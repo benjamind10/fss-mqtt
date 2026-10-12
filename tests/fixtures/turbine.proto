@@ -1,0 +1,31 @@
+// Schema of the Protobuf fixtures (see make_protobuf.py). The decoder never sees it.
+syntax = "proto3";
+
+package fixtures;
+
+enum Status {
+  STATUS_UNKNOWN = 0;
+  RUNNING = 1;
+  IDLE = 2;
+  FAULT = 3;
+}
+
+message Location {
+  double lat = 1;
+  double lon = 2;
+}
+
+message TurbineReading {
+  string turbine_id = 1;
+  double active_power = 2;
+  float wind_speed = 3;
+  int64 power_delta = 4;
+  sint32 yaw_offset = 5;
+  bool running = 6;
+  Status status = 7;
+  Location location = 8;
+  repeated int32 rpm = 9;
+  repeated string tags = 10;
+  bytes raw = 11;
+  map<string, double> temps = 12;
+}

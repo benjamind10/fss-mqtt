@@ -338,6 +338,12 @@ pub fn decode(file: &[u8]) -> Result<SqliteView, String> {
             {
                 row[c] = Some(id.to_string());
             }
+            // VIRTUAL generated columns aren't stored; SQLite computes them on read.
+            for (c, col) in def.columns.iter().enumerate() {
+                if col.generated {
+                    row[c] = Some("(computed)".into());
+                }
+            }
             let size = row.iter().map(|c| c.as_ref().map_or(4, |s| s.len()) + 1).sum::<usize>();
             if used + size > budget && !t.first.is_empty() {
                 return false;
@@ -1322,6 +1328,21 @@ mod tests {
         assert_eq!(keys.len(), 300);
         assert!(keys.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(keys[299], "key099/T03");
+    }
+
+    #[test]
+    fn generated_columns() {
+        // mw is VIRTUAL (not stored), label is STORED: later values must not shift.
+        let v = sniff("", &fixture("generated.db")).unwrap().unwrap();
+        let rows = match &v.sections.last().unwrap().body {
+            Body::Table { header, rows } => {
+                assert_eq!(header, &["id", "kw", "mw", "site", "label", "note"]);
+                rows.clone()
+            }
+            _ => panic!("no rows table"),
+        };
+        let row: Vec<_> = rows[0].iter().map(|c| c.as_deref().unwrap_or("null")).collect();
+        assert_eq!(row, ["1", "2500.0", "(computed)", "falster", "falster:1", "a"]);
     }
 
     #[test]

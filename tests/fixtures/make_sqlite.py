@@ -112,5 +112,20 @@ db.execute("DROP TABLE t")
 db.execute("VACUUM")
 db.close()
 
-for name in ("turbine.db", "deep.db", "overflow.db", "without_rowid.db", "utf16.db", "wal.db", "empty.db"):
+# Generated columns: VIRTUAL ones aren't stored in the record, STORED ones are.
+db = fresh("generated.db")
+db.executescript("""
+CREATE TABLE power (
+    id INTEGER PRIMARY KEY,
+    kw REAL,
+    mw REAL GENERATED ALWAYS AS (kw / 1000) VIRTUAL,
+    site TEXT,
+    label TEXT GENERATED ALWAYS AS (site || ':' || id) STORED,
+    note TEXT
+);
+INSERT INTO power (kw, site, note) VALUES (2500.0, 'falster', 'a'), (1800.0, 'lolland', 'b');
+""")
+db.close()
+
+for name in ("turbine.db", "deep.db", "overflow.db", "without_rowid.db", "utf16.db", "wal.db", "empty.db", "generated.db"):
     print(name, os.path.getsize(name))

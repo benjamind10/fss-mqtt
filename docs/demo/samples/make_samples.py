@@ -22,10 +22,20 @@ base = dt.datetime(2026, 10, 8, 10, 20, tzinfo=dt.timezone.utc)
 turbines = [f"T{i:02d}" for i in range(1, 9)]
 
 
+# fss-mqtt keeps this much of each payload by default (--max-payload), so a
+# sample this size or smaller is shown whole, without a truncation note.
+MAX_PAYLOAD = 4 * 1024
+
+
+def check(name):
+    size = os.path.getsize(name)
+    assert size <= MAX_PAYLOAD, (name, size)
+
+
 def write(name, data):
-    assert len(data) < 16 * 1024, (name, len(data))
     with open(name, "wb") as f:
         f.write(data)
+    check(name)
 
 
 # Parquet: a 1 Hz fast log from one turbine.
@@ -40,6 +50,7 @@ fastlog = pa.table({
     "Status": pa.array(["RUNNING"] * n),
 }).replace_schema_metadata({b"ProviderName": b"TurbineFastlog", b"Version": b"1.0.0"})
 pq.write_table(fastlog, "fastlog.parquet", compression="snappy", row_group_size=n, store_schema=False)
+check("fastlog.parquet")
 
 # Avro container file: the turbine event log.
 schema = fastavro.parse_schema({
@@ -91,7 +102,7 @@ if os.path.exists("turbines.db"):
 con = apsw.Connection("turbines.db")
 con.execute(setup + rows)
 con.close()
-write("turbines.db", open("turbines.db", "rb").read())
+check("turbines.db")
 
 # SQLite changeset: a setpoint change pushed to the site.
 con = apsw.Connection(":memory:")

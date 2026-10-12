@@ -11,6 +11,7 @@ mod fmt;
 mod glyph;
 mod mqtt;
 mod parquet;
+mod pemkey;
 mod pretty;
 mod protobuf;
 mod sqlite;
@@ -43,7 +44,8 @@ Usage:
 
 Connections live in a small file you can edit (see --config). Connecting to a
 broker on the command line adds or updates its entry; passwords are never
-written, use password_env in the file or type it when asked.
+written, use password_env in the file or type it when asked. The same goes for
+the passphrase of an encrypted --key (key_password_env).
 
 Connection flags:
   -b, --broker string        broker URL (mqtt://, mqtts://) or host[:port]
@@ -57,7 +59,7 @@ Connection flags:
       --history int          messages kept per topic (default 10)
       --inline int           payloads up to this many bytes are shown inline in the tree (default 64)
       --insecure             skip TLS certificate verification
-      --key string           client private key PEM for mutual TLS
+      --key string           client private key PEM for mutual TLS (may be encrypted)
       --max-payload string   payload bytes kept per message; the rest is discarded on arrival (default \"4KiB\")
   -P, --password string      password
   -q, --qos int              subscription QoS (0, 1, 2)
@@ -65,7 +67,8 @@ Connection flags:
   -u, --username string      username
   -v, --version              print version and exit
 
-Environment: FSS_MQTT_BROKER, FSS_MQTT_USERNAME, FSS_MQTT_PASSWORD, FSS_MQTT_CAFILE";
+Environment: FSS_MQTT_BROKER, FSS_MQTT_USERNAME, FSS_MQTT_PASSWORD, FSS_MQTT_CAFILE,
+FSS_MQTT_KEY_PASSWORD (the --key passphrase)";
 
 struct Args {
     broker: Option<String>,
@@ -77,6 +80,7 @@ struct Args {
     username: Option<String>,
     password: Option<String>,
     password_from_env: bool,
+    key_password: Option<String>, // from the environment only
     client_id: Option<String>,
     qos: u8,
     history: usize,
@@ -107,6 +111,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         username: env("FSS_MQTT_USERNAME"),
         password: env("FSS_MQTT_PASSWORD"),
         password_from_env: env("FSS_MQTT_PASSWORD").is_some(),
+        key_password: env("FSS_MQTT_KEY_PASSWORD"),
         client_id: None,
         qos: 0,
         history: 10,
@@ -290,6 +295,9 @@ fn cli_connection(a: &Args, b: &Broker, saved: Option<&config::ConnCfg>) -> conf
     if a.password_from_env {
         c.password_env = Some("FSS_MQTT_PASSWORD".into());
     }
+    if a.key_password.is_some() {
+        c.key_password_env = Some("FSS_MQTT_KEY_PASSWORD".into());
+    }
     c.insecure |= a.insecure;
     if a.qos != 0 {
         c.qos = a.qos;
@@ -313,7 +321,12 @@ fn absolute_path(p: &str) -> String {
         .unwrap_or(p)
 }
 
-fn mqtt_config(idx: usize, c: &config::ConnCfg, password: Option<String>) -> Result<mqtt::Config, String> {
+fn mqtt_config(
+    idx: usize,
+    c: &config::ConnCfg,
+    password: Option<String>,
+    key_password: Option<String>,
+) -> Result<mqtt::Config, String> {
     let b = parse_broker(&c.url, c.cafile.is_some() || c.cert.is_some())?;
     Ok(mqtt::Config {
         conn: idx,
@@ -323,6 +336,7 @@ fn mqtt_config(idx: usize, c: &config::ConnCfg, password: Option<String>) -> Res
         ca_file: c.cafile.as_deref().map(config::expand),
         cert_file: c.cert.as_deref().map(config::expand),
         key_file: c.key.as_deref().map(config::expand),
+        key_password,
         insecure: c.insecure,
         client_id: c.client_id.clone().unwrap_or_else(random_client_id),
         username: c.username.clone(),
@@ -348,8 +362,15 @@ fn run() -> Result<(), String> {
             Some(&e.name) == name.as_ref() || (name.is_none() && cli_connection(&a, &b, None).name == e.name)
         });
         let c = cli_connection(&a, &b, existing.map(|i| &entries[i]));
-        // Fail fast on a bad cafile/cert for the broker you just typed.
-        mqtt::tls_config(&mqtt_config(0, &c, None)?).map_err(|e| format!("{}: {e}", c.name))?;
+        // Fail fast on a bad cafile/cert/key for the broker you just typed. An
+        // encrypted key without a passphrase is fine: the UI asks for it.
+        match mqtt::tls_config(&mqtt_config(0, &c, None, a.key_password.clone())?) {
+            Ok(_) | Err(mqtt::TlsError::Key(_, pemkey::KeyError::NeedsPassphrase)) => {}
+            Err(e @ mqtt::TlsError::Key(..)) => {
+                return Err(format!("{}: {e} (from FSS_MQTT_KEY_PASSWORD)", c.name));
+            }
+            Err(e) => return Err(format!("{}: {e}", c.name)),
+        }
         let i = match existing {
             Some(i) => {
                 entries[i] = c;
@@ -419,6 +440,11 @@ fn run() -> Result<(), String> {
         } else {
             e.password_env.as_deref().and_then(|v| std::env::var(v).ok())
         };
+        let key_password = if Some(i) == cli_idx && a.key_password.is_some() {
+            a.key_password.clone()
+        } else {
+            e.key_password_env.as_deref().and_then(|v| std::env::var(v).ok())
+        };
         let subs = e
             .topics
             .iter()
@@ -428,25 +454,27 @@ fn run() -> Result<(), String> {
                 err: None,
             })
             .collect();
-        let cfg = mqtt_config(i, e, password.clone()).map_err(|err| format!("connection {:?}: {err}", e.name))?;
+        let cfg = mqtt_config(i, e, password.clone(), key_password.clone())
+            .map_err(|err| format!("connection {:?}: {err}", e.name))?;
         let display = parse_broker(&e.url, e.cafile.is_some() || e.cert.is_some())?.display;
         let idx = store
             .lock()
             .unwrap()
             .add_conn(&e.name, &display, e.username.clone(), subs);
         debug_assert_eq!(idx, i);
-        // A connection that needs a password we don't have waits for the prompt.
-        let needs_password = e.username.is_some() && password.is_none();
-        if start[i] && needs_password {
-            ask.push(i);
-        }
-        let tx = mqtt::spawn(cfg, store.clone(), start[i] && !needs_password);
-        ctls.push(app::ConnCtl {
+        let ctl = app::ConnCtl {
             cfg: e.clone(),
             saved: saved[i],
-            tx,
+            tx: mqtt::spawn(cfg, store.clone(), false),
             password,
-        });
+            key_password,
+        };
+        // A connection that needs a password or passphrase we don't have waits
+        // for the prompt; the app connects the rest.
+        if start[i] {
+            ask.push(i);
+        }
+        ctls.push(ctl);
     }
 
     let opts = app::Options { inline_bytes: a.inline };

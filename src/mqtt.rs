@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
+use crate::pemkey::{self, KeyError};
 use crate::store::{ConnState, Props, Status, Store};
 
 pub struct Config {
@@ -21,6 +22,7 @@ pub struct Config {
     pub ca_file: Option<String>,
     pub cert_file: Option<String>,
     pub key_file: Option<String>,
+    pub key_password: Option<String>, // for an encrypted key_file
     pub insecure: bool,
     pub client_id: String,
     pub username: Option<String>,
@@ -28,10 +30,25 @@ pub struct Config {
     pub qos: u8,
 }
 
+impl Config {
+    fn update(&mut self, password: Option<String>, key_password: Option<String>) {
+        if password.is_some() {
+            self.password = password;
+        }
+        if key_password.is_some() {
+            self.key_password = key_password;
+        }
+    }
+}
+
 /// What the UI can ask a connection to do. Which topics to subscribe on
 /// connect is read from the connection's `subs` in the store.
 pub enum Cmd {
-    Connect { password: Option<String> },
+    /// Passwords given here replace the ones the connection has.
+    Connect {
+        password: Option<String>,
+        key_password: Option<String>,
+    },
     Disconnect,
     Subscribe(String),
     Unsubscribe(String),
@@ -41,7 +58,45 @@ const KEEP_ALIVE: u16 = 30;
 const RETRY: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub fn tls_config(cfg: &Config) -> Result<Option<Arc<rustls::ClientConfig>>, String> {
+/// Why TLS couldn't be set up. Key problems are told apart because retrying
+/// won't help them: the connection stops and the UI asks for the passphrase.
+#[derive(Debug)]
+pub enum TlsError {
+    Key(String, KeyError), // the key file's path
+    Other(String),
+}
+
+impl std::fmt::Display for TlsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TlsError::Key(path, e) => write!(f, "key {path}: {e}"),
+            TlsError::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+impl From<String> for TlsError {
+    fn from(e: String) -> TlsError {
+        TlsError::Other(e)
+    }
+}
+
+/// Whether the key at `path` is encrypted and `passphrase` doesn't open it
+/// (false if the file can't be read or parsed; connecting reports that).
+pub fn key_needs_passphrase(path: &str, passphrase: Option<&str>) -> bool {
+    matches!(load_key(path, passphrase), Err(TlsError::Key(..)))
+}
+
+/// Reads the private key at `path`, decrypting it with `passphrase` if needed.
+pub fn load_key(path: &str, passphrase: Option<&str>) -> Result<PrivateKeyDer<'static>, TlsError> {
+    let pem = std::fs::read(path).map_err(|e| TlsError::Other(format!("key {path}: {e}")))?;
+    pemkey::load(&pem, passphrase).map_err(|e| match e {
+        KeyError::Other(m) => TlsError::Other(format!("key {path}: {m}")),
+        e => TlsError::Key(path.into(), e),
+    })
+}
+
+pub fn tls_config(cfg: &Config) -> Result<Option<Arc<rustls::ClientConfig>>, TlsError> {
     if !cfg.tls {
         return Ok(None);
     }
@@ -63,7 +118,7 @@ pub fn tls_config(cfg: &Config) -> Result<Option<Arc<rustls::ClientConfig>>, Str
                     .collect::<Result<_, _>>()
                     .map_err(|e| format!("cafile {path}: {e}"))?;
                 if certs.is_empty() {
-                    return Err(format!("cafile {path}: no PEM certificates found"));
+                    return Err(format!("cafile {path}: no PEM certificates found").into());
                 }
                 for c in certs {
                     roots.add(c).map_err(|e| format!("cafile {path}: {e}"))?;
@@ -84,13 +139,13 @@ pub fn tls_config(cfg: &Config) -> Result<Option<Arc<rustls::ClientConfig>>, Str
                 .map_err(|e| format!("cert {cert}: {e}"))?
                 .collect::<Result<_, _>>()
                 .map_err(|e| format!("cert {cert}: {e}"))?;
-            let key = PrivateKeyDer::from_pem_file(key).map_err(|e| format!("key {key}: {e}"))?;
+            let key = load_key(key, cfg.key_password.as_deref())?;
             builder
                 .with_client_auth_cert(chain, key)
                 .map_err(|e| format!("client certificate: {e}"))?
         }
         (None, None) => builder.with_no_client_auth(),
-        _ => return Err("cert and key must be given together".into()),
+        _ => return Err(TlsError::Other("cert and key must be given together".into())),
     };
     Ok(Some(Arc::new(config)))
 }
@@ -171,6 +226,7 @@ impl Write for Conn {
 /// How a session ended.
 enum End {
     Failed(String), // retry after a pause
+    Halted(String), // retrying won't help (the key's passphrase): wait for the UI
     Stopped,        // the UI asked to disconnect
     Closed,         // the UI is gone
 }
@@ -181,14 +237,13 @@ pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<C
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut want = start;
+        let mut halted = None;
         loop {
             if !want {
-                set_status(&store, cfg.conn, ConnState::Disconnected, None);
+                set_status(&store, cfg.conn, ConnState::Disconnected, halted.take());
                 match rx.recv() {
-                    Ok(Cmd::Connect { password }) => {
-                        if password.is_some() {
-                            cfg.password = password;
-                        }
+                    Ok(Cmd::Connect { password, key_password }) => {
+                        cfg.update(password, key_password);
                         want = true;
                     }
                     Ok(_) => continue, // subscription changes apply on the next connect
@@ -198,6 +253,10 @@ pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<C
             set_status(&store, cfg.conn, ConnState::Connecting, None);
             match session(&cfg, &store, &rx) {
                 End::Stopped => want = false,
+                End::Halted(err) => {
+                    halted = Some(err);
+                    want = false;
+                }
                 End::Closed => return,
                 End::Failed(err) => {
                     set_status(&store, cfg.conn, ConnState::Connecting, Some(err));
@@ -209,10 +268,8 @@ pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<C
                                 want = false;
                                 break;
                             }
-                            Ok(Cmd::Connect { password }) => {
-                                if password.is_some() {
-                                    cfg.password = password;
-                                }
+                            Ok(Cmd::Connect { password, key_password }) => {
+                                cfg.update(password, key_password);
                                 break;
                             }
                             Ok(_) => {}
@@ -256,7 +313,8 @@ fn dial(host: &str, port: u16) -> Result<TcpStream, String> {
 fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>) -> End {
     let tls = match tls_config(cfg) {
         Ok(t) => t,
-        Err(e) => return End::Failed(e),
+        Err(e @ TlsError::Key(..)) => return End::Halted(e.to_string()),
+        Err(e) => return End::Failed(e.to_string()),
     };
     let tcp = match dial(&cfg.host, cfg.port) {
         Ok(s) => s,
@@ -764,6 +822,7 @@ mod tests {
 mod e2e {
     use super::*;
     use crate::store::{Message, Sub};
+    use std::path::Path;
     use std::process::Command;
 
     fn sub(t: &str) -> Sub {
@@ -786,6 +845,7 @@ mod e2e {
             ca_file: ca.map(String::from),
             cert_file: None,
             key_file: None,
+            key_password: None,
             insecure: false,
             client_id: format!("e2e-{port}-{}", ca.is_some()),
             username: None,
@@ -900,7 +960,11 @@ mod e2e {
         tx.send(Cmd::Disconnect).unwrap();
         assert_eq!(wait_state(&st, ConnState::Disconnected).state, ConnState::Disconnected);
         assert_eq!(st.lock().unwrap().total(), before + 1, "data kept after disconnect");
-        tx.send(Cmd::Connect { password: None }).unwrap();
+        tx.send(Cmd::Connect {
+            password: None,
+            key_password: None,
+        })
+        .unwrap();
         assert_eq!(wait_state(&st, ConnState::Connected).state, ConnState::Connected);
         publish(&["-p", "18830", "-q", "1", "-t", "e2e/again", "-m", "x"]);
         assert_eq!(wait_for(&st, before + 2), before + 2, "after reconnect");
@@ -938,5 +1002,43 @@ mod e2e {
             err.contains("certificate") || err.contains("UnknownIssuer"),
             "unexpected error: {err}"
         );
+
+        // Mutual TLS with an encrypted client key: a wrong passphrase stops the
+        // connection (no retrying) until the right one comes.
+        let dir = Path::new(&ca).parent().unwrap();
+        let (st, mut cfg) = setup(18884, true, Some(&ca), &["#"]);
+        cfg.cert_file = Some(dir.join("client.pem").to_string_lossy().into());
+        cfg.key_file = Some(dir.join("client.key").to_string_lossy().into());
+        cfg.key_password = Some("wrong".into());
+        let tx = spawn(cfg, st.clone(), true);
+        for _ in 0..50 {
+            if status(&st).err.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let s = status(&st);
+        assert!(s.state == ConnState::Disconnected, "kept trying with a wrong passphrase");
+        assert!(s.err.as_deref().unwrap_or_default().contains("wrong passphrase"), "{:?}", s.err);
+        tx.send(Cmd::Connect {
+            password: None,
+            key_password: Some("s3cret".into()),
+        })
+        .unwrap();
+        let s = wait_state(&st, ConnState::Connected);
+        assert!(
+            s.state == ConnState::Connected && s.err.is_none(),
+            "mtls connect: {:?}",
+            s.err
+        );
+        #[rustfmt::skip]
+        publish(&[
+            "-p", "18884", "-h", "localhost", "--cafile", &ca,
+            "--cert", &dir.join("client.pem").to_string_lossy(),
+            "--key", &dir.join("client-plain.key").to_string_lossy(),
+            "-t", "e2e/mtls", "-m", "hi",
+        ]);
+        assert_eq!(wait_for(&st, 1), 1);
     }
 }

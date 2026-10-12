@@ -681,7 +681,7 @@ mod tests {
         for e in std::fs::read_dir(&dir).unwrap() {
             let path = e.unwrap().path();
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            if name.ends_with(".changeset") || name.ends_with(".patchset") {
+            if !path.is_file() || name.ends_with(".changeset") || name.ends_with(".patchset") {
                 continue;
             }
             assert!(sniff("", &std::fs::read(&path).unwrap()).is_none(), "{name}");

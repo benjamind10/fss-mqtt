@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 
 use crate::arrow;
 use crate::avro;
+use crate::changeset;
 use crate::compressed;
 use crate::fmt;
 use crate::parquet;
@@ -36,6 +37,8 @@ const DECODERS: &[(&str, Decoder)] = &[
     ("Avro", avro::sniff),
     ("Arrow", arrow::sniff),
     ("SQLite", sqlite::sniff),
+    // A heuristic without magic bytes: last, so it never shadows the others.
+    ("SQLite changeset", changeset::sniff),
 ];
 
 /// Decodes binary formats that can't be read from a truncated prefix.

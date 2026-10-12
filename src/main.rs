@@ -10,6 +10,7 @@ mod pretty;
 mod store;
 mod theme;
 mod ui;
+mod view;
 mod viewer;
 
 use std::collections::hash_map::RandomState;

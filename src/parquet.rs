@@ -7,6 +7,9 @@
 
 use std::io::Read;
 
+use crate::fmt::commas;
+use crate::view::{Body, DocView, Fact};
+
 /// Rows are decoded until the rendered cells reach about this many bytes.
 const ROW_BUDGET: usize = 4096;
 const MAX_ROWS: usize = 200;
@@ -31,6 +34,59 @@ pub struct Column {
     pub min: Option<String>,
     pub max: Option<String>,
     pub nulls: Option<i64>,
+}
+
+/// Decoder entry point (see `pretty::Decoder`): recognised by its magic bytes.
+pub fn sniff(_ct: &str, b: &[u8]) -> Option<Result<DocView, String>> {
+    is_parquet(b).then(|| decode(b).map(|v| v.to_view()))
+}
+
+impl ParquetView {
+    pub fn to_view(&self) -> DocView {
+        let mut d = DocView::new("Parquet");
+        d.summary = vec![
+            Fact::new(commas(self.num_rows.max(0) as u64), "rows"),
+            Fact::new(self.row_groups.to_string(), "row groups"),
+            Fact::new(self.columns.len().to_string(), "columns"),
+        ];
+        if let Some(c) = &self.created_by {
+            d.summary.push(Fact::new("", c.clone()));
+        }
+        // Arrow's embedded schema is long and repeats the one below.
+        d.meta = self
+            .kv
+            .iter()
+            .filter(|(k, _)| !k.starts_with("ARROW:"))
+            .cloned()
+            .collect();
+        let header = ["column", "type", "nulls", "min", "max"].map(String::from).to_vec();
+        let rows = self
+            .columns
+            .iter()
+            .map(|c| {
+                vec![
+                    Some(c.name.clone()),
+                    Some(c.ty.clone()),
+                    c.nulls.map(|n| n.to_string()),
+                    c.min.clone(),
+                    c.max.clone(),
+                ]
+            })
+            .collect();
+        d.section("Schema", "", Body::Table { header, rows });
+        if !self.rows.is_empty() {
+            d.section(
+                "Rows",
+                format!("· first {} of {}", self.rows.len(), commas(self.num_rows.max(0) as u64)),
+                Body::Table {
+                    header: self.columns.iter().map(|c| c.name.clone()).collect(),
+                    rows: self.rows.clone(),
+                },
+            );
+        }
+        d.notes = self.notes.clone();
+        d
+    }
 }
 
 pub fn is_parquet(b: &[u8]) -> bool {

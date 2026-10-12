@@ -14,7 +14,8 @@ printf "subjectAltName=DNS:localhost,IP:127.0.0.1" > san.ext
 openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out server.pem -days 2 -extfile san.ext 2>/dev/null
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -aes256 -pass pass:s3cret -out client.key 2>/dev/null
 openssl req -new -key client.key -passin pass:s3cret -out client.csr -subj "/CN=fss-mqtt e2e" 2>/dev/null
-openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out client.pem -days 2 2>/dev/null
+printf "extendedKeyUsage=clientAuth" > client.ext # makes it an X.509 v3 cert, which rustls requires
+openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out client.pem -days 2 -extfile client.ext 2>/dev/null
 openssl pkey -in client.key -passin pass:s3cret -out client-plain.key # for mosquitto_pub
 
 cat > plain.conf <<CONF

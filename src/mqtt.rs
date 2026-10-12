@@ -59,7 +59,8 @@ const RETRY: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why TLS couldn't be set up. Key problems are told apart because retrying
-/// won't help them: the connection stops and the UI asks for the passphrase.
+/// won't help them: the connection stops (and the UI asks for the passphrase
+/// when that's what's missing).
 #[derive(Debug)]
 pub enum TlsError {
     Key(String, KeyError), // the key file's path
@@ -84,16 +85,16 @@ impl From<String> for TlsError {
 /// Whether the key at `path` is encrypted and `passphrase` doesn't open it
 /// (false if the file can't be read or parsed; connecting reports that).
 pub fn key_needs_passphrase(path: &str, passphrase: Option<&str>) -> bool {
-    matches!(load_key(path, passphrase), Err(TlsError::Key(..)))
+    matches!(
+        load_key(path, passphrase),
+        Err(TlsError::Key(_, KeyError::NeedsPassphrase | KeyError::WrongPassphrase))
+    )
 }
 
 /// Reads the private key at `path`, decrypting it with `passphrase` if needed.
 pub fn load_key(path: &str, passphrase: Option<&str>) -> Result<PrivateKeyDer<'static>, TlsError> {
     let pem = std::fs::read(path).map_err(|e| TlsError::Other(format!("key {path}: {e}")))?;
-    pemkey::load(&pem, passphrase).map_err(|e| match e {
-        KeyError::Other(m) => TlsError::Other(format!("key {path}: {m}")),
-        e => TlsError::Key(path.into(), e),
-    })
+    pemkey::load(&pem, passphrase).map_err(|e| TlsError::Key(path.into(), e))
 }
 
 pub fn tls_config(cfg: &Config) -> Result<Option<Arc<rustls::ClientConfig>>, TlsError> {
@@ -1019,8 +1020,15 @@ mod e2e {
         }
         std::thread::sleep(Duration::from_millis(300));
         let s = status(&st);
-        assert!(s.state == ConnState::Disconnected, "kept trying with a wrong passphrase");
-        assert!(s.err.as_deref().unwrap_or_default().contains("wrong passphrase"), "{:?}", s.err);
+        assert!(
+            s.state == ConnState::Disconnected,
+            "kept trying with a wrong passphrase"
+        );
+        assert!(
+            s.err.as_deref().unwrap_or_default().contains("wrong passphrase"),
+            "{:?}",
+            s.err
+        );
         tx.send(Cmd::Connect {
             password: None,
             key_password: Some("s3cret".into()),

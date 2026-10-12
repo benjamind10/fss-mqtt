@@ -366,7 +366,7 @@ fn run() -> Result<(), String> {
         // encrypted key without a passphrase is fine: the UI asks for it.
         match mqtt::tls_config(&mqtt_config(0, &c, None, a.key_password.clone())?) {
             Ok(_) | Err(mqtt::TlsError::Key(_, pemkey::KeyError::NeedsPassphrase)) => {}
-            Err(e @ mqtt::TlsError::Key(..)) => {
+            Err(e @ mqtt::TlsError::Key(_, pemkey::KeyError::WrongPassphrase)) => {
                 return Err(format!("{}: {e} (from FSS_MQTT_KEY_PASSWORD)", c.name));
             }
             Err(e) => return Err(format!("{}: {e}", c.name)),

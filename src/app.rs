@@ -566,8 +566,9 @@ impl App {
                 })
             }
             None => {
+                // An empty password connects with the username only.
                 let _ = ctl.tx.send(Cmd::Connect {
-                    password: ctl.password.clone(),
+                    password: ctl.password.clone().filter(|p| !p.is_empty()),
                     key_password: ctl.key_password.clone(),
                 });
             }
@@ -591,7 +592,7 @@ impl App {
             KeyCode::Enter => {
                 let ctl = &mut self.ctls[p.conn];
                 match p.ask {
-                    // An empty password connects with the username only.
+                    // Kept even when empty, so it isn't asked for again.
                     Ask::Password => ctl.password = Some(std::mem::take(&mut p.input)),
                     Ask::KeyPassphrase => {
                         ctl.key_password = Some(std::mem::take(&mut p.input));

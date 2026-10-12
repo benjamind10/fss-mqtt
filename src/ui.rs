@@ -1222,6 +1222,10 @@ mod tests {
         press(&mut app, &[KeyCode::Char(' ')]);
         assert!(app.prompt.is_none());
         assert!(matches!(rx[1].try_recv(), Ok(Cmd::Connect { .. })));
+        // An empty password connects with the username only (no password sent).
+        app.ctls[1].password = Some(String::new());
+        press(&mut app, &[KeyCode::Char(' ')]);
+        assert!(matches!(rx[1].try_recv(), Ok(Cmd::Connect { password: None, .. })));
 
         // Typing in the panel goes to the filter.
         typ(&mut app, "tr");

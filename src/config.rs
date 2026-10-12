@@ -28,6 +28,7 @@ pub struct ConnCfg {
     pub insecure: bool,
     pub username: Option<String>,
     pub password_env: Option<String>,
+    pub key_password_env: Option<String>,
     pub client_id: Option<String>,
     pub qos: u8,
     pub topics: Vec<String>,
@@ -86,8 +87,8 @@ pub fn save(path: &Path, c: &ConnCfg) -> Result<(), String> {
 
 const HEADER: &str = "\
 # fss-mqtt connections. Edit freely; see `fss-mqtt --help`.
-# Passwords are not stored: set password_env to an environment variable name,
-# or fss-mqtt asks for the password when it connects.
+# Passwords are not stored: set password_env (or key_password_env, for an
+# encrypted key) to an environment variable name, or fss-mqtt asks when it connects.
 ";
 
 /// Returns `text` with `c`'s block replaced (by name) or appended.
@@ -125,6 +126,7 @@ fn render(c: &ConnCfg) -> String {
         ("key", &c.key),
         ("username", &c.username),
         ("password_env", &c.password_env),
+        ("key_password_env", &c.key_password_env),
         ("client_id", &c.client_id),
     ] {
         if let Some(v) = v {
@@ -371,6 +373,7 @@ fn set(c: &mut ConnCfg, key: &str, v: Value) -> Result<(), String> {
         "key" => c.key = Some(s(v)?),
         "username" => c.username = Some(s(v)?),
         "password_env" => c.password_env = Some(s(v)?),
+        "key_password_env" => c.key_password_env = Some(s(v)?),
         "client_id" => c.client_id = Some(s(v)?),
         "insecure" | "autoconnect" => {
             let Value::Bool(b) = v else {
@@ -398,6 +401,9 @@ fn set(c: &mut ConnCfg, key: &str, v: Value) -> Result<(), String> {
         }
         "password" => {
             return Err("passwords are not read from the file; use password_env = \"VAR\"".into());
+        }
+        "key_password" => {
+            return Err("passphrases are not read from the file; use key_password_env = \"VAR\"".into());
         }
         other => return Err(format!("unknown setting {other:?}")),
     }

@@ -37,6 +37,7 @@ cargo install --path .       # or install it to ~/.cargo/bin
 fss-mqtt broker.example.com                # connect (and save the connection)
 fss-mqtt mqtts://broker:8883 -u me         # TLS (system trust store); asks for the password
 fss-mqtt broker:8883 --cafile ca.pem       # TLS with your own CA
+fss-mqtt broker:8883 --cafile ca.pem --cert me.pem --key me.key   # mutual TLS
 fss-mqtt broker -t 'v1/#' -t '$SYS/#'      # several subscriptions
 fss-mqtt                                   # connect the saved connections marked autoconnect
 fss-mqtt -c local -c staging               # connect these saved connections
@@ -44,7 +45,8 @@ fss-mqtt -c local -c staging               # connect these saved connections
 
 Connects with MQTT v5 (so user properties are visible) and reconnects automatically.
 TCP and TLS only; WebSocket brokers (`ws://`, `wss://`) are not supported.
-`FSS_MQTT_BROKER`, `FSS_MQTT_USERNAME`, `FSS_MQTT_PASSWORD` and `FSS_MQTT_CAFILE` are read from the environment.
+`FSS_MQTT_BROKER`, `FSS_MQTT_USERNAME`, `FSS_MQTT_PASSWORD`, `FSS_MQTT_CAFILE` and
+`FSS_MQTT_KEY_PASSWORD` (the `--key` passphrase) are read from the environment.
 With no saved connections and no broker given, it connects to `mqtt://localhost:1883` (not saved).
 
 ## Connections
@@ -77,6 +79,11 @@ autoconnect  = true                        # connect when started without -c or 
   also write `~/…`.
 - **Passwords are never written.** Set `password_env`, or fss-mqtt asks when it connects and keeps
   the password in memory only. `FSS_MQTT_PASSWORD` is saved as `password_env`; `-P` is not.
+  The passphrase of an encrypted `--key` works the same way: `key_password_env` in the file
+  (`FSS_MQTT_KEY_PASSWORD` is saved as that), or it's asked for, and asked again if it's wrong.
+  Supported: PKCS#8 `ENCRYPTED PRIVATE KEY` with PBKDF2 and AES or 3DES (what `openssl genpkey
+  -aes256` and `openssl pkcs8 -topk8` write) and the older OpenSSL `Proc-Type: 4,ENCRYPTED`
+  RSA/EC keys; not scrypt or PKCS#5 v1.5.
 - **Saving** rewrites only that connection's block, so your comments elsewhere in the file stay.
   Pausing or resuming a subscription in the panel is saved the same way.
 
@@ -96,7 +103,7 @@ connection, or turns a subscription on or off (subscribed and unsubscribed live)
 | `--inline` | `64` | payloads up to this size are shown inline in the tree; larger ones show only their size |
 | `-q, --qos` | `0` | subscription QoS |
 | `--cafile` | | PEM file of CA certificates to trust (implies TLS) |
-| `--cert`, `--key` | | client certificate and key for mutual TLS |
+| `--cert`, `--key` | | client certificate and key (PEM) for mutual TLS; the key may be encrypted |
 | `--insecure` | | skip TLS certificate verification |
 
 ## Filtering
@@ -198,12 +205,13 @@ no async runtime, which keeps the binary around 1 MB. TLS uses rustls.
 ## Development
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux, macOS and Windows, checks the
-minimum Rust version, runs the end-to-end test against mosquitto (plain and TLS), and guards the
+minimum Rust version, runs the end-to-end test against mosquitto (plain, TLS and mutual TLS), and guards the
 release binary size.
 
 ```sh
 cargo test
-# end-to-end: starts mosquitto on 127.0.0.1:18830 (plain) and localhost:18883 (TLS)
+# end-to-end: starts mosquitto on 127.0.0.1:18830 (plain), localhost:18883 (TLS) and
+# localhost:18884 (mutual TLS, with an encrypted client key)
 scripts/e2e-brokers.sh /tmp/fss-brokers
 FSS_TEST_CA=/tmp/fss-brokers/ca.pem cargo test --release e2e -- --ignored --nocapture
 # filter benchmark over 100k topics:

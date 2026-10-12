@@ -8,7 +8,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
-use crate::app::{App, Focus, PanelRow, msg_index, node_title};
+use crate::app::{App, Ask, Focus, PanelRow, msg_index, node_title};
 use crate::fmt::{self, ago, commas, human_bytes, human_count, msg_count, plural};
 use crate::glyph;
 use crate::pretty;
@@ -64,7 +64,8 @@ fn status_text(c: &ConnInfo) -> String {
         (ConnState::Connected, _) => "connected".into(),
         (ConnState::Connecting, None) => "connecting…".into(),
         (ConnState::Connecting, Some(e)) => format!("retrying · {e}"),
-        (ConnState::Disconnected, _) => "disconnected".into(),
+        (ConnState::Disconnected, None) => "disconnected".into(),
+        (ConnState::Disconnected, Some(e)) => format!("stopped · {e}"),
     }
 }
 
@@ -165,12 +166,24 @@ fn prompt_box(buf: &mut Buffer, area: Rect, app: &App, st: &Store) {
             buf[(x, y)].reset();
         }
     }
-    let who = format!("{}@{}", c.username.as_deref().unwrap_or(""), c.url);
+    let (who, label) = match p.ask {
+        Ask::Password => (
+            format!("{}@{}", c.username.as_deref().unwrap_or(""), c.url),
+            "Password ",
+        ),
+        Ask::KeyPassphrase => {
+            let key = app.ctls[p.conn].cfg.key.clone().unwrap_or_default();
+            (format!("client key {key}"), "Key passphrase ")
+        }
+    };
     let lines = vec![
-        Line::styled(who, th.dim),
-        Line::default(),
+        Line::styled(fmt::trunc_left(&who, w as usize - 4), th.dim),
+        match p.err {
+            Some(e) => Line::styled(e, th.red),
+            None => Line::default(),
+        },
         Line::from(vec![
-            Span::styled("Password ", th.text),
+            Span::styled(label, th.text),
             Span::styled("•".repeat(p.input.chars().count()), th.text),
             Span::styled(" ", th.cursor),
         ]),
@@ -807,7 +820,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use crate::app::{App, ConnCtl, Focus, Options};
+    use crate::app::{App, Ask, ConnCtl, Focus, Options};
     use crate::config::{self, ConnCfg};
     use crate::glyph;
     use crate::mqtt::Cmd;
@@ -920,12 +933,20 @@ mod tests {
                     name: name.into(),
                     url: "mqtt://x:1883".into(),
                     username: user.map(String::from),
+                    // staging's client key is passphrase-protected.
+                    key: user.map(|_| {
+                        format!(
+                            "{}/tests/fixtures/keys/rsa-legacy-aes256.key",
+                            env!("CARGO_MANIFEST_DIR")
+                        )
+                    }),
                     topics: topics.into_iter().map(String::from).collect(),
                     ..Default::default()
                 },
                 saved: true,
                 tx,
                 password: None,
+                key_password: None,
             });
         }
         let opts = Options { inline_bytes: 64 };
@@ -1169,20 +1190,42 @@ mod tests {
         press(&mut app, &[KeyCode::Up, KeyCode::Char(' ')]);
         assert!(matches!(rx[0].try_recv(), Ok(Cmd::Disconnect)));
 
-        // staging needs a password: space asks for it, enter connects with it.
+        // staging has an encrypted key and a username: space asks for the
+        // key's passphrase (again if it's wrong), then the password.
         press(&mut app, &[KeyCode::End]);
         press(&mut app, &[KeyCode::Up, KeyCode::Char(' ')]);
-        assert!(app.prompt.is_some());
+        assert_eq!(app.prompt.as_ref().map(|p| p.ask), Some(Ask::KeyPassphrase));
+        typ(&mut app, "nope");
+        press(&mut app, &[KeyCode::Enter]);
+        let v = frame(&app, "wrong passphrase");
+        assert!(
+            v.contains("wrong passphrase") && v.contains("rsa-legacy-aes256.key"),
+            "{v}"
+        );
+        assert!(rx[1].try_recv().is_err(), "connected with a wrong passphrase");
         typ(&mut app, "s3cret");
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(app.prompt.as_ref().map(|p| p.ask), Some(Ask::Password));
+        typ(&mut app, "pw");
         let v = frame(&app, "password prompt");
-        assert!(v.contains("Connect staging") && v.contains("••••••") && !v.contains("s3cret"));
+        assert!(v.contains("Connect staging") && v.contains("••") && !v.contains("pw "));
         press(&mut app, &[KeyCode::Enter]);
         assert!(app.prompt.is_none());
-        assert!(matches!(rx[1].try_recv(), Ok(Cmd::Connect { password: Some(p) }) if p == "s3cret"));
-        assert!(
-            !std::fs::read_to_string(&cfg).unwrap().contains("s3cret"),
-            "password must not be written"
-        );
+        assert!(matches!(
+            rx[1].try_recv(),
+            Ok(Cmd::Connect { password: Some(p), key_password: Some(k) }) if p == "pw" && k == "s3cret"
+        ));
+        let file = std::fs::read_to_string(&cfg).unwrap();
+        assert!(!file.contains("s3cret"), "passwords must not be written");
+        // Once known, reconnecting doesn't ask again.
+        app.store.lock().unwrap().conns[1].status.state = ConnState::Disconnected;
+        press(&mut app, &[KeyCode::Char(' ')]);
+        assert!(app.prompt.is_none());
+        assert!(matches!(rx[1].try_recv(), Ok(Cmd::Connect { .. })));
+        // An empty password connects with the username only (no password sent).
+        app.ctls[1].password = Some(String::new());
+        press(&mut app, &[KeyCode::Char(' ')]);
+        assert!(matches!(rx[1].try_recv(), Ok(Cmd::Connect { password: None, .. })));
 
         // Typing in the panel goes to the filter.
         typ(&mut app, "tr");

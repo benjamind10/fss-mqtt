@@ -10,9 +10,13 @@ keywords = ["mqtt", "tui", "iot", "cli", "explorer"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
+aes = "0.9"
+des = "0.9"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-decode"] }
+md-5 = "0.11"
 miniz_oxide = "0.9.1"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+ring = { version = "0.17", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = { version = "1", features = ["std"] }

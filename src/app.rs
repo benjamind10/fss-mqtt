@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::{self, ConnCfg};
-use crate::mqtt::Cmd;
+use crate::mqtt::{self, Cmd};
 use crate::store::{ConnState, Filter, FilterMode, INSIDE, MATCHED, Message, ROOT, Row, Store};
 use crate::theme::Theme;
 use crate::viewer::Viewer;
@@ -27,12 +27,22 @@ pub struct ConnCtl {
     pub cfg: ConnCfg,
     pub saved: bool, // lives in the connections file; subscription toggles are written back
     pub tx: Sender<Cmd>,
-    pub password: Option<String>, // in memory only
+    pub password: Option<String>,     // in memory only
+    pub key_password: Option<String>, // in memory only
 }
 
 impl ConnCtl {
-    fn needs_password(&self) -> bool {
-        self.cfg.username.is_some() && self.password.is_none()
+    /// What to ask before connecting, if anything: the key's passphrase first
+    /// (also when the one we have doesn't open it), then the password.
+    fn missing(&self) -> Option<Ask> {
+        let key = self.cfg.key.as_deref().map(config::expand);
+        if key.is_some_and(|k| mqtt::key_needs_passphrase(&k, self.key_password.as_deref())) {
+            Some(Ask::KeyPassphrase)
+        } else if self.cfg.username.is_some() && self.password.is_none() {
+            Some(Ask::Password)
+        } else {
+            None
+        }
     }
 }
 
@@ -50,9 +60,17 @@ pub enum PanelRow {
     Sub(usize, usize),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ask {
+    Password,
+    KeyPassphrase,
+}
+
 pub struct Prompt {
     pub conn: usize,
+    pub ask: Ask,
     pub input: String,
+    pub err: Option<&'static str>,
 }
 
 pub struct Layout {
@@ -107,7 +125,7 @@ pub struct App {
 }
 
 impl App {
-    /// `ask` lists connections that should connect now but need a password first.
+    /// `ask` lists connections to connect now, asking for passwords they need first.
     pub fn new(
         store: Arc<Mutex<Store>>,
         opts: Options,
@@ -504,15 +522,7 @@ impl App {
     pub fn toggle_conn(&mut self, i: usize) {
         let state = self.store.lock().unwrap().conns[i].status.state;
         if state == ConnState::Disconnected {
-            if self.ctls[i].needs_password() {
-                self.prompt = Some(Prompt {
-                    conn: i,
-                    input: String::new(),
-                });
-                return;
-            }
-            let password = self.ctls[i].password.clone();
-            let _ = self.ctls[i].tx.send(Cmd::Connect { password });
+            self.connect_or_ask(i);
         } else {
             let _ = self.ctls[i].tx.send(Cmd::Disconnect);
         }
@@ -543,13 +553,32 @@ impl App {
         }
     }
 
+    /// Connects `i`, or opens the prompt for what it still needs.
+    fn connect_or_ask(&mut self, i: usize) {
+        let ctl = &self.ctls[i];
+        match ctl.missing() {
+            Some(ask) => {
+                self.prompt = Some(Prompt {
+                    conn: i,
+                    ask,
+                    input: String::new(),
+                    err: None,
+                })
+            }
+            None => {
+                // An empty password connects with the username only.
+                let _ = ctl.tx.send(Cmd::Connect {
+                    password: ctl.password.clone().filter(|p| !p.is_empty()),
+                    key_password: ctl.key_password.clone(),
+                });
+            }
+        }
+    }
+
     fn next_prompt(&mut self) {
-        if self.prompt.is_none() && !self.prompt_queue.is_empty() {
+        while self.prompt.is_none() && !self.prompt_queue.is_empty() {
             let conn = self.prompt_queue.remove(0);
-            self.prompt = Some(Prompt {
-                conn,
-                input: String::new(),
-            });
+            self.connect_or_ask(conn);
         }
     }
 
@@ -561,12 +590,21 @@ impl App {
                 p.input.pop();
             }
             KeyCode::Enter => {
-                let p = self.prompt.take().unwrap();
-                // An empty password connects with the username only.
-                let pw = (!p.input.is_empty()).then_some(p.input);
                 let ctl = &mut self.ctls[p.conn];
-                ctl.password = Some(pw.clone().unwrap_or_default());
-                let _ = ctl.tx.send(Cmd::Connect { password: pw });
+                match p.ask {
+                    // Kept even when empty, so it isn't asked for again.
+                    Ask::Password => ctl.password = Some(std::mem::take(&mut p.input)),
+                    Ask::KeyPassphrase => {
+                        ctl.key_password = Some(std::mem::take(&mut p.input));
+                        if ctl.missing() == Some(Ask::KeyPassphrase) {
+                            p.err = Some("wrong passphrase, try again");
+                            return;
+                        }
+                    }
+                }
+                let conn = p.conn;
+                self.prompt = None;
+                self.connect_or_ask(conn);
                 self.next_prompt();
             }
             KeyCode::Esc => {

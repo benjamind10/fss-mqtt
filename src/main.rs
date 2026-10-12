@@ -1,6 +1,7 @@
 //! fss-mqtt — interactive terminal MQTT explorer.
 
 mod app;
+mod arrow;
 mod avro;
 mod compressed;
 mod config;

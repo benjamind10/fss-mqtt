@@ -5,6 +5,7 @@
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
+use crate::arrow;
 use crate::avro;
 use crate::compressed;
 use crate::fmt;
@@ -32,6 +33,7 @@ const DECODERS: &[(&str, Decoder)] = &[
     ("CBOR", binval::sniff_cbor),
     ("Protobuf", protobuf::sniff),
     ("Avro", avro::sniff),
+    ("Arrow", arrow::sniff),
 ];
 
 /// Decodes binary formats that can't be read from a truncated prefix.
@@ -662,7 +664,7 @@ pub fn table(header: &[String], rows: &[Vec<Option<String>>], th: &Theme) -> Vec
 
 // ── MessagePack and CBOR ───────────────────────────────────────────────────
 
-mod binval {
+pub(crate) mod binval {
     //! Just enough MessagePack and CBOR to show a document as JSON.
 
     use crate::view::{Body, DocView};
@@ -945,7 +947,7 @@ mod binval {
         })
     }
 
-    fn half(h: u16) -> f64 {
+    pub(crate) fn half(h: u16) -> f64 {
         let exp = (h >> 10) & 0x1f;
         let mant = (h & 0x3ff) as f64;
         let v = match exp {

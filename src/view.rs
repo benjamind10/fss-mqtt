@@ -52,11 +52,18 @@ pub enum Body {
     Json(String),
     /// Plain lines.
     Lines(Vec<String>),
+    /// The first bytes of a `size`-byte payload (e.g. unpacked from gzip),
+    /// formatted like a message payload: JSON, XML, CSV, text or hex.
+    Payload {
+        bytes: Vec<u8>,
+        size: usize,
+        content_type: String,
+    },
 }
 
 /// Raw bytes shown under a decoding error.
 const RAW_BYTES: usize = 256;
-/// Hex dumps are laid out for this many cells (16 bytes a row).
+/// Hex dumps (error views and `Body::Payload`) are laid out for this many cells (16 bytes a row).
 const HEX_WIDTH: usize = 76;
 
 impl DocView {
@@ -103,9 +110,20 @@ impl DocView {
         });
     }
 
-    /// Tables don't wrap in the full-screen viewer (it pans instead).
+    /// Tables (CSV payloads too) don't wrap in the full-screen viewer (it pans instead).
     pub fn has_table(&self) -> bool {
-        self.sections.iter().any(|s| matches!(s.body, Body::Table { .. }))
+        self.sections.iter().any(|s| match &s.body {
+            Body::Table { .. } => true,
+            Body::Payload {
+                bytes,
+                size,
+                content_type,
+            } => matches!(
+                crate::pretty::detect_payload(bytes, *size, content_type),
+                crate::pretty::Format::Csv(_)
+            ),
+            _ => false,
+        })
     }
 
     pub fn render(&self, th: &Theme) -> Vec<Line<'static>> {
@@ -147,6 +165,11 @@ impl DocView {
                 Body::Table { header, rows } => out.extend(crate::pretty::table(header, rows, th)),
                 Body::Json(text) => out.extend(crate::pretty::json_lines(text, th)),
                 Body::Lines(lines) => out.extend(lines.iter().map(|l| Line::styled(l.clone(), th.value))),
+                Body::Payload {
+                    bytes,
+                    size,
+                    content_type,
+                } => out.extend(crate::pretty::payload_lines(bytes, *size, content_type, th, HEX_WIDTH)),
             }
         }
         for n in &self.notes {

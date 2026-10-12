@@ -1,7 +1,9 @@
 //! fss-mqtt — interactive terminal MQTT explorer.
 
 mod app;
+mod compressed;
 mod config;
+mod crc32;
 mod fmt;
 mod glyph;
 mod mqtt;

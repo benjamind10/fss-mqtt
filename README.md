@@ -152,11 +152,13 @@ format comes from the `content-type` property when there is one, otherwise from 
 | CSV, TSV (`,` `;` tab `|`) | an aligned table, numbers right-aligned |
 | Parquet | row count, row groups, writer and file metadata; the schema with types, null counts and min/max; the first rows as a table |
 | MessagePack, CBOR (by `content-type`) | decoded and shown as JSON |
+| gzip, zstd | unpacked on arrival; what's inside is detected and formatted like any other payload |
 | other text / binary | text / hex dump |
 
-Parquet, MessagePack and CBOR are decoded when the message arrives, while the whole payload is
-still there; what's kept is the decoded result (about 4 KiB of rows for Parquet) next to the first
-`--max-payload` bytes. Parquet support covers flat columns with PLAIN and dictionary encodings and
+Parquet, MessagePack, CBOR, gzip and zstd are decoded when the message arrives, while the whole
+payload is still there; what's kept is the decoded result (about 4 KiB of rows for Parquet, the
+first 4 KiB of what a gzip or zstd payload unpacks to, at most 64 MiB of which is unpacked) next to
+the first `--max-payload` bytes. Parquet support covers flat columns with PLAIN and dictionary encodings and
 Snappy, Gzip, Zstd and LZ4 compression; nested columns and rarer encodings show the schema with a
 note.
 

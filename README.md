@@ -151,6 +151,7 @@ format comes from the `content-type` property when there is one, otherwise from 
 | XML | indented, short elements on one line, tags/attributes/values coloured |
 | CSV, TSV (`,` `;` tab `|`) | an aligned table, numbers right-aligned |
 | Parquet | row count, row groups, writer and file metadata; the schema with types, null counts and min/max; the first rows as a table |
+| Avro container files | schema, record count and codec, the first records as a table; schema-registry framing is recognised and explained |
 | MessagePack, CBOR (by `content-type`) | decoded and shown as JSON |
 | gzip, zstd | unpacked on arrival; what's inside is detected and formatted like any other payload |
 | Protobuf (by content-type) | raw field numbers and values, nested messages indented; no schema needed |
@@ -167,6 +168,9 @@ like one of these formats but can't be read, the reason is shown above a hex dum
 - **Protobuf:** shown without a schema, like `protoc --decode_raw` (a gRPC message frame is stripped
   first): each length-delimited field is shown as text, a nested message, a packed list of small
   numbers or bytes, whichever it most likely is.
+- **Avro:** container files are read with the schema in their header (uncompressed, Deflate, Snappy
+  or Zstandard), nested values shown as compact JSON; Avro without its schema (Confluent
+  schema-registry framing, single-object encoding) can't be decoded and says so.
 
 ## Performance notes
 

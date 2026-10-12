@@ -1,6 +1,7 @@
 //! fss-mqtt — interactive terminal MQTT explorer.
 
 mod app;
+mod avro;
 mod compressed;
 mod config;
 mod crc32;
@@ -13,6 +14,7 @@ mod protobuf;
 mod store;
 mod theme;
 mod ui;
+mod values;
 mod view;
 mod viewer;
 

@@ -23,4 +23,7 @@ docker run -d --name fss-demo-pub-bergen --network $net -v "$root/docs/demo:/dem
 sleep 12 # let a few large payloads and alarms arrive first
 docker run --rm --network $net -v "$root:/vhs" -v "$bin:/usr/local/bin/fss-mqtt:ro" \
     ghcr.io/charmbracelet/vhs docs/demo/demo.tape
+# The theme needs few colours; fewer in the palette roughly halves the file.
+docker run --rm -v "$root/docs:/docs" alpine:3 \
+    sh -c 'apk add -q gifsicle && gifsicle -b -O3 --colors 32 /docs/demo.gif'
 ls -lh "$root/docs/demo.gif"

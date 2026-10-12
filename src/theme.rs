@@ -155,7 +155,7 @@ impl Theme {
 
     pub fn new(light: bool) -> Theme {
         let c = |l: u32, d: u32| Style::new().fg(rgb(if light { l } else { d }));
-        let accent = c(0xC15F3C, 0xD77757); // Claude orange
+        let accent = c(0xC15F3C, 0xD77757); // warm orange
         let dim = c(0x8A8A8A, 0x7A7A7A);
         Theme {
             accent,

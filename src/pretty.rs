@@ -7,45 +7,34 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
 use crate::fmt;
-use crate::parquet::{self, ParquetView};
+use crate::parquet;
 use crate::store::Message;
 use crate::theme::Theme;
+use crate::view::DocView;
 
-/// What a binary payload was turned into when it arrived, while the whole
-/// payload was still available.
-pub enum Decoded {
-    Parquet(ParquetView),
-    /// MessagePack or CBOR, converted to JSON text (at most ~4 KiB).
-    Json {
-        from: &'static str,
-        text: String,
-    },
-}
+/// What a binary payload was turned into when it arrived.
+pub type Decoded = DocView;
 
+/// Bytes of JSON kept for decoded documents (MessagePack, CBOR).
 const DOC_BUDGET: usize = 4096;
+
+/// Recognises and decodes one binary format from the whole payload.
+/// `None`: not this format. `Some(Err)`: it is, but couldn't be read.
+pub type Decoder = fn(content_type: &str, payload: &[u8]) -> Option<Result<DocView, String>>;
+
+/// Tried in order; the first that recognises the payload wins.
+const DECODERS: &[(&str, Decoder)] = &[
+    ("Parquet", parquet::sniff),
+    ("MessagePack", binval::sniff_msgpack),
+    ("CBOR", binval::sniff_cbor),
+];
 
 /// Decodes binary formats that can't be read from a truncated prefix.
 pub fn decode_on_arrival(content_type: Option<&str>, payload: &[u8]) -> Option<Decoded> {
     let ct = content_type.unwrap_or("").to_ascii_lowercase();
-    if parquet::is_parquet(payload) {
-        return Some(match parquet::decode(payload) {
-            Ok(v) => Decoded::Parquet(v),
-            Err(e) => Decoded::Json {
-                from: "Parquet",
-                text: format!("\"could not read this Parquet file: {e}\""),
-            },
-        });
-    }
-    let (from, value) = if ct.contains("msgpack") {
-        ("MessagePack", binval::msgpack(payload))
-    } else if ct.contains("cbor") {
-        ("CBOR", binval::cbor(payload))
-    } else {
-        return None;
-    };
-    let mut text = String::new();
-    value.ok()?.write_json(&mut text, DOC_BUDGET);
-    Some(Decoded::Json { from, text })
+    DECODERS.iter().find_map(|(name, decode)| {
+        decode(&ct, payload).map(|r| r.unwrap_or_else(|e| DocView::error(name, &e, payload)))
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -56,18 +45,16 @@ pub enum Format {
     Csv(u8),
     Text,
     Binary,
-    Parquet,
-    Decoded(&'static str),
+    /// Decoded on arrival; the flag says whether it holds a table.
+    Decoded(&'static str, bool),
 }
 
 pub fn detect(m: &Message) -> Format {
     if m.size == 0 {
         return Format::Empty;
     }
-    match m.decoded.as_deref() {
-        Some(Decoded::Parquet(_)) => return Format::Parquet,
-        Some(Decoded::Json { from, .. }) => return Format::Decoded(from),
-        None => {}
+    if let Some(v) = m.decoded.as_deref() {
+        return Format::Decoded(v.format, v.has_table());
     }
     let p = &m.payload;
     let ct = m.props.content_type.as_deref().unwrap_or("").to_ascii_lowercase();
@@ -104,8 +91,7 @@ impl Format {
             Format::Csv(_) => "CSV",
             Format::Text => "text",
             Format::Binary => "binary",
-            Format::Parquet => "Parquet",
-            Format::Decoded(from) => from,
+            Format::Decoded(name, _) => name,
         }
     }
 }
@@ -115,14 +101,12 @@ impl Format {
 pub fn render(m: &Message, th: &Theme, width: usize) -> Vec<Line<'static>> {
     let cut = m.truncated();
     // Decoded formats were read from the whole payload: nothing is cut.
-    match m.decoded.as_deref() {
-        Some(Decoded::Parquet(v)) => return parquet_lines(v, th),
-        Some(Decoded::Json { text, .. }) => return json_lines(text, th),
-        None => {}
+    if let Some(v) = m.decoded.as_deref() {
+        return v.render(th);
     }
     let mut out = match detect(m) {
         Format::Empty => vec![Line::styled("(empty payload)", th.dim.add_modifier(Modifier::ITALIC))],
-        Format::Parquet | Format::Decoded(_) => vec![],
+        Format::Decoded(..) => vec![],
         Format::Json => json_lines(&String::from_utf8_lossy(&m.payload), th),
         Format::Xml => xml_lines(&String::from_utf8_lossy(&m.payload), th),
         Format::Csv(d) => csv_lines(&String::from_utf8_lossy(&m.payload), d, cut, th),
@@ -152,7 +136,7 @@ fn text_lines(b: &[u8], th: &Theme) -> Vec<Line<'static>> {
 
 /// Tables keep their rows on one line (the viewer pans sideways instead).
 pub fn wraps(f: Format) -> bool {
-    !matches!(f, Format::Csv(_) | Format::Parquet)
+    !matches!(f, Format::Csv(_) | Format::Decoded(_, true))
 }
 
 /// Drops the first `n` cells of a styled line.
@@ -251,7 +235,7 @@ fn json_like(t: &str) -> bool {
     tokens > 1
 }
 
-fn json_lines(t: &str, th: &Theme) -> Vec<Line<'static>> {
+pub fn json_lines(t: &str, th: &Theme) -> Vec<Line<'static>> {
     let b = t.as_bytes();
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut cur: Vec<Span<'static>> = Vec::new();
@@ -646,70 +630,12 @@ pub fn table(header: &[String], rows: &[Vec<Option<String>>], th: &Theme) -> Vec
     out
 }
 
-// ── Parquet ────────────────────────────────────────────────────────────────
-
-fn parquet_lines(v: &ParquetView, th: &Theme) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    let mut summary = vec![
-        Span::styled(fmt::commas(v.num_rows.max(0) as u64), th.text),
-        Span::styled(" rows · ", th.dim),
-        Span::styled(v.row_groups.to_string(), th.text),
-        Span::styled(" row groups · ", th.dim),
-        Span::styled(v.columns.len().to_string(), th.text),
-        Span::styled(" columns", th.dim),
-    ];
-    if let Some(c) = &v.created_by {
-        summary.push(Span::styled(format!(" · {c}"), th.dim));
-    }
-    out.push(Line::from(summary));
-    // File metadata; Arrow's embedded schema is long and repeats the one below.
-    for (k, val) in v.kv.iter().filter(|(k, _)| !k.starts_with("ARROW:")) {
-        out.push(Line::from(vec![
-            Span::styled(format!("{k} "), th.purple),
-            Span::styled(fmt::one_line(val.as_bytes(), 120), th.text),
-        ]));
-    }
-    out.push(Line::default());
-
-    out.push(Line::styled("Schema", th.section));
-    let header: Vec<String> = ["column", "type", "nulls", "min", "max"].map(String::from).to_vec();
-    let rows: Vec<Vec<Option<String>>> = v
-        .columns
-        .iter()
-        .map(|c| {
-            vec![
-                Some(c.name.clone()),
-                Some(c.ty.clone()),
-                c.nulls.map(|n| n.to_string()),
-                c.min.clone(),
-                c.max.clone(),
-            ]
-        })
-        .collect();
-    out.extend(table(&header, &rows, th));
-    for n in &v.notes {
-        out.push(Line::styled(format!("note: {n}"), th.yellow));
-    }
-    out.push(Line::default());
-
-    if !v.rows.is_empty() {
-        out.push(Line::from(vec![
-            Span::styled("Rows ", th.section),
-            Span::styled(
-                format!("· first {} of {}", v.rows.len(), fmt::commas(v.num_rows.max(0) as u64)),
-                th.dim,
-            ),
-        ]));
-        let names: Vec<String> = v.columns.iter().map(|c| c.name.clone()).collect();
-        out.extend(table(&names, &v.rows, th));
-    }
-    out
-}
-
 // ── MessagePack and CBOR ───────────────────────────────────────────────────
 
 mod binval {
     //! Just enough MessagePack and CBOR to show a document as JSON.
+
+    use crate::view::{Body, DocView};
 
     pub enum V {
         Null,
@@ -818,6 +744,16 @@ mod binval {
             self.depth += 1;
             if self.depth > 64 { Err(()) } else { Ok(()) }
         }
+        fn malformed(&self) -> String {
+            format!("malformed at byte {} of {}", self.p.min(self.b.len()), self.b.len())
+        }
+        /// A document must use the whole payload.
+        fn trailing(&self, v: V) -> Result<V, String> {
+            match self.b.len() - self.p {
+                0 => Ok(v),
+                n => Err(format!("{n} unexpected bytes after the document, at byte {}", self.p)),
+            }
+        }
         fn count(&self, n: u64) -> Result<usize, ()> {
             // Every element takes at least one byte.
             if n as usize > self.b.len() - self.p {
@@ -828,9 +764,26 @@ mod binval {
         }
     }
 
-    pub fn msgpack(b: &[u8]) -> Result<V, ()> {
+    fn as_view(name: &'static str, v: Result<V, String>) -> Result<DocView, String> {
+        let mut text = String::new();
+        v?.write_json(&mut text, super::DOC_BUDGET);
+        let mut view = DocView::new(name);
+        view.section("", "", Body::Json(text));
+        Ok(view)
+    }
+
+    pub fn sniff_msgpack(ct: &str, b: &[u8]) -> Option<Result<DocView, String>> {
+        ct.contains("msgpack").then(|| as_view("MessagePack", msgpack(b)))
+    }
+
+    pub fn sniff_cbor(ct: &str, b: &[u8]) -> Option<Result<DocView, String>> {
+        ct.contains("cbor").then(|| as_view("CBOR", cbor(b)))
+    }
+
+    pub fn msgpack(b: &[u8]) -> Result<V, String> {
         let mut r = R { b, p: 0, depth: 0 };
-        mp(&mut r)
+        let v = mp(&mut r).map_err(|_| r.malformed())?;
+        r.trailing(v)
     }
 
     fn mp(r: &mut R) -> Result<V, ()> {
@@ -897,9 +850,10 @@ mod binval {
         Ok(V::Map(v))
     }
 
-    pub fn cbor(b: &[u8]) -> Result<V, ()> {
+    pub fn cbor(b: &[u8]) -> Result<V, String> {
         let mut r = R { b, p: 0, depth: 0 };
-        cb(&mut r)
+        let v = cb(&mut r).map_err(|_| r.malformed())?;
+        r.trailing(v)
     }
 
     fn cb_arg(r: &mut R, info: u8) -> Result<u64, ()> {
@@ -982,7 +936,7 @@ mod binval {
     mod tests {
         use super::*;
 
-        fn json(v: Result<V, ()>) -> String {
+        fn json(v: Result<V, String>) -> String {
             let mut s = String::new();
             v.unwrap().write_json(&mut s, 4096);
             s
@@ -1001,6 +955,11 @@ mod binval {
                 0xa3, 0x61, b'n', 0x21, 0x61, b'h', 0xf9, 0x3e, 0x00, 0x61, b'b', 0x42, 1, 2,
             ];
             assert_eq!(json(cbor(&cb)), r#"{"n":-2,"h":1.5,"b":"<2 bytes: 0102>"}"#);
+            assert_eq!(msgpack(&[0x92, 0x01]).err().unwrap(), "malformed at byte 1 of 2");
+            assert_eq!(
+                cbor(&[0x01, 0x02]).err().unwrap(),
+                "1 unexpected bytes after the document, at byte 1"
+            );
             assert!(msgpack(&[0xdd, 0xff, 0xff, 0xff, 0xff]).is_err());
             assert!(cbor(&[0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]).is_err());
         }
@@ -1062,7 +1021,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         ))
         .unwrap();
-        assert_eq!(d(&pq, Some("application/parquet")), Format::Parquet);
+        assert_eq!(d(&pq, Some("application/parquet")), Format::Decoded("Parquet", true));
     }
 
     #[test]

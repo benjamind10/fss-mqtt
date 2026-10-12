@@ -1693,6 +1693,27 @@ mod tests {
     }
 
     #[test]
+    fn claimed_buffer_sizes_are_checked_before_allocating() {
+        let budget = Cell::new(64 << 20);
+        let claim = |n: i64, data: &[u8]| {
+            let mut raw = n.to_le_bytes().to_vec();
+            raw.extend_from_slice(data);
+            raw
+        };
+        // A few bytes claiming 2^63, or over the per-buffer cap: refused, nothing allocated.
+        for codec in [0, 1] {
+            assert!(decompress(codec, &claim(i64::MAX, b"\x04\x22\x4d\x18"), &budget).is_err());
+            assert!(decompress(codec, &claim((MAX_BUFFER + 1) as i64, b"x"), &budget).is_err());
+        }
+        // Within the cap but far more than 8 bytes of LZ4 can expand to.
+        assert!(lz4_frame(b"\x04\x22\x4d\x18\x60\x40\x82\0", MAX_BUFFER).is_err());
+        // The per-payload budget runs out across buffers.
+        let small = Cell::new(10);
+        assert!(decompress(1, &claim(11, b""), &small).is_err());
+        assert_eq!(budget.get(), 64 << 20, "refused claims don't use the budget");
+    }
+
+    #[test]
     fn decimals() {
         let le = |x: i128| x.to_le_bytes();
         assert_eq!(decimal(&le(-5), 2), "-0.05");

@@ -82,8 +82,10 @@ impl From<String> for TlsError {
     }
 }
 
-/// Whether the key at `path` is encrypted and `passphrase` doesn't open it
-/// (false if the file can't be read or parsed; connecting reports that).
+/// Whether the key at `path` is encrypted and `passphrase` doesn't open it.
+/// False for every other problem, where no passphrase helps: an unreadable
+/// file (connecting retries) or an unsupported or damaged key (connecting
+/// stops with `stopped · …`).
 pub fn key_needs_passphrase(path: &str, passphrase: Option<&str>) -> bool {
     matches!(
         load_key(path, passphrase),

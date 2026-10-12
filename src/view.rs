@@ -51,9 +51,13 @@ pub enum Body {
     /// JSON text, shown indented and coloured.
     Json(String),
     /// Plain lines.
-    #[allow(dead_code)] // the first users are format decoders still to come
     Lines(Vec<String>),
 }
+
+/// Raw bytes shown under a decoding error.
+const RAW_BYTES: usize = 256;
+/// Hex dumps are laid out for this many cells (16 bytes a row).
+const HEX_WIDTH: usize = 76;
 
 impl DocView {
     pub fn new(format: &'static str) -> DocView {
@@ -66,10 +70,28 @@ impl DocView {
         }
     }
 
-    /// A file that looked like `format` but couldn't be read.
-    pub fn error(format: &'static str, err: &str) -> DocView {
+    /// A payload that looked like `format` but couldn't be read: the reason,
+    /// and the start of the raw bytes so nothing is hidden.
+    pub fn error(format: &'static str, err: &str, payload: &[u8]) -> DocView {
         let mut v = DocView::new(format);
         v.notes.push(format!("could not read this {format} payload: {err}"));
+        if !payload.is_empty() {
+            let shown = &payload[..payload.len().min(RAW_BYTES)];
+            let detail = if shown.len() < payload.len() {
+                format!(
+                    "· first {} of {}",
+                    fmt::human_bytes(shown.len()),
+                    fmt::human_bytes(payload.len())
+                )
+            } else {
+                format!("· {}", fmt::human_bytes(payload.len()))
+            };
+            let lines = fmt::hex_lines(shown, HEX_WIDTH, &Theme::new(false))
+                .into_iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect();
+            v.section("Raw bytes", detail, Body::Lines(lines));
+        }
         v
     }
 
@@ -185,12 +207,19 @@ mod tests {
     }
 
     #[test]
-    fn error_view() {
-        let v = DocView::error("Avro", "bad sync marker");
+    fn error_view_keeps_the_raw_bytes() {
+        let v = DocView::error("Avro", "bad sync marker", b"Obj\x01\x00");
         assert!(!v.has_table());
         assert_eq!(
             text(&v.render(&Theme::new(false))),
-            ["note: could not read this Avro payload: bad sync marker"]
+            [
+                "Raw bytes · 5 B",
+                "00000000  4f 62 6a 01 00                                    Obj..",
+                "note: could not read this Avro payload: bad sync marker"
+            ]
         );
+        let big = vec![0u8; 1000];
+        let v = DocView::error("Avro", "x", &big);
+        assert_eq!(v.sections[0].detail, "· first 256 B of 1000 B");
     }
 }

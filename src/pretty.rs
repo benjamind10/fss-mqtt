@@ -32,9 +32,9 @@ const DECODERS: &[(&str, Decoder)] = &[
 /// Decodes binary formats that can't be read from a truncated prefix.
 pub fn decode_on_arrival(content_type: Option<&str>, payload: &[u8]) -> Option<Decoded> {
     let ct = content_type.unwrap_or("").to_ascii_lowercase();
-    DECODERS
-        .iter()
-        .find_map(|(name, decode)| decode(&ct, payload).map(|r| r.unwrap_or_else(|e| DocView::error(name, &e))))
+    DECODERS.iter().find_map(|(name, decode)| {
+        decode(&ct, payload).map(|r| r.unwrap_or_else(|e| DocView::error(name, &e, payload)))
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -744,6 +744,16 @@ mod binval {
             self.depth += 1;
             if self.depth > 64 { Err(()) } else { Ok(()) }
         }
+        fn malformed(&self) -> String {
+            format!("malformed at byte {} of {}", self.p.min(self.b.len()), self.b.len())
+        }
+        /// A document must use the whole payload.
+        fn trailing(&self, v: V) -> Result<V, String> {
+            match self.b.len() - self.p {
+                0 => Ok(v),
+                n => Err(format!("{n} unexpected bytes after the document, at byte {}", self.p)),
+            }
+        }
         fn count(&self, n: u64) -> Result<usize, ()> {
             // Every element takes at least one byte.
             if n as usize > self.b.len() - self.p {
@@ -754,10 +764,9 @@ mod binval {
         }
     }
 
-    fn as_view(name: &'static str, v: Result<V, ()>) -> Result<DocView, String> {
+    fn as_view(name: &'static str, v: Result<V, String>) -> Result<DocView, String> {
         let mut text = String::new();
-        v.map_err(|_| "malformed".to_string())?
-            .write_json(&mut text, super::DOC_BUDGET);
+        v?.write_json(&mut text, super::DOC_BUDGET);
         let mut view = DocView::new(name);
         view.section("", "", Body::Json(text));
         Ok(view)
@@ -771,9 +780,10 @@ mod binval {
         ct.contains("cbor").then(|| as_view("CBOR", cbor(b)))
     }
 
-    pub fn msgpack(b: &[u8]) -> Result<V, ()> {
+    pub fn msgpack(b: &[u8]) -> Result<V, String> {
         let mut r = R { b, p: 0, depth: 0 };
-        mp(&mut r)
+        let v = mp(&mut r).map_err(|_| r.malformed())?;
+        r.trailing(v)
     }
 
     fn mp(r: &mut R) -> Result<V, ()> {
@@ -840,9 +850,10 @@ mod binval {
         Ok(V::Map(v))
     }
 
-    pub fn cbor(b: &[u8]) -> Result<V, ()> {
+    pub fn cbor(b: &[u8]) -> Result<V, String> {
         let mut r = R { b, p: 0, depth: 0 };
-        cb(&mut r)
+        let v = cb(&mut r).map_err(|_| r.malformed())?;
+        r.trailing(v)
     }
 
     fn cb_arg(r: &mut R, info: u8) -> Result<u64, ()> {
@@ -925,7 +936,7 @@ mod binval {
     mod tests {
         use super::*;
 
-        fn json(v: Result<V, ()>) -> String {
+        fn json(v: Result<V, String>) -> String {
             let mut s = String::new();
             v.unwrap().write_json(&mut s, 4096);
             s
@@ -944,6 +955,11 @@ mod binval {
                 0xa3, 0x61, b'n', 0x21, 0x61, b'h', 0xf9, 0x3e, 0x00, 0x61, b'b', 0x42, 1, 2,
             ];
             assert_eq!(json(cbor(&cb)), r#"{"n":-2,"h":1.5,"b":"<2 bytes: 0102>"}"#);
+            assert_eq!(msgpack(&[0x92, 0x01]).err().unwrap(), "malformed at byte 1 of 2");
+            assert_eq!(
+                cbor(&[0x01, 0x02]).err().unwrap(),
+                "1 unexpected bytes after the document, at byte 1"
+            );
             assert!(msgpack(&[0xdd, 0xff, 0xff, 0xff, 0xff]).is_err());
             assert!(cbor(&[0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]).is_err());
         }

@@ -6,6 +6,7 @@
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
+use crate::compressed;
 use crate::fmt;
 use crate::parquet;
 use crate::store::Message;
@@ -24,6 +25,7 @@ pub type Decoder = fn(content_type: &str, payload: &[u8]) -> Option<Result<DocVi
 
 /// Tried in order; the first that recognises the payload wins.
 const DECODERS: &[(&str, Decoder)] = &[
+    ("compressed", compressed::sniff),
     ("Parquet", parquet::sniff),
     ("MessagePack", binval::sniff_msgpack),
     ("CBOR", binval::sniff_cbor),
@@ -32,9 +34,20 @@ const DECODERS: &[(&str, Decoder)] = &[
 /// Decodes binary formats that can't be read from a truncated prefix.
 pub fn decode_on_arrival(content_type: Option<&str>, payload: &[u8]) -> Option<Decoded> {
     let ct = content_type.unwrap_or("").to_ascii_lowercase();
-    DECODERS.iter().find_map(|(name, decode)| {
-        decode(&ct, payload).map(|r| r.unwrap_or_else(|e| DocView::error(name, &e, payload)))
-    })
+    decode(&ct, payload, "")
+}
+
+/// Decodes what a compressed payload unpacked to: every decoder but
+/// `compressed` itself, so nesting stops after one level.
+pub fn decode_unpacked(ct: &str, payload: &[u8]) -> Option<Decoded> {
+    decode(ct, payload, "compressed")
+}
+
+fn decode(ct: &str, payload: &[u8], skip: &str) -> Option<Decoded> {
+    DECODERS
+        .iter()
+        .filter(|(name, _)| *name != skip)
+        .find_map(|(name, decode)| decode(ct, payload).map(|r| r.unwrap_or_else(|e| DocView::error(name, &e, payload))))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -56,8 +69,15 @@ pub fn detect(m: &Message) -> Format {
     if let Some(v) = m.decoded.as_deref() {
         return Format::Decoded(v.format, v.has_table());
     }
-    let p = &m.payload;
-    let ct = m.props.content_type.as_deref().unwrap_or("").to_ascii_lowercase();
+    detect_payload(&m.payload, m.size, m.props.content_type.as_deref().unwrap_or(""))
+}
+
+/// The text format of `p`, the first bytes of a `size`-byte payload.
+pub fn detect_payload(p: &[u8], size: usize, content_type: &str) -> Format {
+    if size == 0 {
+        return Format::Empty;
+    }
+    let ct = content_type.to_ascii_lowercase();
     if !fmt::is_text(p) {
         return Format::Binary;
     }
@@ -99,27 +119,34 @@ impl Format {
 /// The formatted payload, one `Line` per screen line (not wrapped). `width`
 /// only sizes hex dumps.
 pub fn render(m: &Message, th: &Theme, width: usize) -> Vec<Line<'static>> {
-    let cut = m.truncated();
     // Decoded formats were read from the whole payload: nothing is cut.
     if let Some(v) = m.decoded.as_deref() {
         return v.render(th);
     }
-    let mut out = match detect(m) {
+    payload_lines(
+        &m.payload,
+        m.size,
+        m.props.content_type.as_deref().unwrap_or(""),
+        th,
+        width,
+    )
+}
+
+/// Formats `p`, the first bytes of a `size`-byte payload, and marks it when cut.
+pub fn payload_lines(p: &[u8], size: usize, content_type: &str, th: &Theme, width: usize) -> Vec<Line<'static>> {
+    let cut = p.len() < size;
+    let mut out = match detect_payload(p, size, content_type) {
         Format::Empty => vec![Line::styled("(empty payload)", th.dim.add_modifier(Modifier::ITALIC))],
         Format::Decoded(..) => vec![],
-        Format::Json => json_lines(&String::from_utf8_lossy(&m.payload), th),
-        Format::Xml => xml_lines(&String::from_utf8_lossy(&m.payload), th),
-        Format::Csv(d) => csv_lines(&String::from_utf8_lossy(&m.payload), d, cut, th),
-        Format::Text => text_lines(&m.payload, th),
-        Format::Binary => fmt::hex_lines(&m.payload, width, th),
+        Format::Json => json_lines(&String::from_utf8_lossy(p), th),
+        Format::Xml => xml_lines(&String::from_utf8_lossy(p), th),
+        Format::Csv(d) => csv_lines(&String::from_utf8_lossy(p), d, cut, th),
+        Format::Text => text_lines(p, th),
+        Format::Binary => fmt::hex_lines(p, width, th),
     };
     if cut {
         out.push(Line::styled(
-            format!(
-                "… first {} of {}",
-                fmt::human_bytes(m.payload.len()),
-                fmt::human_bytes(m.size)
-            ),
+            format!("… first {} of {}", fmt::human_bytes(p.len()), fmt::human_bytes(size)),
             th.faint,
         ));
     }

@@ -157,6 +157,7 @@ format comes from the `content-type` property when there is one, otherwise from 
 | MessagePack, CBOR (by `content-type`) | decoded and shown as JSON |
 | gzip, zstd | unpacked on arrival; what's inside is detected and formatted like any other payload |
 | Protobuf (by content-type) | raw field numbers and values, nested messages indented; no schema needed |
+| SQLite changeset / patchset | per table, the inserts, updates (old → new) and deletes |
 | other text / binary | text / hex dump |
 
 Binary formats are decoded when the message arrives, while the whole payload is still there; what's
@@ -179,6 +180,9 @@ like one of these formats but can't be read, the reason is shown above a hex dum
 - **SQLite:** read directly from the file format: tables with columns and row counts, indexes,
   views and triggers, and the first rows of each table; WITHOUT ROWID tables, overflow pages and
   UTF-16 databases are read; in WAL mode, changes still in the `-wal` file aren't part of the payload.
+- **SQLite changesets / patchsets** (from the session extension): recognised by a `content-type`
+  containing `changeset` or `patchset`, or without one when the whole payload reads as one; the
+  format doesn't carry column names, so columns are numbered (`pk c0`, `c1`, …).
 
 ## Performance notes
 

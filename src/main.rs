@@ -3,6 +3,7 @@
 mod app;
 mod arrow;
 mod avro;
+mod changeset;
 mod compressed;
 mod config;
 mod crc32;

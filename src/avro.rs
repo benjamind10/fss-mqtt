@@ -40,7 +40,8 @@ pub fn sniff(ct: &str, b: &[u8]) -> Option<Result<DocView, String>> {
         return None; // Avro's JSON encoding is shown as JSON
     }
     let mut d = DocView::new("Avro");
-    if b.len() >= 10 && b.starts_with(b"\xc3\x01") && (avro_ct || ct.is_empty()) {
+    // Two magic bytes are too weak to claim an unlabelled payload.
+    if b.len() >= 10 && b.starts_with(b"\xc3\x01") && avro_ct {
         d.summary = vec![Fact::new(commas(b.len() as u64 - 10), "bytes of data")];
         d.notes.push(format!(
             "Avro single-object encoding, schema fingerprint {}: the schema isn't in the payload",
@@ -1213,7 +1214,8 @@ mod tests {
 
         let mut so = b"\xc3\x01\x01\x02\x03\x04\x05\x06\x07\x08".to_vec();
         so.extend(&f[5..]);
-        let d = sniff("", &so).unwrap().unwrap();
+        assert!(sniff("", &so).is_none(), "two magic bytes alone don't claim a payload");
+        let d = sniff("avro/binary", &so).unwrap().unwrap();
         assert_eq!(
             d.notes,
             ["Avro single-object encoding, schema fingerprint 0102030405060708: the schema isn't in the payload"]

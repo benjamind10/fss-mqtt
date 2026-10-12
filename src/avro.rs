@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::io::Read;
 
 use crate::fmt::commas;
-use crate::parquet::{be_i128, clip, date, decimal, hex, time_of_day, timestamp, uuid};
+use crate::values::{be_i128, clip, date, decimal, hex, time_of_day, timestamp, uuid};
 use crate::view::{Body, DocView, Fact};
 
 /// Records are decoded until the rendered cells reach about this many bytes.
@@ -223,7 +223,7 @@ fn inflate<'a>(codec: &str, data: &'a [u8]) -> Result<Cow<'a, [u8]>, String> {
             let out = snap::raw::Decoder::new()
                 .decompress_vec(body)
                 .map_err(|e| format!("snappy: {e}"))?;
-            if crc32(&out).to_be_bytes() != crc {
+            if crate::crc32::crc32(&out).to_be_bytes() != crc {
                 return Err("snappy: checksum mismatch".into());
             }
             out
@@ -239,17 +239,6 @@ fn inflate<'a>(codec: &str, data: &'a [u8]) -> Result<Cow<'a, [u8]>, String> {
         }
         c => return Err(format!("{c} compression isn't supported")),
     }))
-}
-
-fn crc32(b: &[u8]) -> u32 {
-    let mut c = !0u32;
-    for &x in b {
-        c ^= x as u32;
-        for _ in 0..8 {
-            c = (c >> 1) ^ (0xedb8_8320 & (c & 1).wrapping_neg());
-        }
-    }
-    !c
 }
 
 // ── Binary encoding ────────────────────────────────────────────────────────

@@ -14,6 +14,7 @@ mod protobuf;
 mod store;
 mod theme;
 mod ui;
+mod values;
 mod view;
 mod viewer;
 

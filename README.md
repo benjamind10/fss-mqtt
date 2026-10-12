@@ -153,14 +153,20 @@ format comes from the `content-type` property when there is one, otherwise from 
 | Parquet | row count, row groups, writer and file metadata; the schema with types, null counts and min/max; the first rows as a table |
 | MessagePack, CBOR (by `content-type`) | decoded and shown as JSON |
 | gzip, zstd | unpacked on arrival; what's inside is detected and formatted like any other payload |
+| Protobuf (by content-type) | raw field numbers and values, nested messages indented; no schema needed |
 | other text / binary | text / hex dump |
 
-Parquet, MessagePack, CBOR, gzip and zstd are decoded when the message arrives, while the whole
-payload is still there; what's kept is the decoded result (about 4 KiB of rows for Parquet, the
-first 4 KiB of what a gzip or zstd payload unpacks to, at most 64 MiB of which is unpacked) next to
-the first `--max-payload` bytes. Parquet support covers flat columns with PLAIN and dictionary encodings and
-Snappy, Gzip, Zstd and LZ4 compression; nested columns and rarer encodings show the schema with a
-note.
+Binary formats are decoded when the message arrives, while the whole payload is still there; what's
+kept is the decoded result (about 4 KiB) next to the first `--max-payload` bytes. If a payload looks
+like one of these formats but can't be read, the reason is shown above a hex dump of its first bytes.
+
+- **Parquet:** flat columns with PLAIN and dictionary encodings, Snappy, Gzip, Zstd and LZ4
+  compression; nested columns and rarer encodings show the schema with a note.
+- **gzip, zstd:** at most 64 MiB is unpacked; the first 4 KiB of what's inside is kept, or the decoded
+  view if it's another binary format (e.g. a zstd-compressed Parquet file).
+- **Protobuf:** shown without a schema, like `protoc --decode_raw` (a gRPC message frame is stripped
+  first): each length-delimited field is shown as text, a nested message, a packed list of small
+  numbers or bytes, whichever it most likely is.
 
 ## Performance notes
 

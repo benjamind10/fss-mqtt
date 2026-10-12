@@ -28,7 +28,7 @@ pub struct Message {
     pub qos: u8,
     pub retain: bool,
     pub props: Props,
-    /// Binary formats decoded on arrival (Parquet, MessagePack, CBOR).
+    /// Binary formats decoded on arrival (Parquet, MessagePack, CBOR, Protobuf).
     pub decoded: Option<Box<crate::pretty::Decoded>>,
 }
 

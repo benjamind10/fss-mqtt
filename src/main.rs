@@ -9,6 +9,7 @@ mod glyph;
 mod mqtt;
 mod parquet;
 mod pretty;
+mod protobuf;
 mod store;
 mod theme;
 mod ui;

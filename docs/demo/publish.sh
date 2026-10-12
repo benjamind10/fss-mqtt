@@ -8,7 +8,7 @@ num() { awk -v seed="$(od -An -N4 -tu4 /dev/urandom)" -v lo="$1" -v hi="$2" -v d
     'BEGIN { srand(seed); printf "%." d "f", lo + rand() * (hi - lo) }'; }
 turbines=$(i=1; while [ "$i" -le "$n" ]; do printf "T%02d " "$i"; i=$((i + 1)); done)
 
-# A large XML snapshot and a binary log file, published now and then.
+# A large XML snapshot, published now and then.
 xml=/tmp/scada.xml
 {
     echo '<?xml version="1.0"?><DataStatus><StationStatus site="'"$site"'">'
@@ -17,10 +17,26 @@ xml=/tmp/scada.xml
     done
     echo '</StationStatus></DataStatus>'
 } > $xml
-head -c 819200 /dev/urandom > /tmp/fastlog.bin
 
 until pub -t "site/$site/online" -r -m true 2>/dev/null; do sleep 0.5; done
 for t in $turbines; do pub -r -t "site/$site/turbine/$t/status" -m RUNNING; done
+
+# One retained sample of each binary format the viewer decodes (see samples/make_samples.py).
+sample() { # <topic> <file> <content-type> [more mosquitto_pub options]
+    topic=$1 file=$2 ct=$3
+    shift 3
+    pub -r -t "site/$site/$topic" -f "/demo/samples/$file" -D publish content-type "$ct" "$@"
+}
+sample turbine/T01/fastlog fastlog.parquet application/vnd.apache.parquet -D publish user-property TurbineId T01
+sample turbine/T02/events events.avro application/avro -D publish user-property TurbineId T02
+sample turbine/T03/vibration samples.arrow application/vnd.apache.arrow.file -D publish user-property TurbineId T03
+sample turbine/T04/reading reading.pb application/x-protobuf -D publish user-property TurbineId T04
+sample turbine/T05/state state.msgpack application/msgpack -D publish user-property TurbineId T05
+sample turbine/T02/cms vibration.cbor application/cbor -D publish user-property TurbineId T02
+sample config/turbines.db turbines.db application/vnd.sqlite3 -D publish user-property Version 3
+sample config/setpoints setpoints.changeset application/vnd.sqlite3.changeset -D publish user-property Version 4
+sample export/daily.csv daily.csv text/csv -D publish user-property Date 2026-10-07
+sample scada/summary summary.json.gz application/gzip -D publish user-property ProviderName SiteSummary
 
 i=0
 while true; do
@@ -49,8 +65,8 @@ while true; do
     fi
     if [ $((i % 11)) -eq 0 ]; then
         t=T0$(( (i / 11) % n + 1 ))
-        pub -r -t "site/$site/turbine/$t/fastlog" -f /tmp/fastlog.bin \
-            -D publish content-type application/parquet -D publish user-property TurbineId "$t"
+        pub -r -t "site/$site/turbine/$t/fastlog" -f /demo/samples/fastlog.parquet \
+            -D publish content-type application/vnd.apache.parquet -D publish user-property TurbineId "$t"
     fi
     if [ $((i % 13)) -eq 0 ]; then
         t=T0$(( (i / 13) % n + 1 ))

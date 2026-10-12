@@ -29,7 +29,7 @@ Sleep 400ms
 Down
 Right
 Sleep 400ms
-Down@300ms 4
+Down@300ms 6
 Right
 Sleep 400ms
 Down
@@ -62,15 +62,88 @@ Sleep 400ms
 Escape
 Sleep 600ms
 
-# A large binary payload: only the size shows in the tree.
-Type "fastlog"
-Sleep 2s
+# Binary formats are decoded on arrival: Parquet, Avro, Arrow, SQLite and its changesets,
+# Protobuf without a schema, MessagePack, CBOR, CSV, and gzip unpacked first.
+Type@50ms "fastlog"
+Sleep 500ms
 Enter
 Sleep 2.5s
 Escape
-Sleep 400ms
+Sleep 200ms
 Escape
-Sleep 600ms
+Sleep 300ms
+Type@50ms "events"
+Sleep 500ms
+Enter
+Sleep 1.9s
+Escape
+Sleep 200ms
+Escape
+Sleep 300ms
+Type@50ms "vibration"
+Sleep 500ms
+Enter
+Sleep 2.2s
+Escape
+Sleep 200ms
+Escape
+Sleep 300ms
+Type@50ms "turbines.db"
+Sleep 500ms
+Enter
+Sleep 2.2s
+Escape
+Sleep 200ms
+Escape
+Sleep 300ms
+Type@50ms "setpoints"
+Sleep 500ms
+Enter
+Sleep 2.2s
+Escape
+Sleep 200ms
+Escape
+Sleep 300ms
+Type@50ms "reading"
+Sleep 500ms
+Enter
+Sleep 1.9s
+Escape
+Sleep 200ms
+Escape
+Sleep 300ms
+Type@50ms "state"
+Sleep 500ms
+Enter
+Sleep 1.9s
+Escape
+Sleep 200ms
+Escape
+Sleep 300ms
+Type@50ms "cms"
+Sleep 500ms
+Enter
+Sleep 1.9s
+Escape
+Sleep 200ms
+Escape
+Sleep 300ms
+Type@50ms "daily"
+Sleep 500ms
+Enter
+Sleep 1.9s
+Escape
+Sleep 200ms
+Escape
+Sleep 300ms
+Type@50ms "summary"
+Sleep 500ms
+Enter
+Sleep 1.9s
+Escape
+Sleep 200ms
+Escape
+Sleep 300ms
 
 # MQTT patterns match below each broker.
 Type "site/+/grid"

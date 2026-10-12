@@ -78,11 +78,12 @@ impl ArrowView {
     fn to_view(&self) -> DocView {
         let mut d = DocView::new("Arrow");
         let n = |k: u64, one: &str, many: &str| Fact::new(commas(k), if k == 1 { one } else { many });
+        // Same order as Parquet's: rows, groups, columns, then how it's stored.
         d.summary = vec![
-            Fact::new("", self.kind),
-            n(self.batches as u64, "record batch", "record batches"),
             n(self.num_rows, "row", "rows"),
+            n(self.batches as u64, "record batch", "record batches"),
             n(self.columns.len() as u64, "column", "columns"),
+            Fact::new("", self.kind),
         ];
         if let Some(c) = self.codec {
             d.summary.push(Fact::new("", c));
@@ -1677,7 +1678,7 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
-        assert_eq!(t[0], "stream · 3 record batches · 500 rows · 11 columns · lz4");
+        assert_eq!(t[0], "500 rows · 3 record batches · 11 columns · stream · lz4");
         assert_eq!(t[1], "ProviderName TurbineFastlog");
         assert_eq!(t[2], "Version 1.0.0");
         assert_eq!(t[4], "Schema");

@@ -422,7 +422,7 @@ fn unit_digits(t: &T) -> u32 {
     }
 }
 
-fn clip(s: String) -> String {
+pub fn clip(s: String) -> String {
     if s.chars().count() <= MAX_CELL {
         return s;
     }
@@ -773,12 +773,12 @@ fn civil(days: i64) -> (i64, u32, u32) {
     (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
-fn date(days: i64) -> String {
+pub fn date(days: i64) -> String {
     let (y, m, d) = civil(days);
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-fn time_of_day(t: i64, digits: u32) -> String {
+pub fn time_of_day(t: i64, digits: u32) -> String {
     let per_sec = 10i64.pow(digits);
     let secs = t.div_euclid(per_sec);
     let frac = t.rem_euclid(per_sec);
@@ -790,7 +790,7 @@ fn time_of_day(t: i64, digits: u32) -> String {
     }
 }
 
-fn timestamp(t: i64, digits: u32, utc: bool) -> String {
+pub fn timestamp(t: i64, digits: u32, utc: bool) -> String {
     let per_day = 86_400 * 10i64.pow(digits);
     let days = t.div_euclid(per_day);
     let rest = t.rem_euclid(per_day);
@@ -802,7 +802,7 @@ fn timestamp(t: i64, digits: u32, utc: bool) -> String {
     )
 }
 
-fn decimal(x: i128, scale: i64) -> String {
+pub fn decimal(x: i128, scale: i64) -> String {
     if scale <= 0 {
         return x.to_string();
     }
@@ -814,7 +814,7 @@ fn decimal(x: i128, scale: i64) -> String {
     format!("{}{int}.{frac}", if neg { "-" } else { "" })
 }
 
-fn be_i128(b: &[u8]) -> Option<i128> {
+pub fn be_i128(b: &[u8]) -> Option<i128> {
     if b.is_empty() || b.len() > 16 {
         return None;
     }
@@ -824,12 +824,12 @@ fn be_i128(b: &[u8]) -> Option<i128> {
     Some(i128::from_be_bytes(buf))
 }
 
-fn uuid(b: &[u8]) -> String {
+pub fn uuid(b: &[u8]) -> String {
     let h = hex(b);
     format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
 }
 
-fn hex(b: &[u8]) -> String {
+pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 

@@ -1,11 +1,11 @@
-//! Payload formatting: JSON, XML, CSV/TSV, Parquet, MessagePack, CBOR and
-//! Protobuf, with text and hex as the fallbacks. Text formats are formatted from the
+//! Payload formatting: JSON, XML, CSV/TSV and text are formatted from the
 //! stored prefix of the payload and tolerate being cut off; binary formats
-//! are decoded on arrival (see [`decode_on_arrival`]).
+//! (see `DECODERS`) are decoded on arrival, with hex as the fallback.
 
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
+use crate::avro;
 use crate::compressed;
 use crate::fmt;
 use crate::parquet;
@@ -31,6 +31,7 @@ const DECODERS: &[(&str, Decoder)] = &[
     ("MessagePack", binval::sniff_msgpack),
     ("CBOR", binval::sniff_cbor),
     ("Protobuf", protobuf::sniff),
+    ("Avro", avro::sniff),
 ];
 
 /// Decodes binary formats that can't be read from a truncated prefix.

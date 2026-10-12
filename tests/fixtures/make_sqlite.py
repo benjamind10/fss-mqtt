@@ -127,5 +127,29 @@ INSERT INTO power (kw, site, note) VALUES (2500.0, 'falster', 'a'), (1800.0, 'lo
 """)
 db.close()
 
-for name in ("turbine.db", "deep.db", "overflow.db", "without_rowid.db", "utf16.db", "wal.db", "empty.db", "generated.db"):
+# Columns added after rows exist: those rows read the DEFAULT.
+db = fresh("altered.db")
+db.executescript("""
+CREATE TABLE meters (id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO meters (name) VALUES ('m1'), ('m2');
+ALTER TABLE meters ADD COLUMN unit TEXT DEFAULT 'it''s kWh';
+ALTER TABLE meters ADD COLUMN scale REAL DEFAULT -1.5;
+ALTER TABLE meters ADD COLUMN note TEXT;
+INSERT INTO meters (name, unit, scale, note) VALUES ('m3', 'MWh', 1000, 'new');
+""")
+db.close()
+
+# Auto-vacuum: pointer-map pages sit between the b-tree pages.
+db = fresh("autovacuum.db", page_size=512)
+db.execute("PRAGMA auto_vacuum = FULL")
+db.execute("CREATE TABLE a (x INTEGER, y TEXT)")
+db.execute("CREATE TABLE b (x INTEGER, y TEXT)")
+for i in range(300):
+    db.execute("INSERT INTO a VALUES (?, ?)", (i, "a" * 40))
+    db.execute("INSERT INTO b VALUES (?, ?)", (i, "b" * 40))
+db.execute("DELETE FROM a WHERE x % 3 = 0")
+db.close()
+
+for name in ("turbine.db", "deep.db", "overflow.db", "without_rowid.db", "utf16.db", "wal.db", "empty.db", "generated.db",
+             "altered.db", "autovacuum.db"):
     print(name, os.path.getsize(name))

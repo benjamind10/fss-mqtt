@@ -323,6 +323,11 @@ pub fn decode(file: &[u8]) -> Result<SqliteView, String> {
         let mut used = 0;
         let res = db.rows(*root, |rowid, rec| {
             let mut row: Vec<Option<String>> = vec![None; def.columns.len()];
+            // Records written before an ALTER TABLE ADD COLUMN are shorter: those
+            // columns read as their DEFAULT.
+            for &c in order.iter().skip(rec.len()) {
+                row[c] = def.columns[c].default.clone();
+            }
             for (i, v) in rec.iter().enumerate() {
                 match order.get(i) {
                     // REAL columns store whole numbers as integers.
@@ -867,6 +872,9 @@ struct ColumnDef {
     pk_desc: bool,
     /// A VIRTUAL generated column: not stored in the record.
     generated: bool,
+    /// The DEFAULT value as shown, for records written before the column was
+    /// added (ALTER TABLE ADD COLUMN): `None` when there's no default (NULL).
+    default: Option<String>,
 }
 
 impl TableDef {
@@ -968,6 +976,45 @@ fn tokens(s: &str) -> Vec<(Tok, usize, usize)> {
 }
 
 /// An identifier without its quotes.
+/// A column's DEFAULT as it would read back: a literal (`'a''b'` → `a'b`,
+/// `-1.5`, TRUE → 1), NULL → `None`, anything computed is described instead.
+fn default_value<'a>(toks: &[(Tok, usize, usize)], text: impl Fn(&(Tok, usize, usize)) -> &'a str) -> Option<String> {
+    let first = toks.first()?;
+    let word = text(first);
+    match first.0 {
+        Tok::Str => {
+            let inner = word.strip_prefix('\'').unwrap_or(word);
+            Some(inner.strip_suffix('\'').unwrap_or(inner).replace("''", "'"))
+        }
+        Tok::Punct if word == "-" || word == "+" => {
+            let n = adjacent(&toks[1..], &text);
+            Some(if word == "-" { format!("-{n}") } else { n })
+        }
+        Tok::Punct if word == "(" => Some("(default expression)".into()),
+        Tok::Word if word.eq_ignore_ascii_case("NULL") => None,
+        Tok::Word if word.eq_ignore_ascii_case("TRUE") => Some("1".into()),
+        Tok::Word if word.eq_ignore_ascii_case("FALSE") => Some("0".into()),
+        Tok::Word if word.to_ascii_uppercase().starts_with("CURRENT_") => {
+            Some(format!("({})", word.to_ascii_uppercase()))
+        }
+        _ => Some(adjacent(toks, &text)),
+    }
+}
+
+/// The text of the tokens that follow each other without a gap: `1`, `.`, `5` → `1.5`.
+fn adjacent<'a>(toks: &[(Tok, usize, usize)], text: &impl Fn(&(Tok, usize, usize)) -> &'a str) -> String {
+    let mut out = String::new();
+    let mut end = None;
+    for t in toks {
+        if end.is_some_and(|e| e != t.1) || (end.is_some() && t.0 == Tok::Str) {
+            break;
+        }
+        out.push_str(text(t));
+        end = Some(t.2);
+    }
+    out
+}
+
 fn ident(s: &str, kind: Tok) -> String {
     let inner = |q: char| {
         let t = s.strip_prefix(q).unwrap_or(s);
@@ -1081,6 +1128,10 @@ fn parse_create_table(sql: &str) -> TableDef {
         let cons = &rest[cut..];
         let pk = cons.windows(2).position(|w| is(&w[0], "PRIMARY") && is(&w[1], "KEY"));
         let generated = cons.iter().any(|t| is(t, "AS")) && !cons.iter().any(|t| is(t, "STORED"));
+        let default = cons
+            .iter()
+            .position(|t| is(t, "DEFAULT"))
+            .and_then(|d| default_value(&cons[d + 1..], text));
         if pk.is_some() {
             column_pk.push(def.columns.len());
         }
@@ -1089,6 +1140,7 @@ fn parse_create_table(sql: &str) -> TableDef {
             ty,
             pk_desc: pk.is_some_and(|p| cons.get(p + 2).is_some_and(|t| is(t, "DESC"))),
             generated,
+            default,
         });
     }
     def.pk = if column_pk.is_empty() {
@@ -1254,6 +1306,97 @@ mod tests {
             .map(|c| c.as_ref().map_or(4, |s| s.len()) + 1)
             .sum();
         assert!(rendered <= ROW_BUDGET, "rows use {rendered} bytes");
+    }
+
+    /// The rows of one table, as rendered cells.
+    fn table_rows(file: &str, table: &str) -> Vec<Vec<String>> {
+        let v = sniff("", &fixture(file)).unwrap().unwrap();
+        let s = v.sections.iter().find(|s| s.title == table).expect(table);
+        match &s.body {
+            Body::Table { rows, .. } => rows
+                .iter()
+                .map(|r| r.iter().map(|c| c.as_deref().unwrap_or("null").to_string()).collect())
+                .collect(),
+            _ => panic!("not a table"),
+        }
+    }
+
+    #[test]
+    fn added_columns_read_their_default() {
+        // m1 and m2 were written before the three ALTER TABLE ADD COLUMNs.
+        assert_eq!(
+            table_rows("altered.db", "meters"),
+            [
+                ["1", "m1", "it's kWh", "-1.5", "null"],
+                ["2", "m2", "it's kWh", "-1.5", "null"],
+                ["3", "m3", "MWh", "1000.0", "new"],
+            ]
+        );
+        let toks = |sql: &'static str| (sql, tokens(sql));
+        for (sql, want) in [
+            ("DEFAULT 'a''b'", Some("a'b")),
+            ("DEFAULT -7", Some("-7")),
+            ("DEFAULT 1.5e3 NOT NULL", Some("1.5e3")),
+            ("DEFAULT NULL", None),
+            ("DEFAULT TRUE", Some("1")),
+            ("DEFAULT current_timestamp", Some("(CURRENT_TIMESTAMP)")),
+            ("DEFAULT (1 + 2)", Some("(default expression)")),
+            ("DEFAULT 'unterminated ø", Some("unterminated ø")),
+        ] {
+            let (sql, t) = toks(sql);
+            assert_eq!(default_value(&t[1..], |t| &sql[t.1..t.2]).as_deref(), want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn auto_vacuum_pointer_map_pages() {
+        // auto_vacuum=FULL puts pointer-map pages between the b-tree pages; they
+        // aren't part of any table and mustn't be read as one.
+        let v = sniff("", &fixture("autovacuum.db")).unwrap().unwrap();
+        let counts = match &v.sections[0].body {
+            Body::Table { rows, .. } => rows.iter().map(|r| (r[0].clone(), r[1].clone())).collect::<Vec<_>>(),
+            _ => panic!(),
+        };
+        assert_eq!(
+            counts,
+            [
+                (Some("a".into()), Some("200".into())),
+                (Some("b".into()), Some("300".into()))
+            ]
+        );
+        assert!(v.notes.is_empty(), "{:?}", v.notes);
+    }
+
+    #[test]
+    fn record_headers() {
+        let file = fixture("empty.db");
+        let db = Db::open(&file).unwrap();
+        // header size 6 (itself included); types NULL, int8, 1, text(1), blob(2); then the body.
+        let rec = [6, 0, 1, 9, 15, 16, 0x7f, b'x', 0xca, 0xfe];
+        assert_eq!(
+            db.record(&rec).unwrap(),
+            [
+                Value::Null,
+                Value::Int(127),
+                Value::Int(1),
+                Value::Text("x".into()),
+                Value::Blob(2, vec![0xca, 0xfe])
+            ]
+        );
+        // A real: serial type 7, 8 bytes big-endian.
+        let mut rec = vec![2, 7];
+        rec.extend(2.5f64.to_be_bytes());
+        assert_eq!(db.record(&rec).unwrap(), [Value::Real(2.5)]);
+        // Negative 24-bit integer (type 3).
+        assert_eq!(db.record(&[2, 3, 0xff, 0xff, 0xfe]).unwrap(), [Value::Int(-2)]);
+        // Header longer than the record, reserved types, and a value past the end.
+        assert!(db.record(&[9, 1]).is_err());
+        assert!(db.record(&[2, 10]).is_err());
+        assert_eq!(db.record(&[2, 4, 1]).unwrap(), [Value::Cut]);
+        // Multi-byte varint header size and serial type (text of 100 bytes: 13 + 2*100 = 213).
+        let mut rec = vec![3, 0x81, 0x55];
+        rec.extend([b'a'; 100]);
+        assert_eq!(db.record(&rec).unwrap(), [Value::Text("a".repeat(100))]);
     }
 
     #[test]

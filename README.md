@@ -152,9 +152,7 @@ format comes from the `content-type` property when there is one, otherwise from 
 | CSV, TSV (`,` `;` tab `|`) | an aligned table, numbers right-aligned |
 | Parquet | row count, row groups, writer and file metadata; the schema with types, null counts and min/max; the first rows as a table |
 | Avro container files | schema, record count and codec, the first records as a table; schema-registry framing is recognised and explained |
-- **Arrow IPC:** file and stream formats, LZ4 or Zstd compressed buffers, dictionary-encoded
-  columns; nested values are shown inline (`[a, b]`, `{x: 1}`); Union, view types and run-end
-  encoded columns are noted.
+| Arrow IPC (file and stream) | schema, record batches and row count, the first rows as a table |
 | MessagePack, CBOR (by `content-type`) | decoded and shown as JSON |
 | gzip, zstd | unpacked on arrival; what's inside is detected and formatted like any other payload |
 | Protobuf (by content-type) | raw field numbers and values, nested messages indented; no schema needed |

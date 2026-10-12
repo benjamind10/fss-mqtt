@@ -11,6 +11,7 @@ use crate::compressed;
 use crate::fmt;
 use crate::parquet;
 use crate::protobuf;
+use crate::sqlite;
 use crate::store::Message;
 use crate::theme::Theme;
 use crate::view::DocView;
@@ -34,6 +35,7 @@ const DECODERS: &[(&str, Decoder)] = &[
     ("Protobuf", protobuf::sniff),
     ("Avro", avro::sniff),
     ("Arrow", arrow::sniff),
+    ("SQLite", sqlite::sniff),
 ];
 
 /// Decodes binary formats that can't be read from a truncated prefix.

@@ -12,6 +12,7 @@ mod mqtt;
 mod parquet;
 mod pretty;
 mod protobuf;
+mod sqlite;
 mod store;
 mod theme;
 mod ui;

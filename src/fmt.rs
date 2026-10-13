@@ -133,10 +133,28 @@ pub fn steady(c: char) -> bool {
         )
 }
 
-/// Combining diacritics (é written as e + ◌́), which terminals draw on the
-/// character before them.
-pub fn is_diacritic(c: char) -> bool {
-    matches!(c as u32, 0x300..=0x36F)
+/// Combining marks in any script (é written as e + ◌́, Devanagari vowel signs,
+/// Thai tone marks, Arabic harakat …): zero-width characters that terminals
+/// draw on the character before them. Not the invisible format characters
+/// (soft hyphen, bidi controls, zero-width space and joiner, variation
+/// selectors, tags) or Hangul's conjoining jamo, which terminals handle
+/// inconsistently.
+pub fn is_mark(c: char) -> bool {
+    c.width() == Some(0)
+        && !matches!(
+            c as u32,
+            0x00 | 0xAD
+                | 0x061C
+                | 0x1160..=0x11FF
+                | 0x180B..=0x180F
+                | 0x200B..=0x200F
+                | 0x2028..=0x202E
+                | 0x2060..=0x206F
+                | 0xD7B0..=0xD7FF
+                | 0xFE00..=0xFE0F
+                | 0xFEFF
+                | 0xE0000..=0xE0FFF
+        )
 }
 
 /// At most `max` bytes of `b` as one printable line. Binary payloads show only
@@ -159,7 +177,10 @@ pub fn one_line(b: &[u8], max: usize) -> String {
             '\n' => Some(crate::glyph::NEWLINE),
             '\r' => None,
             '\t' => Some(' '),
-            c if steady(c) || is_diacritic(c) => Some(c),
+            // Emoji joiners and presentation selectors only change how a
+            // character looks; dropped, ❤️ shows as ❤ and 👨‍👩‍👧 as 👨👩👧.
+            '\u{200D}' | '\u{FE0E}' | '\u{FE0F}' => None,
+            c if steady(c) || is_mark(c) => Some(c),
             _ => Some('·'),
         })
         .collect()
@@ -318,9 +339,12 @@ mod tests {
         assert_eq!(one_line(pb, 64), "··T04······@%···");
         // Text keeps its letters, CJK, emoji and accents; the rest becomes ·.
         let s = "Ørsted 風力 ❤ e\u{301} \u{202E}rtl\u{200B}\u{AD}\u{E000}\u{2028}❤\u{FE0F}\u{E0041}\u{40000}!";
-        assert_eq!(one_line(s.as_bytes(), 256), "Ørsted 風力 ❤ e\u{301} ·rtl····❤···!");
+        assert_eq!(one_line(s.as_bytes(), 256), "Ørsted 風力 ❤ e\u{301} ·rtl····❤··!");
+        // Marks in other scripts stay; emoji joiners and selectors go.
+        assert_eq!(one_line("हिन्दी ไม้ שָׁלוֹם".as_bytes(), 256), "हिन्दी ไม้ שָׁלוֹם");
+        assert_eq!(one_line("✔\u{FE0F} 👨\u{200D}👩\u{200D}👧".as_bytes(), 256), "✔ 👨👩👧");
         for c in one_line(s.as_bytes(), 256).chars() {
-            assert!(steady(c) || is_diacritic(c), "{c:?}");
+            assert!(steady(c) || is_mark(c), "{c:?}");
         }
         assert!(steady('a') && steady('風') && steady('🌬'));
         assert!(!steady('\u{200D}') && !steady('\u{FE0F}') && !steady('\u{1b}') && !steady('\u{9b}'));

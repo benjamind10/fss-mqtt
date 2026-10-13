@@ -35,7 +35,7 @@ fn steady_cells(buf: &mut Buffer) {
         }
         let mut chars = sym.chars();
         let first = chars.next().filter(|&c| fmt::steady(c));
-        if first.is_some() && chars.all(fmt::is_diacritic) {
+        if first.is_some() && chars.all(fmt::is_mark) {
             continue;
         }
         // Keep the base of a cluster (an emoji without its joiners and
@@ -1216,7 +1216,7 @@ mod tests {
             assert!(v.contains("v1/odd") && v.contains("rtl"), "{v}");
             for c in v.chars() {
                 assert!(
-                    c == '\n' || crate::fmt::steady(c) || crate::fmt::is_diacritic(c),
+                    c == '\n' || crate::fmt::steady(c) || crate::fmt::is_mark(c),
                     "{c:?} reached the terminal"
                 );
             }

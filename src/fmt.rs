@@ -120,9 +120,35 @@ fn local_parts(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
     )
 }
 
-/// At most `max` bytes of `b` as one printable line.
+/// Whether terminals reliably draw `c` as wide as `unicode-width` says. When
+/// they don't, the rest of the row shifts and spills onto the next line, so
+/// such characters are shown as `·`: zero-width and control characters, soft
+/// hyphens, line separators, private-use and special code points, and
+/// anything past the CJK planes (tags, unassigned, private use).
+pub fn steady(c: char) -> bool {
+    matches!(c.width(), Some(1 | 2))
+        && !matches!(
+            c as u32,
+            0xAD | 0x2028 | 0x2029 | 0xE000..=0xF8FF | 0xFFF0..=0xFFFF | 0x40000..
+        )
+}
+
+/// Combining diacritics (é written as e + ◌́), which terminals draw on the
+/// character before them.
+pub fn is_diacritic(c: char) -> bool {
+    matches!(c as u32, 0x300..=0x36F)
+}
+
+/// At most `max` bytes of `b` as one printable line. Binary payloads show only
+/// their printable ASCII; stray Unicode decoded from binary bytes is noise.
 pub fn one_line(b: &[u8], max: usize) -> String {
     let b = &b[..b.len().min(max)];
+    if !is_text(b) {
+        return b
+            .iter()
+            .map(|&c| if (0x20..0x7f).contains(&c) { c as char } else { '·' })
+            .collect();
+    }
     let s = match std::str::from_utf8(b) {
         Ok(s) => s.to_string(),
         Err(e) if e.error_len().is_none() => String::from_utf8_lossy(&b[..e.valid_up_to()]).into_owned(),
@@ -133,9 +159,8 @@ pub fn one_line(b: &[u8], max: usize) -> String {
             '\n' => Some(crate::glyph::NEWLINE),
             '\r' => None,
             '\t' => Some(' '),
-            '\u{FFFD}' => Some('·'),
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => Some('·'),
-            c => Some(c),
+            c if steady(c) || is_diacritic(c) => Some(c),
+            _ => Some('·'),
         })
         .collect()
 }
@@ -279,9 +304,25 @@ mod tests {
     #[test]
     fn misc() {
         assert_eq!(commas(1234567), "1,234,567");
-        assert_eq!(one_line(b"a\nb\x01", 10), format!("a{}b·", crate::glyph::NEWLINE));
+        assert_eq!(one_line(b"a\nb\tc", 10), format!("a{}b c", crate::glyph::NEWLINE));
         assert!(is_text(b"hello"));
         assert!(!is_text(&[0, 1, 2, 0xff]));
         assert_eq!(trunc_left("v1/plant/temp", 6), "…/temp");
+    }
+
+    #[test]
+    fn one_line_keeps_cells_steady() {
+        // Binary: printable ASCII only, even where the bytes happen to be valid UTF-8 (ћ).
+        let pb = b"\x0a\x03T04\x11\xd1\x9b\x00\x00\x00@%\x1a\x01\x00";
+        assert!(!is_text(pb));
+        assert_eq!(one_line(pb, 64), "··T04······@%···");
+        // Text keeps its letters, CJK, emoji and accents; the rest becomes ·.
+        let s = "Ørsted 風力 ❤ e\u{301} \u{202E}rtl\u{200B}\u{AD}\u{E000}\u{2028}❤\u{FE0F}\u{E0041}\u{40000}!";
+        assert_eq!(one_line(s.as_bytes(), 256), "Ørsted 風力 ❤ e\u{301} ·rtl····❤···!");
+        for c in one_line(s.as_bytes(), 256).chars() {
+            assert!(steady(c) || is_diacritic(c), "{c:?}");
+        }
+        assert!(steady('a') && steady('風') && steady('🌬'));
+        assert!(!steady('\u{200D}') && !steady('\u{FE0F}') && !steady('\u{1b}') && !steady('\u{9b}'));
     }
 }

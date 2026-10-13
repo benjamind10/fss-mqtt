@@ -7,6 +7,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Ask, Focus, PanelRow, msg_index, node_title};
 use crate::fmt::{self, ago, commas, human_bytes, human_count, msg_count, plural};
@@ -18,6 +19,34 @@ use crate::theme::Theme;
 const ACTIVE_FOR: Duration = Duration::from_millis(1500);
 
 pub fn draw(f: &mut Frame, app: &App) {
+    draw_all(f, app);
+    steady_cells(f.buffer_mut());
+}
+
+/// Replaces what terminals might draw wider or narrower than the buffer
+/// assumes (see [`fmt::steady`]); such a cell shifts the rest of its row,
+/// which then wraps onto the next line. Payloads, topics and properties can
+/// hold any character, so this runs over the whole frame.
+fn steady_cells(buf: &mut Buffer) {
+    for cell in buf.content.iter_mut() {
+        let sym = cell.symbol();
+        if sym.is_ascii() {
+            continue;
+        }
+        let mut chars = sym.chars();
+        let first = chars.next().filter(|&c| fmt::steady(c));
+        if first.is_some() && chars.all(fmt::is_diacritic) {
+            continue;
+        }
+        // Keep the base of a cluster (an emoji without its joiners and
+        // selectors) if it fits the cells the cluster took.
+        let fits = first.filter(|c| c.width().unwrap_or(0) <= sym.width());
+        let keep = fits.map_or_else(|| "·".to_string(), String::from);
+        cell.set_symbol(&keep);
+    }
+}
+
+fn draw_all(f: &mut Frame, app: &App) {
     let area = f.area();
     if area.width < 10 || area.height < 8 {
         return;
@@ -1161,6 +1190,38 @@ mod tests {
         frame(&app, "search truck");
         app.resize(60, 30);
         frame(&app, "narrow");
+    }
+
+    #[test]
+    fn odd_characters_stay_in_their_cells() {
+        let cfg = tmp_config("odd");
+        let (mut app, _rx) = sample(cfg.clone());
+        let odd =
+            "rtl\u{202E}x\u{200B}y\u{AD}z\u{E000}\u{2028}❤\u{FE0F}👨\u{200D}👩\u{1F3FB}\u{E0041}\u{40000}e\u{301}";
+        let props = Props {
+            user: vec![(odd.into(), odd.into())],
+            ..Props::default()
+        };
+        app.store
+            .lock()
+            .unwrap()
+            .add(0, &format!("v1/odd{odd}"), odd.as_bytes(), 0, false, props);
+        app.tick();
+        typ(&mut app, "v1/odd");
+        press(&mut app, &[KeyCode::Down]);
+        let mut views = vec![frame(&app, "odd characters")];
+        press(&mut app, &[KeyCode::Enter]);
+        views.push(frame(&app, "odd characters, viewer"));
+        for v in views {
+            assert!(v.contains("v1/odd") && v.contains("rtl"), "{v}");
+            for c in v.chars() {
+                assert!(
+                    c == '\n' || crate::fmt::steady(c) || crate::fmt::is_diacritic(c),
+                    "{c:?} reached the terminal"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&cfg);
     }
 
     #[test]

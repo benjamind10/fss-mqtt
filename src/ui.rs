@@ -175,13 +175,23 @@ fn panel_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
         };
         lines.push(line);
     }
-    let up = st
-        .conns
-        .iter()
-        .filter(|c| c.status.state == ConnState::Connected)
-        .count();
-    let title = format!("Connections {up}/{}", st.conns.len());
+    let up = st.live().filter(|c| c.status.state == ConnState::Connected).count();
+    let title = format!("Connections {up}/{}", st.live().count());
     draw_box(buf, r, &title, lines, focused, sel_line, th);
+    // Where the connections live; edits to the file apply while running.
+    border_label(buf, r, &crate::config::tilde(&app.config_path), th.faint);
+}
+
+/// Writes `label` into the bottom border of `r`, right-aligned, keeping its
+/// end (the file name) when it has to be cut.
+fn border_label(buf: &mut Buffer, r: Rect, label: &str, style: ratatui::style::Style) {
+    let room = (r.width as usize).saturating_sub(8);
+    if room < 12 || r.height < 2 {
+        return;
+    }
+    let text = format!(" {} ", fmt::trunc_left(label, room));
+    let x = r.right() - 2 - fmt::str_width(&text) as u16;
+    buf.set_string(x, r.bottom() - 1, text, style);
 }
 
 fn prompt_box(buf: &mut Buffer, area: Rect, app: &App, st: &Store) {
@@ -279,18 +289,14 @@ fn draw_box(buf: &mut Buffer, r: Rect, title: &str, lines: Vec<Line>, focused: b
 
 fn header<'a>(app: &App, st: &Store) -> Line<'a> {
     let th = &app.th;
-    let up = st
-        .conns
-        .iter()
-        .filter(|c| c.status.state == ConnState::Connected)
-        .count();
-    let failing = st.conns.iter().filter(|c| c.status.err.is_some()).count();
+    let up = st.live().filter(|c| c.status.state == ConnState::Connected).count();
+    let failing = st.live().filter(|c| c.status.err.is_some()).count();
     let mut left = vec![
         Span::raw(" "),
         Span::styled(format!("{} fss-mqtt", glyph::LOGO), th.accent_b),
         Span::raw("  "),
         Span::styled(
-            format!("{up}/{} connected", st.conns.len()),
+            format!("{up}/{} connected", st.live().count()),
             if up > 0 { th.green } else { th.dim },
         ),
     ];
@@ -326,8 +332,8 @@ fn tree_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
     let mut lines = Vec::new();
     if app.rows.is_empty() || (st.topic_count() == 0 && app.filter_text.is_empty()) {
         if st.topic_count() == 0 && app.filter_text.is_empty() {
-            let up = st.conns.iter().any(|c| c.status.state == ConnState::Connected);
-            let refused = st.conns.iter().flat_map(|c| &c.subs).any(|s| s.err.is_some());
+            let up = st.live().any(|c| c.status.state == ConnState::Connected);
+            let refused = st.live().flat_map(|c| &c.subs).any(|s| s.err.is_some());
             lines.push(Line::default());
             if refused {
                 lines.push(Line::styled(
@@ -1221,6 +1227,151 @@ mod tests {
                 );
             }
         }
+        let _ = std::fs::remove_file(&cfg);
+    }
+
+    #[test]
+    fn connections_file_reloads_live() {
+        let cfg = tmp_config("reload");
+        let (mut app, rx) = sample(cfg.clone());
+        let (total, staging_msgs) = {
+            let st = app.store.lock().unwrap();
+            (st.total(), st.nodes[st.conns[1].node].sub_msgs)
+        };
+        let local = app.ctls[0].cfg.clone();
+
+        // local (connected): v2/# dropped, v3/# added, applied live. staging
+        // removed. lab added (no autoconnect, so it stays disconnected).
+        let edited = ConnCfg {
+            topics: vec!["v1/#".into(), "v3/#".into()],
+            ..local.clone()
+        };
+        let lab = ConnCfg {
+            name: "lab".into(),
+            url: "mqtt://lab:1883".into(),
+            topics: vec!["#".into()],
+            ..Default::default()
+        };
+        // The rate's last sample saw every message, so the removal makes
+        // the total smaller than it; the next rate must not underflow.
+        app.rate_total = total;
+        app.rate_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.apply_config(vec![edited.clone(), lab]);
+        app.tick();
+        assert_eq!(app.rate, 0.0);
+        assert!(matches!(rx[0].try_recv(), Ok(Cmd::Subscribe(t)) if t == "v3/#"));
+        assert!(matches!(rx[0].try_recv(), Ok(Cmd::Unsubscribe(t)) if t == "v2/#"));
+        assert!(rx[0].try_recv().is_err(), "subscription edits must not reconnect");
+        assert!(matches!(rx[1].try_recv(), Ok(Cmd::Disconnect)));
+        assert!(rx[1].recv().is_err(), "a removed connection's thread is let go");
+        {
+            let st = app.store.lock().unwrap();
+            assert!(st.conns[1].removed);
+            assert_eq!(st.total(), total - staging_msgs, "removed messages leave the totals");
+            assert_eq!(st.live().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["local", "lab"]);
+            let subs: Vec<_> = st.conns[0].subs.iter().map(|s| s.topic.as_str()).collect();
+            assert_eq!(subs, ["v1/#", "v3/#"]);
+        }
+        let v = frame(&app, "reloaded");
+        assert!(v.contains("lab") && v.contains("v3/#") && !v.contains("staging") && !v.contains("v2/#"));
+        assert!(v.contains("connections reloaded: 1 added, 1 changed, 1 removed"), "{v}");
+        assert!(
+            v.contains(&format!("fss-mqtt-test-{}-reload.toml", std::process::id())),
+            "path shown"
+        );
+
+        // A new address reconnects with the new settings.
+        let moved = ConnCfg {
+            url: "mqtt://elsewhere:1884".into(),
+            ..edited.clone()
+        };
+        app.apply_config(vec![moved.clone()]);
+        assert!(matches!(
+            rx[0].try_recv(),
+            Ok(Cmd::Reconfigure { cfg, connect: true }) if cfg.host == "elsewhere" && cfg.port == 1884
+        ));
+        assert!(app.store.lock().unwrap().conns[2].removed, "lab is gone from this file");
+
+        // Through the file: a broken file is reported and changes nothing;
+        // fixing it applies it. The same content again is not a change.
+        std::fs::write(&cfg, "[[connection]]\nname = \"local\"\nurl = 42\n").unwrap();
+        app.check_config();
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|(t, err, _)| *err && t.starts_with("not reloaded"))
+        );
+        assert_eq!(app.ctls[0].cfg, moved);
+        std::fs::remove_file(&cfg).unwrap();
+        config::save(
+            &cfg,
+            &ConnCfg {
+                qos: 1,
+                ..moved.clone()
+            },
+        )
+        .unwrap();
+        app.check_config();
+        assert_eq!(app.ctls[0].cfg.qos, 1, "{:?}", app.notice);
+        assert!(matches!(rx[0].try_recv(), Ok(Cmd::Reconfigure { cfg, .. }) if cfg.qos == 1));
+        app.notice = None;
+        app.check_config();
+        assert!(app.notice.is_none() && rx[0].try_recv().is_err());
+
+        // An edit landing just before a panel toggle is applied first, not
+        // overwritten by the toggle's save.
+        let local_now = app.ctls[0].cfg.clone();
+        std::fs::remove_file(&cfg).unwrap();
+        let mut external = ConnCfg {
+            topics: vec!["v1/#".into(), "v3/#".into(), "v4/#".into()],
+            ..local_now
+        };
+        config::save(&cfg, &external).unwrap();
+        app.toggle_sub(0, 0); // v1/#, pause
+        assert!(
+            matches!(rx[0].try_recv(), Ok(Cmd::Subscribe(t)) if t == "v4/#"),
+            "edit applied first"
+        );
+        assert!(
+            matches!(rx[0].try_recv(), Ok(Cmd::Unsubscribe(t)) if t == "v1/#"),
+            "then the toggle"
+        );
+        external.paused = vec!["v1/#".into()];
+        assert_eq!(
+            config::load(&cfg).unwrap(),
+            vec![external.clone()],
+            "the edit survived the save"
+        );
+        assert_eq!(app.ctls[0].cfg, external);
+        let _ = std::fs::remove_file(&cfg);
+    }
+
+    #[test]
+    fn reload_leaves_unsaved_alone_and_keeps_empty_password() {
+        let cfg = tmp_config("unsaved");
+        let (mut app, rx) = sample(cfg.clone());
+        // local came from the command line with --no-save: the file's
+        // entry of the same name doesn't touch it.
+        app.ctls[0].saved = false;
+        let file_local = ConnCfg {
+            url: "mqtt://from-file:1883".into(),
+            ..app.ctls[0].cfg.clone()
+        };
+        // staging (saved) was connected with an empty password: username only.
+        app.ctls[1].password = Some(String::new());
+        app.ctls[1].key_password = Some("s3cret".into());
+        let staging = ConnCfg {
+            url: "mqtt://staging2:1883".into(),
+            ..app.ctls[1].cfg.clone()
+        };
+        app.apply_config(vec![file_local, staging]);
+        assert!(rx[0].try_recv().is_err(), "unsaved connection was changed");
+        assert_eq!(app.ctls[0].cfg.url, "mqtt://x:1883");
+        assert!(!app.ctls[0].saved);
+        assert!(matches!(
+            rx[1].try_recv(),
+            Ok(Cmd::Reconfigure { cfg, .. }) if cfg.host == "staging2" && cfg.password.is_none()
+        ));
         let _ = std::fs::remove_file(&cfg);
     }
 

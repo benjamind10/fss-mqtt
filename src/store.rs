@@ -185,10 +185,11 @@ impl Store {
     }
 
     /// Retires connection `i`: its topics leave the tree (and the totals).
-    pub fn remove_conn(&mut self, i: usize) {
+    /// Returns how many messages it had, by which `total()` went down.
+    pub fn remove_conn(&mut self, i: usize) -> u64 {
         let c = &mut self.conns[i];
         if c.removed {
-            return;
+            return 0;
         }
         c.removed = true;
         c.subs.clear();
@@ -206,6 +207,7 @@ impl Store {
         root.sub_msgs -= msgs;
         root.topics -= topics;
         self.struct_ver += 1;
+        msgs
     }
 
     pub fn total(&self) -> u64 {

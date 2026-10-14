@@ -1252,7 +1252,13 @@ mod tests {
             topics: vec!["#".into()],
             ..Default::default()
         };
+        // The rate's last sample saw every message, so the removal makes
+        // the total smaller than it; the next rate must not underflow.
+        app.rate_total = total;
+        app.rate_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
         app.apply_config(vec![edited.clone(), lab]);
+        app.tick();
+        assert_eq!(app.rate, 0.0);
         assert!(matches!(rx[0].try_recv(), Ok(Cmd::Subscribe(t)) if t == "v3/#"));
         assert!(matches!(rx[0].try_recv(), Ok(Cmd::Unsubscribe(t)) if t == "v2/#"));
         assert!(rx[0].try_recv().is_err(), "subscription edits must not reconnect");
@@ -1311,6 +1317,61 @@ mod tests {
         app.notice = None;
         app.check_config();
         assert!(app.notice.is_none() && rx[0].try_recv().is_err());
+
+        // An edit landing just before a panel toggle is applied first, not
+        // overwritten by the toggle's save.
+        let local_now = app.ctls[0].cfg.clone();
+        std::fs::remove_file(&cfg).unwrap();
+        let mut external = ConnCfg {
+            topics: vec!["v1/#".into(), "v3/#".into(), "v4/#".into()],
+            ..local_now
+        };
+        config::save(&cfg, &external).unwrap();
+        app.toggle_sub(0, 0); // v1/#, pause
+        assert!(
+            matches!(rx[0].try_recv(), Ok(Cmd::Subscribe(t)) if t == "v4/#"),
+            "edit applied first"
+        );
+        assert!(
+            matches!(rx[0].try_recv(), Ok(Cmd::Unsubscribe(t)) if t == "v1/#"),
+            "then the toggle"
+        );
+        external.paused = vec!["v1/#".into()];
+        assert_eq!(
+            config::load(&cfg).unwrap(),
+            vec![external.clone()],
+            "the edit survived the save"
+        );
+        assert_eq!(app.ctls[0].cfg, external);
+        let _ = std::fs::remove_file(&cfg);
+    }
+
+    #[test]
+    fn reload_leaves_unsaved_alone_and_keeps_empty_password() {
+        let cfg = tmp_config("unsaved");
+        let (mut app, rx) = sample(cfg.clone());
+        // local came from the command line with --no-save: the file's
+        // entry of the same name doesn't touch it.
+        app.ctls[0].saved = false;
+        let file_local = ConnCfg {
+            url: "mqtt://from-file:1883".into(),
+            ..app.ctls[0].cfg.clone()
+        };
+        // staging (saved) was connected with an empty password: username only.
+        app.ctls[1].password = Some(String::new());
+        app.ctls[1].key_password = Some("s3cret".into());
+        let staging = ConnCfg {
+            url: "mqtt://staging2:1883".into(),
+            ..app.ctls[1].cfg.clone()
+        };
+        app.apply_config(vec![file_local, staging]);
+        assert!(rx[0].try_recv().is_err(), "unsaved connection was changed");
+        assert_eq!(app.ctls[0].cfg.url, "mqtt://x:1883");
+        assert!(!app.ctls[0].saved);
+        assert!(matches!(
+            rx[1].try_recv(),
+            Ok(Cmd::Reconfigure { cfg, .. }) if cfg.host == "staging2" && cfg.password.is_none()
+        ));
         let _ = std::fs::remove_file(&cfg);
     }
 

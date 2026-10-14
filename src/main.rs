@@ -281,7 +281,10 @@ fn run() -> Result<(), String> {
         }
         let i = match existing {
             Some(i) => {
+                // With --no-save the command line's version isn't the file's;
+                // live reload must leave it alone.
                 entries[i] = c;
+                saved[i] = !a.no_save;
                 i
             }
             None => {

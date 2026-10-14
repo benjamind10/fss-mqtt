@@ -161,8 +161,8 @@ pub struct App {
     pub viewer: Option<Viewer>,
 
     pub rate: f64,
-    rate_total: u64,
-    rate_at: Instant,
+    pub(crate) rate_total: u64,
+    pub(crate) rate_at: Instant,
     pub quit: bool,
 }
 
@@ -274,7 +274,7 @@ impl App {
         };
         let d = self.rate_at.elapsed();
         if d >= Duration::from_secs(1) {
-            self.rate = (total - self.rate_total) as f64 / d.as_secs_f64();
+            self.rate = total.saturating_sub(self.rate_total) as f64 / d.as_secs_f64();
             self.rate_total = total;
             self.rate_at = Instant::now();
         }
@@ -577,9 +577,18 @@ impl App {
     }
 
     pub fn toggle_sub(&mut self, i: usize, j: usize) {
+        // Apply pending edits to the file first: the save below keeps the
+        // rest of the file and marks it as read, and must not write over an
+        // edit to this connection with what we had before it.
+        let Some(topic) = self.store.lock().unwrap().conns[i].subs.get(j).map(|s| s.topic.clone()) else {
+            return;
+        };
+        self.check_config();
         let (topic, enabled) = {
             let mut st = self.store.lock().unwrap();
-            let s = &mut st.conns[i].subs[j];
+            let Some(s) = st.conns[i].subs.iter_mut().find(|s| s.topic == topic) else {
+                return; // removed by the edit (or the connection is gone)
+            };
             s.enabled = !s.enabled;
             s.err = None;
             (s.topic.clone(), s.enabled)
@@ -623,17 +632,15 @@ impl App {
 
     /// Brings the connections in line with the file's `entries`: adds new
     /// ones, updates changed ones, removes saved ones that are gone.
-    /// Connections that were never saved (`--no-save`) are left alone.
+    /// Connections that aren't from the file (`--no-save`, the first-run
+    /// localhost) are left alone, and so is a file entry of the same name.
     pub fn apply_config(&mut self, entries: Vec<ConnCfg>) {
         let (mut added, mut changed, mut removed) = (0, 0, 0);
         let mut errors = Vec::new();
         for e in &entries {
             let res = match self.conn_named(&e.name) {
                 None => self.add_conn(e.clone()).map(|()| added += 1),
-                Some(i) if self.ctls[i].cfg == *e => {
-                    self.ctls[i].saved = true;
-                    Ok(())
-                }
+                Some(i) if !self.ctls[i].saved || self.ctls[i].cfg == *e => Ok(()),
                 Some(i) => self.update_conn(i, e.clone()).map(|()| changed += 1),
             };
             if let Err(err) = res {
@@ -706,7 +713,6 @@ impl App {
         let display = broker::display_url(&new)?;
         let ctl = &mut self.ctls[i];
         let old = std::mem::replace(&mut ctl.cfg, new.clone());
-        ctl.saved = true;
         if old.username != new.username || old.password_env != new.password_env {
             ctl.password = env_secret(new.password_env.as_deref());
         }
@@ -732,7 +738,9 @@ impl App {
         };
         let active = state != ConnState::Disconnected;
         if !same_link(&old, &new) {
-            let cfg = broker::mqtt_config(i, &new, ctl.password.clone(), ctl.key_password.clone())?;
+            // An empty password means username only, as in connect_or_ask.
+            let password = ctl.password.clone().filter(|p| !p.is_empty());
+            let cfg = broker::mqtt_config(i, &new, password, ctl.key_password.clone())?;
             let connect = active && ctl.missing().is_none();
             let _ = ctl.tx.send(Cmd::Reconfigure {
                 cfg: Box::new(cfg),
@@ -762,7 +770,9 @@ impl App {
         ctl.tx = mpsc::channel().0; // dropping the old sender ends the thread
         ctl.saved = false;
         let mut st = self.store.lock().unwrap();
-        st.remove_conn(i);
+        // Its messages leave the total; keep the rate's baseline in step.
+        let msgs = st.remove_conn(i);
+        self.rate_total = self.rate_total.saturating_sub(msgs);
         self.expanded.remove(&st.conns[i].node);
         if self.selected.is_some_and(|n| st.nodes[n].conn == i) {
             self.selected = None;

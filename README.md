@@ -86,6 +86,11 @@ autoconnect  = true                        # connect when started without -c or 
   RSA/EC keys; not scrypt or PKCS#5 v1.5.
 - **Saving** rewrites only that connection's block, so your comments elsewhere in the file stay.
   Pausing or resuming a subscription in the panel is saved the same way.
+- **Live:** edits to the file apply while fss-mqtt runs (it checks once a second). New connections
+  appear (and connect if `autoconnect`), removed ones disconnect and leave the tree, changed
+  subscriptions are (un)subscribed on the open connection, and any other change reconnects with
+  the new settings. A file with an error is reported and not applied. The panel's bottom border
+  shows the file's path.
 
 The panel at the top lists each connection with its subscriptions. `tab` moves between the panel,
 the topic tree and the message list; in the panel, `space` or `⏎` connects or disconnects a

@@ -62,6 +62,16 @@ pub fn expand(p: &str) -> String {
     }
 }
 
+/// `p` with the home directory written as `~`, for display.
+pub fn tilde(p: &Path) -> String {
+    match home().and_then(|h| p.strip_prefix(h).ok().map(Path::to_path_buf)) {
+        Some(rest) if !rest.as_os_str().is_empty() => {
+            format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display())
+        }
+        _ => p.display().to_string(),
+    }
+}
+
 /// Loads the file; a missing file is an empty list.
 pub fn load(path: &Path) -> Result<Vec<ConnCfg>, String> {
     match std::fs::read_to_string(path) {

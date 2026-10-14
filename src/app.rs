@@ -1,22 +1,62 @@
 //! UI state and key handling.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::mpsc::Sender;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::broker;
 use crate::config::{self, ConnCfg};
 use crate::mqtt::{self, Cmd};
-use crate::store::{ConnState, Filter, FilterMode, INSIDE, MATCHED, Message, ROOT, Row, Store};
+use crate::store::{ConnState, Filter, FilterMode, INSIDE, MATCHED, Message, ROOT, Row, Store, Sub};
 use crate::theme::Theme;
 use crate::viewer::Viewer;
 
 /// Up to this many matching topics, a filter expands everything it matched.
 const AUTO_EXPAND_LIMIT: u32 = 300;
 const NOTICE_FOR: Duration = Duration::from_secs(6);
+/// How often the connections file is checked for changes.
+const CONFIG_EVERY: Duration = Duration::from_secs(1);
+
+/// The connections file's modified time and size, to notice edits.
+type Stamp = Option<(SystemTime, u64)>;
+
+fn stamp(path: &Path) -> Stamp {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+/// The value of the environment variable `name` (a `password_env`), if set.
+pub fn env_secret(name: Option<&str>) -> Option<String> {
+    name.and_then(|v| std::env::var(v).ok())
+}
+
+/// A connection's subscriptions as the store tracks them.
+pub fn subs_of(c: &ConnCfg) -> Vec<Sub> {
+    c.topics
+        .iter()
+        .map(|t| Sub {
+            topic: t.clone(),
+            enabled: !c.paused.contains(t),
+            err: None,
+        })
+        .collect()
+}
+
+/// Whether two entries differ only in what applies without reconnecting
+/// (subscriptions and autoconnect).
+fn same_link(a: &ConnCfg, b: &ConnCfg) -> bool {
+    let strip = |c: &ConnCfg| ConnCfg {
+        topics: vec![],
+        paused: vec![],
+        autoconnect: false,
+        ..c.clone()
+    };
+    strip(a) == strip(b)
+}
 
 pub struct Options {
     pub inline_bytes: usize, // payloads up to this size are shown inline in the tree
@@ -92,6 +132,8 @@ pub struct App {
 
     pub ctls: Vec<ConnCtl>,
     pub config_path: PathBuf,
+    config_stamp: Stamp,
+    config_checked: Instant,
     pub panel: Vec<PanelRow>,
     pub panel_cursor: usize,
     pub prompt: Option<Prompt>,
@@ -144,6 +186,8 @@ impl App {
             height: 0,
             now: SystemTime::now(),
             ctls,
+            config_stamp: stamp(&config_path),
+            config_checked: Instant::now(),
             config_path,
             panel: Vec::new(),
             panel_cursor: 0,
@@ -239,13 +283,17 @@ impl App {
         {
             self.notice = None;
         }
+        if self.config_checked.elapsed() >= CONFIG_EVERY {
+            self.config_checked = Instant::now();
+            self.check_config();
+        }
         self.rebuild(false);
     }
 
     fn refresh_panel(&mut self) {
         let st = self.store.lock().unwrap();
         self.panel.clear();
-        for (i, c) in st.conns.iter().enumerate() {
+        for (i, c) in st.conns.iter().enumerate().filter(|(_, c)| !c.removed) {
             self.panel.push(PanelRow::Conn(i));
             self.panel.extend((0..c.subs.len()).map(|j| PanelRow::Sub(i, j)));
         }
@@ -546,11 +594,188 @@ impl App {
         if !enabled {
             ctl.cfg.paused.push(topic);
         }
-        if ctl.saved
-            && let Err(e) = config::save(&self.config_path, &ctl.cfg)
-        {
-            self.notify(format!("couldn't save: {e}"), true);
+        if ctl.saved {
+            match config::save(&self.config_path, &ctl.cfg) {
+                // Our own write: nothing to reload.
+                Ok(()) => self.config_stamp = stamp(&self.config_path),
+                Err(e) => self.notify(format!("couldn't save: {e}"), true),
+            }
         }
+    }
+
+    // ── Live reload of the connections file ────────────────────────────────
+
+    /// Re-reads the connections file if it changed since we last read it.
+    pub(crate) fn check_config(&mut self) {
+        let now = stamp(&self.config_path);
+        if now == self.config_stamp {
+            return;
+        }
+        self.config_stamp = now;
+        if now.is_none() {
+            return; // deleted, or mid-replace by an editor: keep what we have
+        }
+        match config::load(&self.config_path) {
+            Ok(entries) => self.apply_config(entries),
+            Err(e) => self.notify(format!("not reloaded: {e}"), true),
+        }
+    }
+
+    /// Brings the connections in line with the file's `entries`: adds new
+    /// ones, updates changed ones, removes saved ones that are gone.
+    /// Connections that were never saved (`--no-save`) are left alone.
+    pub fn apply_config(&mut self, entries: Vec<ConnCfg>) {
+        let (mut added, mut changed, mut removed) = (0, 0, 0);
+        let mut errors = Vec::new();
+        for e in &entries {
+            let res = match self.conn_named(&e.name) {
+                None => self.add_conn(e.clone()).map(|()| added += 1),
+                Some(i) if self.ctls[i].cfg == *e => {
+                    self.ctls[i].saved = true;
+                    Ok(())
+                }
+                Some(i) => self.update_conn(i, e.clone()).map(|()| changed += 1),
+            };
+            if let Err(err) = res {
+                errors.push(format!("{:?}: {err}", e.name));
+            }
+        }
+        let gone: Vec<usize> = (0..self.ctls.len())
+            .filter(|&i| self.ctls[i].saved && !self.is_removed(i))
+            .filter(|&i| !entries.iter().any(|e| e.name == self.ctls[i].cfg.name))
+            .collect();
+        for i in gone {
+            self.remove_conn(i);
+            removed += 1;
+        }
+        if added + changed + removed > 0 {
+            self.refresh_panel();
+            self.need_rebuild = true;
+            self.rebuild(false);
+        }
+        if let Some(err) = errors.first() {
+            self.notify(format!("connection {err}"), true);
+        } else if added + changed + removed > 0 {
+            let parts: Vec<String> = [(added, "added"), (changed, "changed"), (removed, "removed")]
+                .iter()
+                .filter(|(n, _)| *n > 0)
+                .map(|(n, what)| format!("{n} {what}"))
+                .collect();
+            self.notify(format!("connections reloaded: {}", parts.join(", ")), false);
+        }
+        self.next_prompt();
+    }
+
+    fn conn_named(&self, name: &str) -> Option<usize> {
+        (0..self.ctls.len()).find(|&i| self.ctls[i].cfg.name == name && !self.is_removed(i))
+    }
+
+    fn is_removed(&self, i: usize) -> bool {
+        self.store.lock().unwrap().conns[i].removed
+    }
+
+    fn add_conn(&mut self, c: ConnCfg) -> Result<(), String> {
+        let i = self.ctls.len();
+        let password = env_secret(c.password_env.as_deref());
+        let key_password = env_secret(c.key_password_env.as_deref());
+        let cfg = broker::mqtt_config(i, &c, password.clone(), key_password.clone())?;
+        let display = broker::display_url(&c)?;
+        let node = {
+            let mut st = self.store.lock().unwrap();
+            let idx = st.add_conn(&c.name, &display, c.username.clone(), subs_of(&c));
+            debug_assert_eq!(idx, i);
+            st.conns[idx].node
+        };
+        self.expanded.insert(node);
+        if c.autoconnect {
+            self.prompt_queue.push(i);
+        }
+        self.ctls.push(ConnCtl {
+            tx: mqtt::spawn(cfg, self.store.clone(), false),
+            cfg: c,
+            saved: true,
+            password,
+            key_password,
+        });
+        Ok(())
+    }
+
+    /// Applies an edited entry. Subscription changes go to the live
+    /// connection; anything else reconnects it with the new settings.
+    fn update_conn(&mut self, i: usize, new: ConnCfg) -> Result<(), String> {
+        let display = broker::display_url(&new)?;
+        let ctl = &mut self.ctls[i];
+        let old = std::mem::replace(&mut ctl.cfg, new.clone());
+        ctl.saved = true;
+        if old.username != new.username || old.password_env != new.password_env {
+            ctl.password = env_secret(new.password_env.as_deref());
+        }
+        if old.key != new.key || old.key_password_env != new.key_password_env {
+            ctl.key_password = env_secret(new.key_password_env.as_deref());
+        }
+        let (state, before) = {
+            let mut st = self.store.lock().unwrap();
+            let c = &mut st.conns[i];
+            let mut subs = subs_of(&new);
+            for s in &mut subs {
+                // Keep a refusal shown until the broker says otherwise.
+                s.err = c
+                    .subs
+                    .iter()
+                    .find(|o| o.topic == s.topic && o.enabled)
+                    .and_then(|o| o.err.clone());
+            }
+            let before = std::mem::replace(&mut c.subs, subs);
+            c.url = display;
+            c.username = new.username.clone();
+            (c.status.state, before)
+        };
+        let active = state != ConnState::Disconnected;
+        if !same_link(&old, &new) {
+            let cfg = broker::mqtt_config(i, &new, ctl.password.clone(), ctl.key_password.clone())?;
+            let connect = active && ctl.missing().is_none();
+            let _ = ctl.tx.send(Cmd::Reconfigure {
+                cfg: Box::new(cfg),
+                connect,
+            });
+            if active && !connect {
+                self.prompt_queue.push(i); // a new password or passphrase is needed
+            }
+        } else if state == ConnState::Connected {
+            let on =
+                |subs: &[Sub]| -> Vec<String> { subs.iter().filter(|s| s.enabled).map(|s| s.topic.clone()).collect() };
+            let (was, now) = (on(&before), on(&subs_of(&new)));
+            for t in now.iter().filter(|t| !was.contains(t)) {
+                let _ = ctl.tx.send(Cmd::Subscribe(t.clone()));
+            }
+            for t in was.iter().filter(|t| !now.contains(t)) {
+                let _ = ctl.tx.send(Cmd::Unsubscribe(t.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Disconnects connection `i` and takes it out of the panel and tree.
+    fn remove_conn(&mut self, i: usize) {
+        let ctl = &mut self.ctls[i];
+        let _ = ctl.tx.send(Cmd::Disconnect);
+        ctl.tx = mpsc::channel().0; // dropping the old sender ends the thread
+        ctl.saved = false;
+        let mut st = self.store.lock().unwrap();
+        st.remove_conn(i);
+        self.expanded.remove(&st.conns[i].node);
+        if self.selected.is_some_and(|n| st.nodes[n].conn == i) {
+            self.selected = None;
+            self.msg_sel = None;
+            if self.focus == Focus::Msgs {
+                self.focus = Focus::Tree;
+            }
+        }
+        drop(st);
+        if self.prompt.as_ref().is_some_and(|p| p.conn == i) {
+            self.prompt = None;
+        }
+        self.prompt_queue.retain(|&c| c != i);
     }
 
     /// Connects `i`, or opens the prompt for what it still needs.

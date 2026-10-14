@@ -52,6 +52,12 @@ pub enum Cmd {
     Disconnect,
     Subscribe(String),
     Unsubscribe(String),
+    /// New settings (the connections file changed): drop the current
+    /// connection if any, then connect with them if `connect`.
+    Reconfigure {
+        cfg: Box<Config>,
+        connect: bool,
+    },
 }
 
 const KEEP_ALIVE: u16 = 30;
@@ -228,10 +234,11 @@ impl Write for Conn {
 
 /// How a session ended.
 enum End {
-    Failed(String), // retry after a pause
-    Halted(String), // retrying won't help (the key's passphrase): wait for the UI
-    Stopped,        // the UI asked to disconnect
-    Closed,         // the UI is gone
+    Failed(String),                  // retry after a pause
+    Halted(String),                  // retrying won't help (the key's passphrase): wait for the UI
+    Stopped,                         // the UI asked to disconnect
+    Closed,                          // the UI is gone
+    Reconfigured(Box<Config>, bool), // new settings; connect with them?
 }
 
 /// Starts the connection's thread. It connects now if `start`, then follows
@@ -249,6 +256,11 @@ pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<C
                         cfg.update(password, key_password);
                         want = true;
                     }
+                    Ok(Cmd::Reconfigure { cfg: c, connect }) => {
+                        cfg = *c;
+                        want = connect;
+                        continue;
+                    }
                     Ok(_) => continue, // subscription changes apply on the next connect
                     Err(_) => return,
                 }
@@ -261,6 +273,10 @@ pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<C
                     want = false;
                 }
                 End::Closed => return,
+                End::Reconfigured(c, connect) => {
+                    cfg = *c;
+                    want = connect;
+                }
                 End::Failed(err) => {
                     set_status(&store, cfg.conn, ConnState::Connecting, Some(err));
                     // Pause before retrying, but stay responsive.
@@ -273,6 +289,11 @@ pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<C
                             }
                             Ok(Cmd::Connect { password, key_password }) => {
                                 cfg.update(password, key_password);
+                                break;
+                            }
+                            Ok(Cmd::Reconfigure { cfg: c, connect }) => {
+                                cfg = *c;
+                                want = connect;
                                 break;
                             }
                             Ok(_) => {}
@@ -412,6 +433,10 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>) -> End {
                 Cmd::Disconnect => {
                     let _ = conn.write_all(&[0xE0, 0]).and_then(|_| conn.flush());
                     return End::Stopped;
+                }
+                Cmd::Reconfigure { cfg, connect } => {
+                    let _ = conn.write_all(&[0xE0, 0]).and_then(|_| conn.flush());
+                    return End::Reconfigured(cfg, connect);
                 }
                 Cmd::Connect { .. } => continue,
                 Cmd::Subscribe(t) => {
@@ -971,6 +996,20 @@ mod e2e {
         assert_eq!(wait_state(&st, ConnState::Connected).state, ConnState::Connected);
         publish(&["-p", "18830", "-q", "1", "-t", "e2e/again", "-m", "x"]);
         assert_eq!(wait_for(&st, before + 2), before + 2, "after reconnect");
+
+        // New settings (the connections file changed): it drops the session
+        // and connects with them, keeping the store's subscriptions.
+        let (_, mut moved) = setup(18830, false, None, &[]);
+        moved.client_id = "e2e-reconfigured".into();
+        tx.send(Cmd::Reconfigure {
+            cfg: Box::new(moved),
+            connect: true,
+        })
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(wait_state(&st, ConnState::Connected).state, ConnState::Connected);
+        publish(&["-p", "18830", "-q", "1", "-t", "e2e/reconfigured", "-m", "x"]);
+        assert_eq!(wait_for(&st, before + 3), before + 3, "after reconfigure");
 
         // TLS with the test CA connects and receives; without it the cert is refused.
         let ca = std::env::var("FSS_TEST_CA").expect("set FSS_TEST_CA");

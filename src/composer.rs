@@ -714,10 +714,10 @@ impl Composer {
     fn with(title: String, text: &str) -> Composer {
         let mut ed = Editor::new(text);
         // Start on the payload, or after "topic: " when there's no topic yet.
-        match text.split('\n').position(|l| l.trim().is_empty()) {
-            _ if text.starts_with("topic: \n") => ed.set_cursor(0, 7),
-            Some(blank) => ed.set_cursor(blank + 1, 0),
-            None => ed.set_cursor(0, 0),
+        if text.starts_with("topic: \n") {
+            ed.set_cursor(0, 7);
+        } else if let Some(blank) = text.split('\n').position(|l| l.trim().is_empty()) {
+            ed.set_cursor(blank + 1, 0);
         }
         Composer {
             ed,

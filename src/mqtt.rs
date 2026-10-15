@@ -418,6 +418,9 @@ struct Limits {
     max_packet: Option<u32>,
     max_qos: u8,
     retain: bool,
+    /// How many QoS 1 and 2 publishes may wait for its acknowledgement at
+    /// once (Receive Maximum).
+    receive_max: u16,
 }
 
 impl Default for Limits {
@@ -426,6 +429,7 @@ impl Default for Limits {
             max_packet: None,
             max_qos: 2,
             retain: true,
+            receive_max: u16::MAX,
         }
     }
 }
@@ -505,6 +509,58 @@ impl Outbox {
     }
 }
 
+/// Packet ids. A SUBSCRIBE, UNSUBSCRIBE or QoS 1/2 publish keeps its id
+/// until the broker answers it, and no other packet may use that id in the
+/// meantime, also once the counter has gone round.
+#[derive(Default)]
+struct Ids {
+    last: u16,
+    subscribes: Vec<(u16, String)>, // waiting for SUBACK, with their filter
+    unsubscribes: Vec<u16>,         // waiting for UNSUBACK
+}
+
+impl Ids {
+    /// An id nothing is waiting on; None if all 65535 are taken.
+    fn next(&mut self, outbox: &Outbox) -> Option<u16> {
+        let (subs, unsubs) = (&self.subscribes, &self.unsubscribes);
+        free_pid(&mut self.last, |p| {
+            subs.iter().any(|(q, _)| *q == p) || unsubs.contains(&p) || outbox.waiting.iter().any(|w| w.pid == p)
+        })
+    }
+}
+
+/// Moves `last` on to the next id (1 to 65535, then round again) that isn't
+/// `in_use`.
+fn free_pid(last: &mut u16, in_use: impl Fn(u16) -> bool) -> Option<u16> {
+    for _ in 0..u16::MAX {
+        *last = last.wrapping_add(1).max(1);
+        if !in_use(*last) {
+            return Some(*last);
+        }
+    }
+    None
+}
+
+const NO_FREE_ID: &str = "all 65535 packet ids are waiting for the broker's answer";
+
+/// The packet id to publish `o` with (0 for QoS 0), or why it can't go now:
+/// a broker takes at most its Receive Maximum of QoS 1 and 2 publishes it
+/// hasn't acknowledged yet.
+fn publish_id(o: &Outgoing, ids: &mut Ids, outbox: &Outbox, lim: &Limits) -> Result<u16, String> {
+    if o.qos == 0 {
+        return Ok(0);
+    }
+    let n = outbox.waiting.len();
+    if n >= lim.receive_max as usize {
+        let earlier = if n == 1 { "message" } else { "messages" };
+        return Err(format!(
+            "the broker has yet to acknowledge {n} earlier {earlier}, as many as it accepts at once \
+             (its Receive Maximum); try again once it does"
+        ));
+    }
+    ids.next(outbox).ok_or_else(|| NO_FREE_ID.to_string())
+}
+
 /// One connection's lifetime.
 fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut Inbox, outbox: &mut Outbox) -> End {
     let tls = match tls_config(cfg) {
@@ -554,6 +610,7 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut I
             match (id, v) {
                 (0x13, Prop::Int(k)) => keep_alive = k as u16,
                 (0x1F, Prop::Str(s)) => reason_str = Some(s),
+                (0x21, Prop::Int(n)) if n > 0 => limits.receive_max = n as u16, // 0 isn't allowed
                 (0x24, Prop::Int(q)) => limits.max_qos = q.min(2) as u8,
                 (0x25, Prop::Int(r)) => limits.retain = r != 0,
                 (0x27, Prop::Int(n)) => limits.max_packet = Some(n),
@@ -570,13 +627,8 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut I
     }
     set_status(store, cfg.conn, ConnState::Connected, None);
 
-    let mut next_pid: u16 = 0;
-    let mut pid = || {
-        next_pid = next_pid.wrapping_add(1).max(1);
-        next_pid
-    };
+    let mut ids = Ids::default();
     // One SUBSCRIBE per filter, so a refused one is named and the rest work.
-    let mut pending: Vec<(u16, String)> = Vec::new();
     let topics: Vec<String> = {
         let mut st = store.lock().unwrap();
         let c = &mut st.conns[cfg.conn];
@@ -584,11 +636,14 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut I
         c.subs.iter().filter(|s| s.enabled).map(|s| s.topic.clone()).collect()
     };
     for t in topics {
-        let p = pid();
+        let Some(p) = ids.next(outbox) else {
+            set_sub_err(store, cfg.conn, &t, Some(NO_FREE_ID.into()));
+            continue;
+        };
         if let Err(e) = conn.write_all(&subscribe_packet(p, &t, cfg.qos)) {
             return End::Failed(tidy_io(e));
         }
-        pending.push((p, t));
+        ids.subscribes.push((p, t));
     }
     let _ = conn.flush();
 
@@ -618,9 +673,10 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut I
                 Cmd::Connect { .. } => continue,
                 Cmd::Publish(o) => {
                     let what = target(store, cfg.conn, &o.topic);
-                    let p = if o.qos > 0 { pid() } else { 0 };
-                    let pkt = match publish_packet(&o, p, &limits) {
-                        Ok(pkt) => pkt,
+                    let ready = publish_id(&o, &mut ids, outbox, &limits)
+                        .and_then(|p| publish_packet(&o, p, &limits).map(|pkt| (p, pkt)));
+                    let (p, pkt) = match ready {
+                        Ok(r) => r,
                         Err(e) => {
                             store
                                 .lock()
@@ -644,12 +700,25 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut I
                     pkt
                 }
                 Cmd::Subscribe(t) => {
-                    let p = pid();
+                    let Some(p) = ids.next(outbox) else {
+                        set_sub_err(store, cfg.conn, &t, Some(NO_FREE_ID.into()));
+                        continue;
+                    };
                     let pkt = subscribe_packet(p, &t, cfg.qos);
-                    pending.push((p, t));
+                    ids.subscribes.push((p, t));
                     pkt
                 }
-                Cmd::Unsubscribe(t) => unsubscribe_packet(pid(), &t),
+                Cmd::Unsubscribe(t) => {
+                    let Some(p) = ids.next(outbox) else {
+                        store
+                            .lock()
+                            .unwrap()
+                            .notify(format!("{t} not unsubscribed: {NO_FREE_ID}"), true);
+                        continue;
+                    };
+                    ids.unsubscribes.push(p);
+                    unsubscribe_packet(p, &t)
+                }
             };
             if let Err(e) = conn.write_all(&out).and_then(|_| conn.flush()) {
                 return End::Failed(tidy_io(e));
@@ -690,11 +759,16 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut I
                     let mut b = Buf(&body[2..]);
                     let _ = b.props();
                     let code = b.0.first().copied().unwrap_or(0x80);
-                    if let Some(i) = pending.iter().position(|(q, _)| *q == p) {
-                        let (_, t) = pending.remove(i);
+                    if let Some(i) = ids.subscribes.iter().position(|(q, _)| *q == p) {
+                        let (_, t) = ids.subscribes.remove(i);
                         let err = (code >= 0x80).then(|| suback_reason(code));
                         set_sub_err(store, cfg.conn, &t, err);
                     }
+                }
+                11 if body.len() >= 2 => {
+                    // UNSUBACK: its id is free again.
+                    let p = u16::from_be_bytes([body[0], body[1]]);
+                    ids.unsubscribes.retain(|&q| q != p);
                 }
                 14 => {
                     let code = body.first().copied().unwrap_or(0);
@@ -1173,6 +1247,7 @@ mod tests {
             max_packet: Some(64),
             max_qos: 1,
             retain: false,
+            ..Limits::default()
         };
         assert!(publish_packet(&o, 1, &tight).unwrap_err().contains("QoS 1 at most"));
         let o = Outgoing { qos: 1, ..o };
@@ -1264,36 +1339,158 @@ mod tests {
         );
     }
 
-    #[test]
-    fn publish_while_disconnected_says_so() {
+    /// A store with one connection, `name`, and its settings for a broker on
+    /// this machine's `port`.
+    fn local(name: &str, port: u16) -> (Arc<Mutex<Store>>, Config) {
         let mut st = Store::new(10, 1024);
-        st.add_conn("lab", "mqtt://127.0.0.1:1", None, vec![]);
-        let store = Arc::new(Mutex::new(st));
+        st.add_conn(name, "test", None, vec![]);
         let cfg = Config {
             conn: 0,
             host: "127.0.0.1".into(),
-            port: 1,
+            port,
             tls: false,
             ca_file: None,
             cert_file: None,
             key_file: None,
             key_password: None,
             insecure: false,
-            client_id: "idle".into(),
+            client_id: "unit".into(),
             username: None,
             password: None,
             qos: 0,
         };
-        let tx = spawn(cfg, store.clone(), false);
-        tx.send(Cmd::Publish(Box::new(outgoing()))).unwrap();
-        for _ in 0..200 {
-            if let Some((t, err)) = store.lock().unwrap().take_notices().pop() {
-                assert!(err && t == "not published to site/oslo/t: lab isn't connected", "{t}");
-                return;
+        (Arc::new(Mutex::new(st)), cfg)
+    }
+
+    /// The next status-line notice from the connection's thread.
+    fn next_notice(store: &Mutex<Store>) -> (String, bool) {
+        for _ in 0..500 {
+            if let Some(n) = store.lock().unwrap().take_notices().into_iter().next() {
+                return n;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("no notice");
+    }
+
+    fn waiting(pid: u16) -> Waiting {
+        Waiting {
+            pid,
+            what: String::new(),
+            qos: 1,
+            released: false,
+            no_subscribers: false,
+            since: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn publish_while_disconnected_says_so() {
+        let (store, cfg) = local("lab", 1);
+        let tx = spawn(cfg, store.clone(), false);
+        tx.send(Cmd::Publish(Box::new(outgoing()))).unwrap();
+        let (t, err) = next_notice(&store);
+        assert!(err && t == "not published to site/oslo/t: lab isn't connected", "{t}");
+    }
+
+    #[test]
+    fn packet_ids_skip_those_in_use() {
+        // After 65535 comes 1 (0 isn't an id), and taken ids are skipped.
+        let mut last = 65534;
+        assert_eq!(free_pid(&mut last, |_| false), Some(65535));
+        assert_eq!(free_pid(&mut last, |p| p == 1 || p == 2), Some(3));
+        assert_eq!(free_pid(&mut last, |_| true), None);
+        // Taken: SUBSCRIBEs and UNSUBSCRIBEs waiting for their answer, and
+        // publishes waiting for their acknowledgement.
+        let mut outbox = Outbox::default();
+        outbox.waiting.push(waiting(2));
+        let mut ids = Ids {
+            last: u16::MAX,
+            subscribes: vec![(1, "a/#".into())],
+            unsubscribes: vec![3],
+        };
+        assert_eq!(ids.next(&outbox), Some(4));
+        ids.subscribes.clear();
+        ids.last = u16::MAX;
+        assert_eq!(ids.next(&outbox), Some(1), "free again once answered");
+    }
+
+    #[test]
+    fn receive_maximum_window() {
+        let lim = Limits {
+            receive_max: 2,
+            ..Limits::default()
+        };
+        let (mut ids, mut outbox) = (Ids::default(), Outbox::default());
+        let q1 = Outgoing { qos: 1, ..outgoing() };
+        for _ in 0..2 {
+            let p = publish_id(&q1, &mut ids, &outbox, &lim).unwrap();
+            outbox.waiting.push(waiting(p));
+        }
+        assert_ne!(outbox.waiting[0].pid, outbox.waiting[1].pid);
+        let e = publish_id(&q1, &mut ids, &outbox, &lim).unwrap_err();
+        assert!(
+            e.contains("yet to acknowledge 2 earlier messages") && e.contains("Receive Maximum"),
+            "{e}"
+        );
+        // QoS 0 isn't acknowledged, so it doesn't count.
+        let q0 = Outgoing { qos: 0, ..outgoing() };
+        assert_eq!(publish_id(&q0, &mut ids, &outbox, &lim), Ok(0));
+        // An acknowledgement makes room.
+        outbox.waiting.pop();
+        assert!(publish_id(&q1, &mut ids, &outbox, &lim).is_ok());
+    }
+
+    /// The next PUBLISH a broker reads from the client: its topic and id.
+    fn read_publish(rd: &mut Reader, s: &mut TcpStream) -> (String, u16) {
+        let (kind, body) = rd.next(s).unwrap().expect("a packet within the read timeout");
+        assert_eq!(kind, 0x32, "QoS 1 PUBLISH");
+        let (topic, pid, _, _) = parse_publish(&body, 1).unwrap();
+        (topic, pid)
+    }
+
+    #[test]
+    fn receive_maximum_from_connack_holds_publishes() {
+        // A broker on a local port, scripted by hand: it takes one
+        // unacknowledged publish at a time.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (store, cfg) = local("t", listener.local_addr().unwrap().port());
+        let tx = spawn(cfg, store.clone(), true);
+        let (mut broker, _) = listener.accept().unwrap();
+        broker.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut rd = Reader::default();
+        assert_eq!(rd.next(&mut broker).unwrap().unwrap().0, 0x10, "CONNECT");
+        // CONNACK: accepted, with Receive Maximum 1.
+        broker.write_all(&packet(0x20, vec![0, 0, 3, 0x21, 0, 1])).unwrap();
+
+        let publish = |topic: &str| {
+            Cmd::Publish(Box::new(Outgoing {
+                topic: topic.into(),
+                payload: b"x".to_vec(),
+                qos: 1,
+                retain: false,
+                props: Props::default(),
+            }))
+        };
+        tx.send(publish("a")).unwrap();
+        tx.send(publish("b")).unwrap();
+        let (topic, a) = read_publish(&mut rd, &mut broker);
+        assert_eq!(topic, "a");
+        let (n, err) = next_notice(&store);
+        assert!(
+            err && n.starts_with("not published to t · b: the broker has yet to acknowledge 1 earlier message"),
+            "{n}"
+        );
+        // Its PUBACK for "a" makes room for the next one.
+        broker.write_all(&[0x40, 2, (a >> 8) as u8, a as u8]).unwrap();
+        assert_eq!(
+            next_notice(&store),
+            ("published to t · a (QoS 1, acknowledged)".into(), false)
+        );
+        tx.send(publish("c")).unwrap();
+        let (topic, c) = read_publish(&mut rd, &mut broker);
+        assert_eq!(topic, "c");
+        assert_ne!(c, 0);
     }
 
     #[test]

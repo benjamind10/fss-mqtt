@@ -1605,6 +1605,24 @@ mod tests {
     }
 
     #[test]
+    fn composer_says_when_a_connection_has_stopped() {
+        let (mut app, rx) = sample(tmp_config("compose-stopped"));
+        // local's thread is gone: nothing takes its commands any more.
+        drop(rx);
+        typ(&mut app, "v1/plant/line1/temp");
+        press(&mut app, &[KeyCode::Down]);
+        ctrl(&mut app, 'e');
+        ctrl(&mut app, 's');
+        let v = frame(&app, "connection stopped");
+        assert!(
+            v.contains("line 2: not sent: local's connection has stopped; restart fss-mqtt to use it again"),
+            "{v}"
+        );
+        assert!(app.composer.is_some(), "the document stays open");
+        assert!(!v.contains("publishing to"), "{v}");
+    }
+
+    #[test]
     fn composer_scrolls_long_lines() {
         let (mut app, _rx) = sample(tmp_config("compose-scroll"));
         app.resize(40, 20);

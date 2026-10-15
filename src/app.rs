@@ -1021,7 +1021,14 @@ impl App {
             }
         };
         let what = format!("{} · {}", d.conn, d.out.topic);
-        let _ = self.ctls[i].tx.send(Cmd::Publish(Box::new(d.out)));
+        if self.ctls[i].tx.send(Cmd::Publish(Box::new(d.out))).is_err() {
+            // Its thread has ended, so nothing would ever report back.
+            let msg = format!(
+                "not sent: {}'s connection has stopped; restart fss-mqtt to use it again",
+                d.conn
+            );
+            return c.fail_at("connection", msg);
+        }
         self.composer = None;
         self.notify(format!("publishing to {what}…"), false);
     }

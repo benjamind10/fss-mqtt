@@ -179,6 +179,8 @@ user: TurbineId = T01
 - Payloads that aren't plain text (binary, or text with control characters such as CR LF) open
   as base64 with `encoding: base64`; `encoding: hex` reads hex digits instead. Correlation data
   that isn't text is written `base64:…`.
+- The message expiry isn't copied: brokers forward the time a message has left, not the expiry
+  it was published with, so the copy would expire early. Add `message-expiry:` to give it one.
 - A payload cut off on arrival (larger than `--max-payload`) can't be sent unchanged: edit it,
   or restart with a larger `--max-payload` to republish it whole.
 - An empty payload with `retain: yes` clears the retained message on that topic.
@@ -186,7 +188,8 @@ user: TurbineId = T01
   between indented and compact. Mistakes are shown with their line, and the message isn't sent.
 - The result appears on the status line: written (QoS 0), acknowledged (QoS 1) or completed
   (QoS 2), or the broker's reason for refusing it. Limits the broker announces (largest packet,
-  highest QoS, retained messages) are checked before sending.
+  highest QoS, retained messages, how many unacknowledged messages it takes) are checked before
+  sending.
 
 ## Payload formats
 

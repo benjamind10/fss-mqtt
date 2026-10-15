@@ -734,6 +734,10 @@ impl Composer {
     pub fn republish(conn: &str, topic: &str, m: &Message) -> Composer {
         let props = Props {
             subscription_id: None,
+            // Brokers forward the time a message has left, not the expiry it
+            // was published with, so the received value would cut the
+            // copy's life short (to nothing, for an old retained message).
+            message_expiry: None,
             ..m.props.clone()
         };
         let d = Draft {
@@ -1019,6 +1023,10 @@ mod tests {
         assert!(text.contains("user: expr = a=b\n") && text.contains("correlation-data: base64:AAEC/w==\n"));
         assert!(text.ends_with("\n\n{\"t\":21.5}"));
         assert!(!text.contains("subscription"), "subscription ids aren't sent");
+        assert!(
+            !text.contains("message-expiry"),
+            "the received expiry is what was left of it"
+        );
         let d = parse(&text).unwrap();
         assert_eq!(d.conn, "oslo");
         assert_eq!(d.out.topic, "site/x");
@@ -1028,11 +1036,17 @@ mod tests {
             d.out.props,
             Props {
                 subscription_id: None,
+                message_expiry: None,
                 ..all_props()
             }
         );
         // The cursor starts on the payload.
         assert_eq!(c.ed.lines[c.ed.row].iter().collect::<String>(), r#"{"t":21.5}"#);
+        // An expiry typed in is sent, and written back by document().
+        let typed = parse("topic: a\nconnection: c\nmessage-expiry: 30").unwrap();
+        assert_eq!(typed.out.props.message_expiry, Some(30));
+        assert!(document(&typed).contains("\nmessage-expiry: 30\n"));
+        assert_eq!(parse(&document(&typed)).unwrap(), typed);
     }
 
     #[test]

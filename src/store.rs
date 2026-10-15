@@ -12,7 +12,7 @@ use std::time::SystemTime;
 
 use crate::capture::{Capture, Target};
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug, PartialEq)]
 pub struct Props {
     pub content_type: Option<String>,
     pub response_topic: Option<String>,
@@ -168,7 +168,6 @@ impl Store {
     }
 
     /// Queues a status-line message (`error` shows it in red).
-    #[allow(dead_code)] // until a connection thread reports something
     pub fn notify(&mut self, text: impl Into<String>, error: bool) {
         self.notices.push((text.into(), error));
     }

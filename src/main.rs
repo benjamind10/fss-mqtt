@@ -8,6 +8,7 @@ mod broker;
 mod capture;
 mod changeset;
 mod clipboard;
+mod composer;
 mod compressed;
 mod config;
 mod crc32;

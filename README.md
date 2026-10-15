@@ -1,7 +1,7 @@
 # fss-mqtt
 
 A fast, keyboard-driven MQTT explorer for the terminal. Subscribe to a broker and get a
-live topic tree you narrow down just by typing.
+live topic tree you narrow down just by typing; edit any message and publish it again.
 
 ![fss-mqtt: browsing two brokers, filtering, opening messages; Parquet, Avro, Arrow, SQLite, SQLite changeset, Protobuf, MessagePack, CBOR, CSV and gzip payloads decoded; pausing a subscription](docs/demo.gif)
 
@@ -138,7 +138,6 @@ clears. Clearing keeps the tree open at the topic you were on.
 | tree | `→` | expand; on a topic with messages, enter its message list |
 | tree | `←` | collapse, or jump to parent |
 | tree | `⏎` | open the latest message full screen |
-| tree, messages | `ctrl+r` | capture this topic and everything below it to disk; again to stop |
 | messages | `↑ ↓` | pick one of the last 10 messages (properties and payload follow) |
 | messages | `⏎` | open it full screen |
 | messages | `← esc` | back to the tree |
@@ -147,8 +146,11 @@ clears. Clearing keeps the tree open at the topic you were on.
 | full screen | `shift ←→` `<` `>` | pan wide tables (CSV, Parquet) |
 | full screen | `tab` | cycle formatted / raw / hex |
 | full screen | `esc q ⏎` | close |
+| tree, messages | `ctrl+e` | publish: edit a copy of the selected message (or a new one on the topic) and send it |
+| full screen | `e` | publish: edit a copy of this message and send it |
 | tree, messages | `ctrl+t` / `ctrl+y` | copy the topic / the message (see [Clipboard](#clipboard)) |
 | full screen | `t` / `y` | copy the topic / what the view shows |
+| tree, messages | `ctrl+r` | capture this topic and everything below it to disk; again to stop |
 | anywhere | `ctrl+c` | quit |
 
 A green `•`/`▸` means the topic (or something under it) received a message in the last 1.5 s.
@@ -171,6 +173,43 @@ the terminal instead (an OSC 52 escape sequence, up to 768 KB of text), which la
 clipboard of the machine you're sitting at. Most terminals support it (iTerm2, kitty, WezTerm,
 Alacritty, Windows Terminal, foot; Apple Terminal doesn't). In tmux, enable it with
 `set -g set-clipboard on`. `FSS_MQTT_CLIPBOARD=osc52`, `=native` or `=off` overrides the choice.
+
+## Publishing
+
+`ctrl+e` (`e` full screen) opens the message in focus as a document you can edit and send:
+the topic in the tree, the one picked in the message list, or the one on screen. On a topic
+without messages it starts an empty one for that topic.
+
+```
+topic: site/oslo/turbine/T01/telemetry
+connection: oslo
+qos: 1
+retain: no
+content-type: application/json
+user: TurbineId = T01
+
+{"ts":"2026-10-15T10:20:30Z","power_kw":2265.8}
+```
+
+- Headers come first, one `key: value` per line; the first blank line starts the payload, which
+  is sent exactly as written. Headers: `topic`, `connection` (any connected one, so you can
+  replay a message into another broker), `qos`, `retain` (`yes`/`no`), `content-type`,
+  `response-topic`, `correlation-data`, `message-expiry` (seconds), `payload-format`
+  (`utf8`/`bytes`), `user: key = value` (repeatable) and `encoding`.
+- Payloads that aren't plain text (binary, or text with control characters such as CR LF) open
+  as base64 with `encoding: base64`; `encoding: hex` reads hex digits instead. Correlation data
+  that isn't text is written `base64:…`.
+- The message expiry isn't copied: brokers forward the time a message has left, not the expiry
+  it was published with, so the copy would expire early. Add `message-expiry:` to give it one.
+- A payload cut off on arrival (larger than `--max-payload`) can't be sent unchanged: edit it,
+  or restart with a larger `--max-payload` to republish it whole.
+- An empty payload with `retain: yes` clears the retained message on that topic.
+- `ctrl+s` sends, `esc` cancels (twice if you've edited), `ctrl+f` switches a JSON payload
+  between indented and compact. Mistakes are shown with their line, and the message isn't sent.
+- The result appears on the status line: written (QoS 0), acknowledged (QoS 1) or completed
+  (QoS 2), or the broker's reason for refusing it. Limits the broker announces (largest packet,
+  highest QoS, retained messages, how many unacknowledged messages it takes) are checked before
+  sending.
 
 ## Payload formats
 
@@ -272,8 +311,8 @@ bytes (4 KiB); the rest is discarded as it arrives, so a topic costs at most abo
 however large or frequent its messages are (captured topics are written to disk whole, as they
 arrive). Filtering 100k topics takes a few milliseconds.
 
-The MQTT client (`src/mqtt.rs`) is a small MQTT v5 subscriber on blocking I/O with one thread and
-no async runtime, which keeps the binary around 1 MB. TLS uses rustls.
+The MQTT client (`src/mqtt.rs`) is a small MQTT v5 client on blocking I/O with one thread per
+connection and no async runtime, which keeps the binary around 1 MB. TLS uses rustls.
 
 ## Development
 

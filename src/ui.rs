@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Ask, Focus, PanelRow, msg_index, node_title};
+use crate::composer::{self, Editor};
 use crate::fmt::{self, ago, commas, human_bytes, human_count, msg_count, plural};
 use crate::glyph;
 use crate::pretty;
@@ -54,6 +55,13 @@ fn draw_all(f: &mut Frame, app: &App) {
     let st = app.store.lock().unwrap();
     let buf = f.buffer_mut();
 
+    if app.composer.is_some() {
+        composer_view(buf, area, app);
+        if app.prompt.is_some() {
+            prompt_box(buf, area, app, &st);
+        }
+        return;
+    }
     if app.viewer.is_some() {
         viewer(buf, area, app);
         return;
@@ -803,17 +811,44 @@ fn input_box(buf: &mut Buffer, r: Rect, app: &App) {
     }
 }
 
-fn hint<'a>(th: &Theme, pairs: &[(&str, &str)]) -> Line<'a> {
+/// Key hints in the order given, as many as fit in `width` columns: when
+/// they don't all fit, those with the highest rank go first (the rightmost
+/// of equal rank first); rank 0 always stays.
+fn hint<'a>(th: &Theme, pairs: &[(&str, &str, u8)], width: usize) -> Line<'a> {
+    const SEP: &str = " · ";
+    let w = |(k, v, _): &(&str, &str, u8)| fmt::str_width(k) + 1 + fmt::str_width(v);
+    let mut keep = vec![true; pairs.len()];
+    loop {
+        let shown: Vec<_> = pairs
+            .iter()
+            .zip(&keep)
+            .filter(|(_, k)| **k)
+            .map(|(p, _)| w(p))
+            .collect();
+        let total = 2 + shown.iter().sum::<usize>() + fmt::str_width(SEP) * shown.len().saturating_sub(1);
+        let drop = (0..pairs.len())
+            .filter(|&i| keep[i] && pairs[i].2 > 0)
+            .max_by_key(|&i| pairs[i].2);
+        match drop {
+            Some(i) if total > width => keep[i] = false,
+            _ => break,
+        }
+    }
     let mut spans = vec![Span::raw("  ")];
-    for (i, (k, v)) in pairs.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled("  ·  ", th.faint));
+    for (k, v, _) in pairs.iter().zip(&keep).filter(|(_, k)| **k).map(|(p, _)| p) {
+        if spans.len() > 1 {
+            spans.push(Span::styled(SEP, th.faint));
         }
         spans.push(Span::styled(k.to_string(), th.key));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(v.to_string(), th.dim));
     }
     Line::from(spans)
+}
+
+/// Columns left for hints on a bottom line that also shows the version.
+fn hint_room(app: &App) -> usize {
+    (app.width as usize).saturating_sub(fmt::str_width(&version()) + 3)
 }
 
 fn version() -> String {
@@ -840,43 +875,51 @@ fn hints<'a>(app: &App) -> Line<'a> {
     if let Some(line) = notice_line(app) {
         return line;
     }
+    // Ranks: the new actions stay longest; arrows are the first to go. (The
+    // main screen's version sits on the input box, not on this line.)
+    let room = (app.width as usize).saturating_sub(1);
     if app.focus == Focus::Conns {
         hint(
             &app.th,
             &[
-                ("↑↓", "move"),
-                (&format!("space {}", glyph::ENTER), "connect / on-off"),
-                ("tab", "next pane"),
-                ("type", "filter"),
-                ("^c", "quit"),
+                ("↑↓", "move", 3),
+                (&format!("space {}", glyph::ENTER), "connect / on-off", 1),
+                ("tab", "pane", 2),
+                ("type", "filter", 2),
+                ("^c", "quit", 0),
             ],
+            room,
         )
     } else if app.focus == Focus::Msgs {
         hint(
             &app.th,
             &[
-                ("↑↓", "messages"),
-                (glyph::ENTER, "open"),
-                ("^r", "capture"),
-                ("← esc", "back to tree"),
-                ("tab", "next pane"),
-                ("^t ^y", "copy"),
-                ("^c", "quit"),
+                ("↑↓", "messages", 3),
+                (glyph::ENTER, "open", 2),
+                ("^e", "publish", 1),
+                ("^t ^y", "copy", 1),
+                ("^r", "capture", 1),
+                ("← esc", "back", 2),
+                ("tab", "pane", 2),
+                ("^c", "quit", 0),
             ],
+            room,
         )
     } else {
         hint(
             &app.th,
             &[
-                ("↑↓", "move"),
-                ("←→", "collapse/expand"),
-                (glyph::ENTER, "open"),
-                ("^r", "capture"),
-                ("esc", "clear filter"),
-                ("tab", "next pane"),
-                ("^t ^y", "copy"),
-                ("^c", "quit"),
+                ("↑↓", "move", 3),
+                ("←→", "collapse/expand", 3),
+                (glyph::ENTER, "open", 2),
+                ("^e", "publish", 1),
+                ("^t ^y", "copy", 1),
+                ("^r", "capture", 1),
+                ("esc", "clear filter", 2),
+                ("tab", "pane", 2),
+                ("^c", "quit", 0),
             ],
+            room,
         )
     }
 }
@@ -898,19 +941,115 @@ fn viewer(buf: &mut Buffer, area: Rect, app: &App) {
     draw_box(buf, r, &v.path, lines, true, None, th);
 
     let mode = format!("view: {}", v.mode_name());
-    let mut keys = vec![("↑↓ pgup pgdn", "scroll"), ("←→", "older/newer")];
+    let mut keys = vec![("↑↓ pgup pgdn", "scroll", 3), ("←→", "older/newer", 2)];
     if v.max_width > v.width_now() {
-        keys.push(("shift ←→", "pan"));
+        keys.push(("shift ←→", "pan", 1));
     }
-    keys.extend([("tab", mode.as_str()), ("t y", "copy"), ("esc", "back")]);
-    let mut h = notice_line(app).unwrap_or_else(|| hint(th, &keys));
-    if v.lines.len() > body_h && app.notice.is_none() {
-        h.spans.push(Span::styled(
-            format!("  {}–{} of {} lines", v.scroll + 1, end, v.lines.len()),
-            th.faint,
-        ));
+    keys.extend([
+        ("tab", mode.as_str(), 1),
+        ("e", "publish", 1),
+        ("t y", "copy", 1),
+        ("esc", "back", 0),
+    ]);
+    let lines = (v.lines.len() > body_h && app.notice.is_none())
+        .then(|| format!("  {}–{} of {} lines", v.scroll + 1, end, v.lines.len()));
+    let room = hint_room(app).saturating_sub(lines.as_deref().map_or(0, fmt::str_width));
+    let mut h = notice_line(app).unwrap_or_else(|| hint(th, &keys, room));
+    if let Some(lines) = lines {
+        h.spans.push(Span::styled(lines, th.faint));
     }
     put(buf, 0, area.height - 1, with_version(app, h), area.width);
+}
+
+/// The publish composer: the message as a document over the whole screen.
+fn composer_view(buf: &mut Buffer, area: Rect, app: &App) {
+    let c = app.composer.as_ref().unwrap();
+    let th = &app.th;
+    let v = c.view(area.width, area.height);
+    let status = c.status(area.width);
+    let mut lines: Vec<Line> = status
+        .iter()
+        .map(|(t, err)| Line::styled(t.clone(), if *err { th.red } else { th.yellow }))
+        .collect();
+    let ed = &c.ed;
+    // Lines before the blank one are headers.
+    let headers = c.payload_row().map_or(ed.lines.len(), |r| r - 1);
+    for row in ed.top..(ed.top + v.rows).min(ed.lines.len()) {
+        let mut spans = vec![Span::styled(format!("{:>w$} ", row + 1, w = v.gutter - 1), th.faint)];
+        let (text, more) = editor_row(ed, row, v.cols, row < headers, th);
+        let used: usize = text.iter().map(|s| s.width()).sum();
+        spans.extend(text);
+        if more {
+            spans.push(Span::raw(" ".repeat(v.cols.saturating_sub(used))));
+            spans.push(Span::styled("›", th.faint));
+        }
+        lines.push(Line::from(spans));
+    }
+    let r = Rect::new(0, 0, area.width, area.height - 1);
+    draw_box(buf, r, &c.title, lines, true, None, th);
+
+    // The cursor, a block like the filter's.
+    let x = ed.cells_to(ed.row, ed.col).checked_sub(ed.left);
+    let y = ed.row.checked_sub(ed.top).filter(|&y| y < v.rows);
+    if let (Some(x), Some(y)) = (x.filter(|&x| x < v.cols), y) {
+        let (cx, cy) = (r.x as usize + 2 + v.gutter + x, r.y as usize + 1 + status.len() + y);
+        if cx < area.width as usize && cy < area.height as usize {
+            buf[(cx as u16, cy as u16)].set_style(th.cursor);
+        }
+    }
+
+    border_label(buf, r, &format!("ln {}, col {}", ed.row + 1, ed.col + 1), th.faint);
+    let keys = [
+        ("^s", "send", 0),
+        ("esc", "cancel", 0),
+        ("^f", "JSON pretty/compact", 1),
+    ];
+    let h = hint(th, &keys, hint_room(app));
+    put(buf, 0, area.height - 1, with_version(app, h), area.width);
+}
+
+/// What shows of line `row` of the editor: `cols` cells from its sideways
+/// scroll position, a header's key in purple, tabs as a visible mark. Also
+/// whether the line goes on past the right edge.
+fn editor_row<'a>(ed: &Editor, row: usize, cols: usize, header: bool, th: &Theme) -> (Vec<Span<'a>>, bool) {
+    let line = &ed.lines[row];
+    let colon = if header {
+        line.iter().position(|&c| c == ':')
+    } else {
+        None
+    };
+    let (mut key, mut text) = (String::new(), String::new());
+    let (mut x, mut used) = (0, 0);
+    let mut more = false;
+    for (i, &c) in line.iter().enumerate() {
+        let w = composer::cell_width(c);
+        let part = if colon.is_some_and(|k| i <= k) {
+            &mut key
+        } else {
+            &mut text
+        };
+        if x < ed.left {
+            // A wide character cut by the left edge: its visible half.
+            let shown = (x + w).saturating_sub(ed.left);
+            part.extend(std::iter::repeat_n(' ', shown));
+            used += shown;
+            x += w;
+            continue;
+        }
+        if used + w > cols {
+            more = true;
+            break;
+        }
+        part.push(if c == '\t' { composer::TAB } else { c });
+        used += w;
+        x += w;
+    }
+    let mut spans = Vec::new();
+    if !key.is_empty() {
+        spans.push(Span::styled(key, th.purple));
+    }
+    spans.push(Span::styled(text, th.text));
+    (spans, more)
 }
 
 #[cfg(test)]
@@ -1503,6 +1642,152 @@ mod tests {
         app.store.lock().unwrap().notify("published", false);
         app.tick();
         assert!(matches!(&app.notice, Some((t, true, _)) if t == "capture failed"));
+    }
+
+    fn ctrl(app: &mut App, c: char) {
+        app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn compose_and_publish() {
+        let cfg = tmp_config("publish");
+        let (mut app, rx) = sample(cfg.clone());
+        typ(&mut app, "v1/plant/line1/temp");
+        press(&mut app, &[KeyCode::Down]);
+        assert!(frame(&app, "tree hints").contains("^e publish"));
+
+        // ctrl+e: a copy of the latest message, every property included.
+        ctrl(&mut app, 'e');
+        let v = frame(&app, "composer");
+        for want in [
+            "Publish · copy of the message from",
+            "1 topic: v1/plant/line1/temp",
+            "connection: local",
+            "qos: 1",
+            "retain: no",
+            "content-type: application/json",
+            "user: site = oslo",
+            "user: unit = C",
+            r#"{"t":22.5,"ok":true,"tags":["a","b"],"note":null}"#,
+            "^s send",
+        ] {
+            assert!(v.contains(want), "{want:?} missing:\n{v}");
+        }
+        // ctrl+f indents the JSON; ctrl+s sends it on local's channel.
+        ctrl(&mut app, 'f');
+        let v = frame(&app, "composer, JSON indented");
+        assert!(v.contains(r#"  "t": 22.5,"#), "{v}");
+        ctrl(&mut app, 's');
+        assert!(app.composer.is_none());
+        let Ok(Cmd::Publish(o)) = rx[0].try_recv() else {
+            panic!("no publish")
+        };
+        assert_eq!((o.topic.as_str(), o.qos, o.retain), ("v1/plant/line1/temp", 1, false));
+        assert_eq!(o.props.content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            o.props.user,
+            vec![("site".into(), "oslo".into()), ("unit".into(), "C".into())]
+        );
+        let text = String::from_utf8(o.payload).unwrap();
+        assert!(text.starts_with("{\n  \"t\": 22.5,\n  \"ok\": true,"), "{text}");
+        assert!(frame(&app, "sent").contains("publishing to local · v1/plant/line1/temp…"));
+
+        // Full screen, e edits the message shown; esc on an untouched copy
+        // goes back to it. An edited one needs esc twice, and sends nothing.
+        // (A notice takes the full screen's hint line while it shows.)
+        app.notice = None;
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(frame(&app, "viewer").contains("e publish"));
+        press(&mut app, &[KeyCode::Char('e')]);
+        assert!(app.composer.is_some());
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.composer.is_none() && app.viewer.is_some());
+        press(&mut app, &[KeyCode::Char('e')]);
+        typ(&mut app, "draft");
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(frame(&app, "discard?").contains("esc again discards your changes"));
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.composer.is_none() && app.viewer.is_some());
+        assert!(rx[0].try_recv().is_err());
+        press(&mut app, &[KeyCode::Esc]);
+
+        // staging isn't connected: the composer stays open and says so.
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        typ(&mut app, "devices/d9/up/temp");
+        press(&mut app, &[KeyCode::Down]);
+        ctrl(&mut app, 'e');
+        ctrl(&mut app, 's');
+        let v = frame(&app, "not connected");
+        assert!(
+            v.contains("line 2: staging isn't connected; connect it in the panel first"),
+            "{v}"
+        );
+        assert!(rx[1].try_recv().is_err());
+        press(&mut app, &[KeyCode::Esc]);
+
+        // On a topic without messages: a new, empty message for it.
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        typ(&mut app, "v1/plant");
+        ctrl(&mut app, 'e');
+        let v = frame(&app, "new message");
+        assert!(
+            v.contains("Publish · new message") && v.contains("topic: v1/plant"),
+            "{v}"
+        );
+        let _ = std::fs::remove_file(&cfg);
+    }
+
+    #[test]
+    fn composer_refuses_cut_off_payloads() {
+        let (mut app, rx) = sample(tmp_config("compose-cut"));
+        typ(&mut app, "v1/camera/frame");
+        press(&mut app, &[KeyCode::Down]);
+        ctrl(&mut app, 'e');
+        let v = frame(&app, "cut off");
+        assert!(
+            v.contains("only the first 64.0 KB of this 195.3 KB payload were kept"),
+            "{v}"
+        );
+        assert!(v.contains("encoding: base64"), "{v}");
+        ctrl(&mut app, 's');
+        let v = frame(&app, "cut off, refused");
+        assert!(v.contains("restart with --max-payload 256KiB"), "{v}");
+        assert!(app.composer.is_some() && rx[0].try_recv().is_err());
+    }
+
+    #[test]
+    fn composer_says_when_a_connection_has_stopped() {
+        let (mut app, rx) = sample(tmp_config("compose-stopped"));
+        // local's thread is gone: nothing takes its commands any more.
+        drop(rx);
+        typ(&mut app, "v1/plant/line1/temp");
+        press(&mut app, &[KeyCode::Down]);
+        ctrl(&mut app, 'e');
+        ctrl(&mut app, 's');
+        let v = frame(&app, "connection stopped");
+        assert!(
+            v.contains("line 2: not sent: local's connection has stopped; restart fss-mqtt to use it again"),
+            "{v}"
+        );
+        assert!(app.composer.is_some(), "the document stays open");
+        assert!(!v.contains("publishing to"), "{v}");
+    }
+
+    #[test]
+    fn composer_scrolls_long_lines() {
+        let (mut app, _rx) = sample(tmp_config("compose-scroll"));
+        app.resize(40, 20);
+        typ(&mut app, "v1/plant/line1/temp");
+        press(&mut app, &[KeyCode::Down]);
+        ctrl(&mut app, 'e');
+        // The payload line is longer than the box: it's marked, and End
+        // scrolls to show its end with the cursor in view.
+        let v = frame(&app, "long line");
+        assert!(v.lines().any(|l| l.contains(r#"{"t":22.5"#) && l.contains('›')), "{v}");
+        press(&mut app, &[KeyCode::End]);
+        let v = frame(&app, "long line, end");
+        assert!(v.contains(r#""note":null}"#), "{v}");
+        assert!(v.contains("ln 9, col 50"), "{v}");
     }
 
     #[test]

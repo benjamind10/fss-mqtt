@@ -268,7 +268,7 @@ pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<C
             }
             set_status(&store, cfg.conn, ConnState::Connecting, None);
             let end = session(&cfg, &store, &rx, &mut inbox);
-            inbox.flush_capture(&store, cfg.conn, true);
+            crate::capture::flush(&store, cfg.conn); // what this session captured, to disk now
             match end {
                 End::Stopped => want = false,
                 End::Halted(err) => {
@@ -339,10 +339,7 @@ fn dial(host: &str, port: u16) -> Result<TcpStream, String> {
 /// What happens to each message that arrives, with whatever state that needs
 /// across messages and reconnects (one per connection thread).
 #[derive(Default)]
-struct Inbox {
-    /// This connection's capture file, once a message was captured.
-    capture: Option<Arc<Mutex<crate::capture::Sink>>>,
-}
+struct Inbox {}
 
 impl Inbox {
     #[allow(clippy::too_many_arguments)]
@@ -361,27 +358,15 @@ impl Inbox {
         let decoded = crate::pretty::decode_on_arrival(props.content_type.as_deref(), payload);
         let captured = {
             let mut st = store.lock().unwrap();
-            let sink = st.capture_target(conn, topic);
-            let captured = sink.map(|s| (s, props.clone()));
+            let target = st.capture_target(conn, topic);
+            let captured = target.map(|t| (t, props.clone()));
             st.add_decoded(conn, topic, payload, qos, retain, props, decoded);
             captured
         };
-        // To disk, whole, after the lock is released.
-        if let Some((sink, props)) = captured {
-            crate::capture::record(store, conn, &sink, topic, payload, qos, retain, &props);
-            self.capture = Some(sink);
-        }
-    }
-
-    /// Flushes captured messages that have waited a second, or all of them.
-    fn flush_capture(&mut self, store: &Mutex<Store>, conn: usize, all: bool) {
-        let Some(sink) = &self.capture else { return };
-        let res = {
-            let mut s = sink.lock().unwrap();
-            if all { s.flush() } else { s.flush_if_due() }
-        };
-        if let Err(e) = res {
-            crate::capture::fail(store, conn, e);
+        // Encoded whole after the lock is released and queued for the
+        // connection's capture writer, which does the disk I/O.
+        if let Some((target, props)) = captured {
+            target.record(topic, payload, qos, retain, &props);
         }
     }
 }
@@ -566,7 +551,6 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut I
         if last_recv.elapsed() > Duration::from_secs(keep_alive.max(2) as u64 * 2) {
             return End::Failed("keepalive timeout".into());
         }
-        inbox.flush_capture(store, cfg.conn, false);
     }
 }
 
@@ -1087,14 +1071,20 @@ mod e2e {
             (64 * 1024, big.len()),
             "the store keeps 64 KiB"
         );
-        // The thread flushes within a second; don't wait for it.
-        let sink = st.lock().unwrap().conns[0].capture.sink().expect("captured");
-        sink.lock().unwrap().flush().unwrap();
+        // Counted once written by the writer thread; then have it flush now
+        // rather than within the second (without holding the store lock).
+        let start = Instant::now();
+        while st.lock().unwrap().conns[0].capture.rules[0].written() < 2 {
+            assert!(start.elapsed() < Duration::from_secs(5), "not written");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let writer = st.lock().unwrap().conns[0].capture.writer().expect("captured");
+        assert!(writer.flush_wait(Duration::from_secs(5)));
         let files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
         assert_eq!(files.len(), 1, "{files:?}");
         let name = files[0].file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with("fss-mqtt-t-") && name.ends_with(".jsonl"), "{name}");
-        assert_eq!(st.lock().unwrap().conns[0].capture.file.as_ref(), Some(&files[0]));
+        assert_eq!(st.lock().unwrap().conns[0].capture.file().as_ref(), Some(&files[0]));
         let text = std::fs::read_to_string(&files[0]).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "only e2e/cap/#");
@@ -1114,7 +1104,7 @@ mod e2e {
             "{}",
             lines[1]
         );
-        assert_eq!(st.lock().unwrap().conns[0].capture.rules[0].msgs, 2);
+        assert_eq!(st.lock().unwrap().conns[0].capture.rules[0].written(), 2);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&bin_path);
 

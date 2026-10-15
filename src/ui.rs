@@ -198,13 +198,13 @@ fn capture_row<'a>(th: &Theme, cap: &crate::capture::Capture, j: usize, lead: Ve
     ]);
     if !r.enabled {
         spans.push(Span::styled(" · off", th.dim));
-    } else if let Some(e) = &cap.err {
+    } else if let Some(e) = cap.err() {
         spans.push(Span::styled(format!("  failed: {e}"), th.red));
     } else {
-        if let Some(f) = cap.file.as_ref().and_then(|f| f.file_name()) {
+        if let Some(f) = cap.file().as_ref().and_then(|f| f.file_name()) {
             spans.push(Span::styled(format!(" → {}", f.to_string_lossy()), th.dim));
         }
-        let count = match r.msgs {
+        let count = match r.written() {
             0 => "no messages yet".into(),
             n => msg_count(n),
         };
@@ -701,7 +701,7 @@ fn conn_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> Vec<Line<'a>> {
         for j in 0..c.capture.rules.len() {
             out.push(capture_row(th, &c.capture, j, vec![Span::raw("  ")]));
         }
-        match (&c.capture.err, &c.capture.file) {
+        match (c.capture.err(), c.capture.file()) {
             (Some(e), _) => out.push(Line::styled(format!("  stopped: {e}"), th.red)),
             (None, Some(f)) => out.push(Line::styled(format!("  {}", f.display()), th.dim)),
             (None, None) => out.push(Line::styled(
@@ -1525,16 +1525,47 @@ mod tests {
         // The connections file can add and remove rules too, live and
         // without touching the connection.
         let (local, staging) = (app.ctls[0].cfg.clone(), app.ctls[1].cfg.clone());
+        let only_v2 = ConnCfg {
+            capture: vec!["v2/#".into()],
+            ..local.clone()
+        };
+        app.apply_config(vec![only_v2, staging.clone()]);
+        assert!(app.store.lock().unwrap().conns[0].capture.captures("v2/fleet"));
+        assert!(rx[0].try_recv().is_err(), "capture changes don't reconnect");
+
+        // A write that fails (the capture dir can't be made) stops capture
+        // and says so, in the panel and the status line.
+        let wait = std::time::Duration::from_secs(5);
+        let blocker = dir.with_extension("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        app.store.lock().unwrap().capture_dir = blocker.join("captures");
+        let target = app
+            .store
+            .lock()
+            .unwrap()
+            .capture_target(0, "v2/fleet")
+            .expect("captured");
+        target.record("v2/fleet", b"1", 0, false, &Props::default());
+        let writer = app.store.lock().unwrap().conns[0].capture.writer().unwrap();
+        assert!(writer.flush_wait(wait));
+        app.tick();
+        let v = frame(&app, "capture failed");
+        assert!(v.contains("capture v2/#  failed: "), "{v}");
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|(t, err, _)| *err && t.starts_with("capture stopped for local: "))
+        );
+
         let with = ConnCfg {
             capture: vec!["v2/#".into(), "#".into()],
             capture_paused: vec!["#".into()],
             ..local.clone()
         };
-        app.store.lock().unwrap().conns[0].capture.err = Some("disk full".into());
         app.apply_config(vec![with, staging.clone()]);
         {
             let st = app.store.lock().unwrap();
-            assert!(st.conns[0].capture.err.is_none(), "an edited rule tries again");
+            assert!(st.conns[0].capture.err().is_none(), "an edited rule tries again");
             let rules: Vec<_> = st.conns[0]
                 .capture
                 .rules
@@ -1544,10 +1575,35 @@ mod tests {
             assert_eq!(rules, [("v2/#", true), ("#", false)]);
         }
         assert!(rx[0].try_recv().is_err(), "capture changes don't reconnect");
+
+        // Quitting waits for what's queued to be written, but not forever.
+        app.store.lock().unwrap().capture_dir = dir.clone();
+        let target = app
+            .store
+            .lock()
+            .unwrap()
+            .capture_target(0, "v2/fleet")
+            .expect("captured");
+        let go_on = app.store.lock().unwrap().conns[0].capture.writer().unwrap().stall();
+        target.record("v2/fleet", b"2", 0, false, &Props::default());
+        let start = std::time::Instant::now();
+        let late = app.flush_captures(std::time::Duration::from_millis(100));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1), "bounded");
+        assert!(
+            late.len() == 1 && late[0].starts_with("local: ") && late[0].ends_with("the disk is too slow"),
+            "{late:?}"
+        );
+        drop(go_on);
+        assert!(app.flush_captures(wait).is_empty());
+        let file = app.store.lock().unwrap().conns[0].capture.file().expect("a new file");
+        assert!(std::fs::read_to_string(file).unwrap().ends_with("\"payload\":\"2\"}\n"));
+
         app.apply_config(vec![local, staging]);
         assert!(app.store.lock().unwrap().conns[0].capture.rules.is_empty());
         assert!(rx[0].try_recv().is_err());
         let _ = std::fs::remove_file(&cfg);
+        let _ = std::fs::remove_file(&blocker);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

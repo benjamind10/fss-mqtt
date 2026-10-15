@@ -423,9 +423,12 @@ fn run() -> Result<(), String> {
     let mut terminal = ratatui::init();
     let _ = execute!(stdout(), EnableBracketedPaste);
     let res = event_loop(&mut terminal, &mut app);
-    app.flush_captures();
     let _ = execute!(stdout(), DisableBracketedPaste);
     ratatui::restore();
+    // What was captured reaches the disk before we exit, within a bound.
+    for late in app.flush_captures(capture::QUIT_WAIT) {
+        eprintln!("fss-mqtt: capture: {late}");
+    }
     res.map_err(|e| e.to_string())
 }
 

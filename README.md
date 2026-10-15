@@ -217,9 +217,11 @@ Each connection writes one file per run, created when the first matching message
 `fss-mqtt-<connection>-<YYYYMMDD-HHMMSS>.jsonl` in the current directory, or in `--capture-dir`
 (`FSS_MQTT_CAPTURE_DIR`). Its full path is shown when it's created and in the connection's details;
 on Unix it's readable by you only. Payloads are written whole, however large: `--max-payload` only
-limits what's kept in memory. Lines reach the file at least once a second and when you quit. If
-writing fails (a full disk, no permission), capture stops for that connection and says why; turning
-a rule off and on again starts a new file.
+limits what's kept in memory. A thread of its own writes each file, so a slow disk never holds up
+the connection: lines reach the file at least once a second, and quitting waits up to 5 s for what's
+still queued. If writing fails (a full disk, no permission), or more than 64 MB is waiting because
+the disk can't keep up, capture stops for that connection and says why; turning a rule off and on
+again resumes it (in a new file after a failed write).
 
 One message per line ([JSON Lines](https://jsonlines.org)):
 

@@ -650,10 +650,10 @@ impl App {
         }
         let rule = crate::capture::subtree(&path);
         let cfg = &mut self.ctls[i].cfg;
-        if cfg.capture.contains(&rule) {
+        let added = if cfg.capture.contains(&rule) {
             cfg.capture.retain(|r| r != &rule);
             cfg.capture_paused.retain(|r| r != &rule);
-            self.notify(format!("stopped capturing {rule}"), false);
+            false
         } else {
             let covering = {
                 let st = self.store.lock().unwrap();
@@ -664,19 +664,22 @@ impl App {
                 return;
             }
             cfg.capture.push(rule.clone());
-            let text = {
-                let st = self.store.lock().unwrap();
-                match &st.conns[i].capture.file {
-                    Some(f) => format!("capturing {rule} to {} (appending)", f.display()),
-                    None => format!(
-                        "capturing {rule} to {} (from the next message)",
-                        st.capture_dir.display()
-                    ),
-                }
-            };
-            self.notify(text, false);
-        }
+            true
+        };
         self.sync_capture(i);
+        let text = if added {
+            let st = self.store.lock().unwrap();
+            match st.conns[i].capture.file() {
+                Some(f) => format!("capturing {rule} to {} (appending)", f.display()),
+                None => format!(
+                    "capturing {rule} to {} (from the next message)",
+                    st.capture_dir.display()
+                ),
+            }
+        } else {
+            format!("stopped capturing {rule}")
+        };
+        self.notify(text, false);
         self.save_conn(i);
     }
 
@@ -705,8 +708,8 @@ impl App {
     }
 
     /// Hands connection `i`'s capture rules to the store, where its thread
-    /// reads them. Toggling also retries after a failure, and what was
-    /// captured so far is flushed.
+    /// reads them. Toggling also retries after capture stopped, and what was
+    /// captured so far is written out.
     fn sync_capture(&mut self, i: usize) {
         {
             let mut st = self.store.lock().unwrap();
@@ -716,25 +719,32 @@ impl App {
             c.retry();
         }
         self.refresh_panel();
-        self.flush_capture(i);
+        crate::capture::flush(&self.store, i);
     }
 
-    /// Writes out connection `i`'s buffered capture.
-    fn flush_capture(&mut self, i: usize) {
-        let Some(sink) = self.store.lock().unwrap().conns[i].capture.sink() else {
-            return;
+    /// Writes out what every connection captured, before quitting: waits up
+    /// to `wait` in all (a stuck disk mustn't hang the exit), never with the
+    /// store lock held. Returns what couldn't be written in time.
+    pub fn flush_captures(&self, wait: Duration) -> Vec<String> {
+        let writers: Vec<_> = {
+            let st = self.store.lock().unwrap();
+            st.conns
+                .iter()
+                .filter_map(|c| Some((c.name.clone(), c.capture.writer()?)))
+                .collect()
         };
-        let res = sink.lock().unwrap().flush();
-        if let Err(e) = res {
-            crate::capture::fail(&self.store, i, e);
-        }
-    }
-
-    /// Writes out every connection's buffered capture (before quitting).
-    pub fn flush_captures(&mut self) {
-        for i in 0..self.ctls.len() {
-            self.flush_capture(i);
-        }
+        let deadline = Instant::now() + wait;
+        let acks: Vec<_> = writers.into_iter().map(|(name, w)| (name, w.flush_ack(), w)).collect();
+        acks.into_iter()
+            .filter(|(_, ack, w)| {
+                let left = deadline.saturating_duration_since(Instant::now());
+                ack.recv_timeout(left).is_err() && w.pending() > 0
+            })
+            .map(|(name, _, w)| {
+                let left = crate::fmt::human_bytes(w.pending());
+                format!("{name}: {left} of captured messages not written, the disk is too slow")
+            })
+            .collect()
     }
 
     // ── Live reload of the connections file ────────────────────────────────
@@ -869,7 +879,7 @@ impl App {
                 c.set_rules(&new.capture, &new.capture_paused);
                 c.retry();
             }
-            self.flush_capture(i);
+            crate::capture::flush(&self.store, i);
         }
         let ctl = &mut self.ctls[i];
         let active = state != ConnState::Disconnected;

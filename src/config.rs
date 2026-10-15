@@ -10,6 +10,7 @@
 //! password_env = "BROKER_PW"        # read from this environment variable
 //! topics       = ["devices/+/up/#", "$SYS/#"]
 //! paused       = ["$SYS/#"]         # listed but not subscribed
+//! capture      = ["devices/d1/#"]   # written to disk (opt-in, see capture.rs)
 //! autoconnect  = true
 //! ```
 //!
@@ -33,6 +34,9 @@ pub struct ConnCfg {
     pub qos: u8,
     pub topics: Vec<String>,
     pub paused: Vec<String>,
+    /// Topic filters captured to disk, and those of them turned off.
+    pub capture: Vec<String>,
+    pub capture_paused: Vec<String>,
     pub autoconnect: bool,
 }
 
@@ -152,6 +156,12 @@ fn render(c: &ConnCfg) -> String {
     kv("topics", list(&c.topics));
     if !c.paused.is_empty() {
         kv("paused", list(&c.paused));
+    }
+    if !c.capture.is_empty() {
+        kv("capture", list(&c.capture));
+    }
+    if !c.capture_paused.is_empty() {
+        kv("capture_paused", list(&c.capture_paused));
     }
     kv("autoconnect", c.autoconnect.to_string());
     s
@@ -399,14 +409,20 @@ fn set(c: &mut ConnCfg, key: &str, v: Value) -> Result<(), String> {
             Value::Int(q @ 0..=2) => c.qos = q as u8,
             _ => return Err("qos must be 0, 1 or 2".into()),
         },
-        "topics" | "paused" => {
+        "topics" | "paused" | "capture" | "capture_paused" => {
             let Value::List(l) = v else {
                 return Err(format!("{key} must be a list of strings"));
             };
-            if key == "topics" {
-                c.topics = l;
-            } else {
-                c.paused = l;
+            if key.starts_with("capture")
+                && let Some(bad) = l.iter().find(|f| !crate::capture::valid_filter(f))
+            {
+                return Err(format!("{key}: {bad:?} is not a topic filter"));
+            }
+            match key {
+                "topics" => c.topics = l,
+                "paused" => c.paused = l,
+                "capture" => c.capture = l,
+                _ => c.capture_paused = l,
             }
         }
         "password" => {
@@ -437,6 +453,8 @@ topics = [
     "$SYS/#",
 ]
 paused = ["$SYS/#"]
+capture = ["devices/d1/#", "#"]
+capture_paused = ["#"]
 autoconnect = true
 
 # staging, off by default
@@ -455,7 +473,10 @@ topics = ["#"]
         assert_eq!(c[0].cafile.as_deref(), Some("~/secrets/ca.pem"));
         assert_eq!(c[0].topics, vec!["devices/+/up/#", "$SYS/#"]);
         assert_eq!(c[0].paused, vec!["$SYS/#"]);
+        assert_eq!(c[0].capture, vec!["devices/d1/#", "#"]);
+        assert_eq!(c[0].capture_paused, vec!["#"]);
         assert!(c[0].autoconnect);
+        assert!(c[1].capture.is_empty());
         assert_eq!((c[1].qos, c[1].autoconnect), (1, false));
     }
 
@@ -469,6 +490,8 @@ topics = ["#"]
                 .unwrap_err();
         assert!(e.contains("duplicate"), "{e}");
         assert!(parse("[[connection]]\nname = \"a\"").unwrap_err().contains("no url"));
+        let e = parse("[[connection]]\nname = \"a\"\nurl = \"mqtt://x\"\ncapture = [\"a/#/b\"]").unwrap_err();
+        assert!(e.contains("line 4") && e.contains("not a topic filter"), "{e}");
     }
 
     #[test]
@@ -476,6 +499,8 @@ topics = ["#"]
         let mut c = parse(SAMPLE).unwrap()[0].clone();
         c.paused.clear();
         c.topics.push("alarms/#".into());
+        c.capture_paused.clear();
+        c.capture.push("alarms/#".into());
         let out = upsert(SAMPLE, &c).unwrap();
         assert!(out.contains("# my brokers"));
         assert!(out.contains("# staging, off by default"));

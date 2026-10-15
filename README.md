@@ -70,6 +70,7 @@ client_id    = "fss-mqtt-ci"               # optional; random by default
 qos          = 1                           # optional; 0 by default
 topics       = ["devices/+/up/#", "$SYS/#"]
 paused       = ["$SYS/#"]                  # listed, but not subscribed
+capture      = ["devices/d1/#"]            # written to disk; see Capture to disk
 autoconnect  = true                        # connect when started without -c or a broker
 ```
 
@@ -94,7 +95,7 @@ autoconnect  = true                        # connect when started without -c or 
 
 The panel at the top lists each connection with its subscriptions. `tab` moves between the panel,
 the topic tree and the message list; in the panel, `space` or `⏎` connects or disconnects a
-connection, or turns a subscription on or off (subscribed and unsubscribed live).
+connection, or turns a subscription (subscribed and unsubscribed live) or a capture rule on or off.
 
 | Flag | Default | |
 |---|---|---|
@@ -110,6 +111,8 @@ connection, or turns a subscription on or off (subscribed and unsubscribed live)
 | `--cafile` | | PEM file of CA certificates to trust (implies TLS) |
 | `--cert`, `--key` | | client certificate and key (PEM) for mutual TLS; the key may be encrypted |
 | `--insecure` | | skip TLS certificate verification |
+| `--capture` | | topic filter to capture to disk (repeatable; see [Capture to disk](#capture-to-disk)) |
+| `--capture-dir` | current directory | where capture files go (also `FSS_MQTT_CAPTURE_DIR`) |
 
 ## Filtering
 
@@ -130,11 +133,12 @@ clears. Clearing keeps the tree open at the topic you were on.
 |---|---|---|
 | anywhere | `tab` / `shift+tab` | next / previous pane: connections, topics, messages |
 | connections | `↑ ↓` | move |
-| connections | `space` `⏎` | connect / disconnect, or subscription on / off |
+| connections | `space` `⏎` | connect / disconnect, or subscription / capture rule on / off |
 | tree | `↑ ↓ pgup pgdn home end` | move |
 | tree | `→` | expand; on a topic with messages, enter its message list |
 | tree | `←` | collapse, or jump to parent |
 | tree | `⏎` | open the latest message full screen |
+| tree, messages | `ctrl+r` | capture this topic and everything below it to disk; again to stop |
 | messages | `↑ ↓` | pick one of the last 10 messages (properties and payload follow) |
 | messages | `⏎` | open it full screen |
 | messages | `← esc` | back to the tree |
@@ -196,13 +200,50 @@ like one of these formats but can't be read, the reason is shown above a hex dum
   containing `changeset` or `patchset`, or without one when the whole payload reads as one; the
   format doesn't carry column names, so columns are numbered (`pk c0`, `c1`, …).
 
+## Capture to disk
+
+Nothing is written to disk unless you ask for it, per topic. `ctrl+r` on a topic in the tree or the
+message list captures that topic and everything below it (`topic/#`; on a connection's row, all of
+it), and `ctrl+r` again stops. A topic inside a subtree that's already captured says so rather than
+getting a rule of its own. The rules are listed in the connections panel, where `space` turns one off
+and on; captured topics get a red `●` in the tree, and the header shows `● capturing` while anything
+is.
+
+Rules are saved with the connection (`capture = ["site/oslo/#"]`, and `capture_paused` for those
+turned off), so they apply again next time; `--capture FILTER` (repeatable) sets them for the broker
+on the command line. Editing them in the connections file applies live, without reconnecting.
+
+Each connection writes one file per run, created when the first matching message arrives:
+`fss-mqtt-<connection>-<YYYYMMDD-HHMMSS>.jsonl` in the current directory, or in `--capture-dir`
+(`FSS_MQTT_CAPTURE_DIR`). Its full path is shown when it's created and in the connection's details;
+on Unix it's readable by you only. Payloads are written whole, however large: `--max-payload` only
+limits what's kept in memory. Lines reach the file at least once a second and when you quit. If
+writing fails (a full disk, no permission), capture stops for that connection and says why; turning
+a rule off and on again starts a new file.
+
+One message per line ([JSON Lines](https://jsonlines.org)):
+
+```json
+{"time":"2026-10-15T08:20:30.123Z","topic":"site/oslo/turbine/T01/telemetry","qos":1,"retain":false,"content_type":"application/json","user":[["TurbineId","T01"]],"size":34,"payload":"{\"power_kw\":2265.8,\"wind_ms\":11.5}"}
+```
+
+`time` is when it arrived (UTC). `content_type`, `response_topic`, `correlation_data` (base64),
+`message_expiry`, `payload_format` and `user` appear when the message has them. The payload is
+`payload` when it's UTF-8 text and `payload_base64` otherwise; `size` is its length in bytes.
+
+```sh
+# T01's power readings, one number per line
+jq -r 'select(.topic | endswith("T01/telemetry")) | .payload | fromjson | .power_kw' fss-mqtt-oslo-*.jsonl
+```
+
 ## Performance notes
 
 Messages are written straight into an in-memory tree; the UI redraws at ~15 fps rather than per
 message, and only the visible rows are rendered. Large payloads are never rendered in the tree. Each
 topic keeps its last `--history` messages (10), and each message keeps only the first `--max-payload`
 bytes (4 KiB); the rest is discarded as it arrives, so a topic costs at most about 40 KiB of payload
-however large or frequent its messages are. Filtering 100k topics takes a few milliseconds.
+however large or frequent its messages are (captured topics are written to disk whole, as they
+arrive). Filtering 100k topics takes a few milliseconds.
 
 The MQTT client (`src/mqtt.rs`) is a small MQTT v5 subscriber on blocking I/O with one thread and
 no async runtime, which keeps the binary around 1 MB. TLS uses rustls.
@@ -210,7 +251,7 @@ no async runtime, which keeps the binary around 1 MB. TLS uses rustls.
 ## Development
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux, macOS and Windows, checks the
-minimum Rust version, runs the end-to-end test against mosquitto (plain, TLS and mutual TLS), and guards the
+minimum Rust version, runs the end-to-end test against mosquitto (plain, TLS and mutual TLS, and capture to disk), and guards the
 release binary size.
 
 ```sh

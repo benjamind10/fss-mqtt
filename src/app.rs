@@ -47,11 +47,13 @@ pub fn subs_of(c: &ConnCfg) -> Vec<Sub> {
 }
 
 /// Whether two entries differ only in what applies without reconnecting
-/// (subscriptions and autoconnect).
+/// (subscriptions, capture and autoconnect).
 fn same_link(a: &ConnCfg, b: &ConnCfg) -> bool {
     let strip = |c: &ConnCfg| ConnCfg {
         topics: vec![],
         paused: vec![],
+        capture: vec![],
+        capture_paused: vec![],
         autoconnect: false,
         ..c.clone()
     };
@@ -98,6 +100,7 @@ pub enum Focus {
 pub enum PanelRow {
     Conn(usize),
     Sub(usize, usize),
+    Capture(usize, usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -301,6 +304,8 @@ impl App {
         for (i, c) in st.conns.iter().enumerate().filter(|(_, c)| !c.removed) {
             self.panel.push(PanelRow::Conn(i));
             self.panel.extend((0..c.subs.len()).map(|j| PanelRow::Sub(i, j)));
+            self.panel
+                .extend((0..c.capture.rules.len()).map(|j| PanelRow::Capture(i, j)));
         }
         drop(st);
         self.panel_cursor = self.panel_cursor.min(self.panel.len().saturating_sub(1));
@@ -491,6 +496,10 @@ impl App {
                 self.set_filter(String::new());
                 return;
             }
+            KeyCode::Char('r') if ctrl && self.focus != Focus::Conns => {
+                self.capture_selected();
+                return;
+            }
             _ => {}
         }
 
@@ -564,6 +573,7 @@ impl App {
             KeyCode::Char(' ') | KeyCode::Enter => match self.panel.get(self.panel_cursor).copied() {
                 Some(PanelRow::Conn(i)) => self.toggle_conn(i),
                 Some(PanelRow::Sub(i, j)) => self.toggle_sub(i, j),
+                Some(PanelRow::Capture(i, j)) => self.toggle_capture(i, j),
                 None => {}
             },
             KeyCode::Esc => self.focus = Focus::Tree,
@@ -608,12 +618,122 @@ impl App {
         if !enabled {
             ctl.cfg.paused.push(topic);
         }
-        if ctl.saved {
-            match config::save(&self.config_path, &ctl.cfg) {
+        self.save_conn(i);
+    }
+
+    /// Writes connection `i`'s entry back to the connections file, if it
+    /// came from there.
+    fn save_conn(&mut self, i: usize) {
+        if self.ctls[i].saved {
+            match config::save(&self.config_path, &self.ctls[i].cfg) {
                 // Our own write: nothing to reload.
                 Ok(()) => self.config_stamp = stamp(&self.config_path),
                 Err(e) => self.notify(format!("couldn't save: {e}"), true),
             }
+        }
+    }
+
+    // ── Capture to disk ────────────────────────────────────────────────────
+
+    /// `ctrl+r`: starts or stops capturing the selected topic's subtree (a
+    /// whole connection on its row). A topic an enabled rule already
+    /// captures gets no narrower rule.
+    fn capture_selected(&mut self) {
+        let Some(n) = self.selected else { return };
+        let (i, path) = {
+            let st = self.store.lock().unwrap();
+            (st.nodes[n].conn, st.nodes[n].path.clone())
+        };
+        self.check_config(); // apply pending edits before saving over them
+        if self.is_removed(i) {
+            return;
+        }
+        let rule = crate::capture::subtree(&path);
+        let cfg = &mut self.ctls[i].cfg;
+        if cfg.capture.contains(&rule) {
+            cfg.capture.retain(|r| r != &rule);
+            cfg.capture_paused.retain(|r| r != &rule);
+            self.notify(format!("stopped capturing {rule}"), false);
+        } else {
+            let covering = {
+                let st = self.store.lock().unwrap();
+                st.conns[i].capture.covering(&rule).map(String::from)
+            };
+            if let Some(by) = covering {
+                self.notify(format!("{rule} is already captured by {by}"), false);
+                return;
+            }
+            cfg.capture.push(rule.clone());
+            let text = {
+                let st = self.store.lock().unwrap();
+                match &st.conns[i].capture.file {
+                    Some(f) => format!("capturing {rule} to {} (appending)", f.display()),
+                    None => format!(
+                        "capturing {rule} to {} (from the next message)",
+                        st.capture_dir.display()
+                    ),
+                }
+            };
+            self.notify(text, false);
+        }
+        self.sync_capture(i);
+        self.save_conn(i);
+    }
+
+    /// `space` on a capture rule in the panel: turns it off or on.
+    pub fn toggle_capture(&mut self, i: usize, j: usize) {
+        let Some(rule) = self.store.lock().unwrap().conns[i]
+            .capture
+            .rules
+            .get(j)
+            .map(|r| r.filter.clone())
+        else {
+            return;
+        };
+        self.check_config();
+        let cfg = &mut self.ctls[i].cfg;
+        if !cfg.capture.contains(&rule) {
+            return; // removed by the edit (or the connection is gone)
+        }
+        if cfg.capture_paused.contains(&rule) {
+            cfg.capture_paused.retain(|r| r != &rule);
+        } else {
+            cfg.capture_paused.push(rule);
+        }
+        self.sync_capture(i);
+        self.save_conn(i);
+    }
+
+    /// Hands connection `i`'s capture rules to the store, where its thread
+    /// reads them. Toggling also retries after a failure, and what was
+    /// captured so far is flushed.
+    fn sync_capture(&mut self, i: usize) {
+        {
+            let mut st = self.store.lock().unwrap();
+            let cfg = &self.ctls[i].cfg;
+            let c = &mut st.conns[i].capture;
+            c.set_rules(&cfg.capture, &cfg.capture_paused);
+            c.retry();
+        }
+        self.refresh_panel();
+        self.flush_capture(i);
+    }
+
+    /// Writes out connection `i`'s buffered capture.
+    fn flush_capture(&mut self, i: usize) {
+        let Some(sink) = self.store.lock().unwrap().conns[i].capture.sink() else {
+            return;
+        };
+        let res = sink.lock().unwrap().flush();
+        if let Err(e) = res {
+            crate::capture::fail(&self.store, i, e);
+        }
+    }
+
+    /// Writes out every connection's buffered capture (before quitting).
+    pub fn flush_captures(&mut self) {
+        for i in 0..self.ctls.len() {
+            self.flush_capture(i);
         }
     }
 
@@ -696,6 +816,7 @@ impl App {
             let mut st = self.store.lock().unwrap();
             let idx = st.add_conn(&c.name, &display, c.username.clone(), subs_of(&c));
             debug_assert_eq!(idx, i);
+            st.conns[idx].capture.set_rules(&c.capture, &c.capture_paused);
             st.conns[idx].node
         };
         self.expanded.insert(node);
@@ -741,6 +862,16 @@ impl App {
             c.username = new.username.clone();
             (c.status.state, before)
         };
+        if old.capture != new.capture || old.capture_paused != new.capture_paused {
+            {
+                let mut st = self.store.lock().unwrap();
+                let c = &mut st.conns[i].capture;
+                c.set_rules(&new.capture, &new.capture_paused);
+                c.retry();
+            }
+            self.flush_capture(i);
+        }
+        let ctl = &mut self.ctls[i];
         let active = state != ConnState::Disconnected;
         if !same_link(&old, &new) {
             // An empty password means username only, as in connect_or_ask.

@@ -172,6 +172,7 @@ fn panel_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
                 }
                 Line::from(spans)
             }
+            PanelRow::Capture(c, j) => capture_row(th, &st.conns[c].capture, j, vec![mark, Span::raw("    ")]),
         };
         lines.push(line);
     }
@@ -180,6 +181,36 @@ fn panel_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
     draw_box(buf, r, &title, lines, focused, sel_line, th);
     // Where the connections live; edits to the file apply while running.
     border_label(buf, r, &crate::config::tilde(&app.config_path), th.faint);
+}
+
+/// A capture rule after `lead`: `● capture site/# → file.jsonl · 12 msgs`.
+fn capture_row<'a>(th: &Theme, cap: &crate::capture::Capture, j: usize, lead: Vec<Span<'a>>) -> Line<'a> {
+    let r = &cap.rules[j];
+    let mut spans = lead;
+    spans.extend([
+        if r.enabled {
+            Span::styled("● ", th.red)
+        } else {
+            Span::styled("○ ", th.dim)
+        },
+        Span::styled("capture ", if r.enabled { th.text } else { th.dim }),
+        Span::styled(r.filter.clone(), if r.enabled { th.text } else { th.dim }),
+    ]);
+    if !r.enabled {
+        spans.push(Span::styled(" · off", th.dim));
+    } else if let Some(e) = cap.err() {
+        spans.push(Span::styled(format!("  failed: {e}"), th.red));
+    } else {
+        if let Some(f) = cap.file().as_ref().and_then(|f| f.file_name()) {
+            spans.push(Span::styled(format!(" → {}", f.to_string_lossy()), th.dim));
+        }
+        let count = match r.written() {
+            0 => "no messages yet".into(),
+            n => msg_count(n),
+        };
+        spans.push(Span::styled(format!(" · {count}"), th.faint));
+    }
+    Line::from(spans)
 }
 
 /// Writes `label` into the bottom border of `r`, right-aligned, keeping its
@@ -303,6 +334,9 @@ fn header<'a>(app: &App, st: &Store) -> Line<'a> {
     if failing > 0 {
         left.push(Span::styled(format!("  {failing} failing"), th.red));
     }
+    if st.live().any(|c| c.capture.active()) {
+        left.push(Span::styled("  ● capturing", th.red));
+    }
     let right = vec![
         Span::styled(commas(st.topic_count() as u64), th.text),
         Span::styled(" topics  ", th.dim),
@@ -388,6 +422,9 @@ fn tree_line<'a>(app: &App, st: &Store, r: &Row, sel: bool, w: usize) -> Line<'a
         spans.push(status_dot(th, c));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(n.name.clone(), th.bold));
+        if c.capture.active() {
+            spans.push(Span::styled(" ●", th.red));
+        }
         if !r.expanded {
             spans.push(Span::styled(format!(" ({})", n.topics), th.faint));
         }
@@ -411,6 +448,9 @@ fn tree_line<'a>(app: &App, st: &Store, r: &Row, sel: bool, w: usize) -> Line<'a
         gs,
     ));
     spans.extend(node_name(app, &n.name, r.mark, sel));
+    if st.conns[n.conn].capture.captures(&n.path) {
+        spans.push(Span::styled(" ●", th.red)); // written to disk
+    }
 
     if let Some(last) = n.latest() {
         if last.size <= app.opts.inline_bytes {
@@ -655,6 +695,21 @@ fn conn_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> Vec<Line<'a>> {
         }
         out.push(Line::from(spans));
     }
+    if !c.capture.rules.is_empty() {
+        out.push(Line::default());
+        out.push(Line::styled("Capture to disk", th.section));
+        for j in 0..c.capture.rules.len() {
+            out.push(capture_row(th, &c.capture, j, vec![Span::raw("  ")]));
+        }
+        match (c.capture.err(), c.capture.file()) {
+            (Some(e), _) => out.push(Line::styled(format!("  stopped: {e}"), th.red)),
+            (None, Some(f)) => out.push(Line::styled(format!("  {}", f.display()), th.dim)),
+            (None, None) => out.push(Line::styled(
+                format!("  to {} (from the first message)", st.capture_dir.display()),
+                th.dim,
+            )),
+        }
+    }
     out.push(Line::default());
     out.extend(branch_detail(app, st, n, w));
     out
@@ -790,7 +845,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
             &app.th,
             &[
                 ("↑↓", "move"),
-                (&format!("space {}", glyph::ENTER), "connect / subscribe on-off"),
+                (&format!("space {}", glyph::ENTER), "connect / on-off"),
                 ("tab", "next pane"),
                 ("type", "filter"),
                 ("^c", "quit"),
@@ -802,6 +857,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
             &[
                 ("↑↓", "messages"),
                 (glyph::ENTER, "open"),
+                ("^r", "capture"),
                 ("← esc", "back to tree"),
                 ("tab", "next pane"),
                 ("^t ^y", "copy"),
@@ -815,6 +871,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
                 ("↑↓", "move"),
                 ("←→", "collapse/expand"),
                 (glyph::ENTER, "open"),
+                ("^r", "capture"),
                 ("esc", "clear filter"),
                 ("tab", "next pane"),
                 ("^t ^y", "copy"),
@@ -866,7 +923,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use crate::app::{App, Ask, ConnCtl, Focus, Options};
+    use crate::app::{App, Ask, ConnCtl, Focus, Options, PanelRow};
     use crate::config::{self, ConnCfg};
     use crate::glyph;
     use crate::mqtt::Cmd;
@@ -1567,6 +1624,156 @@ mod tests {
         app.key(ctrl('t'));
         app.key(ctrl('y'));
         assert_eq!(copied(&app).len(), before);
+    }
+
+    #[test]
+    fn capture_from_the_tree_and_the_panel() {
+        let cfg = tmp_config("capture");
+        let (mut app, rx) = sample(cfg.clone());
+        let dir = std::env::temp_dir().join(format!("fss-mqtt-test-{}-capture-dir", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        app.store.lock().unwrap().capture_dir = dir.clone();
+        let ctrl_r = |app: &mut App| app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        let selected_path = |app: &App| {
+            let st = app.store.lock().unwrap();
+            st.nodes[app.selected.unwrap()].path.clone()
+        };
+
+        // ctrl+r on v1/plant captures its subtree: saved, listed, marked.
+        typ(&mut app, "v1/plant");
+        assert_eq!(selected_path(&app), "v1/plant");
+        ctrl_r(&mut app);
+        assert_eq!(config::load(&cfg).unwrap()[0].capture, vec!["v1/plant/#"]);
+        assert!(app.panel.contains(&PanelRow::Capture(0, 0)));
+        let v = frame(&app, "capture on");
+        assert!(v.contains("capture v1/plant/# · no messages yet"), "{v}");
+        assert!(v.contains("● capturing"), "header");
+        assert!(v.lines().any(|l| l.contains("plant ●")), "tree mark");
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|(t, _, _)| t.contains(&dir.display().to_string()))
+        );
+        // Below it, no narrower rule.
+        press(&mut app, &[KeyCode::Down]);
+        assert_eq!(selected_path(&app), "v1/plant/line1");
+        ctrl_r(&mut app);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|(t, _, _)| t == "v1/plant/line1/# is already captured by v1/plant/#")
+        );
+        assert_eq!(config::load(&cfg).unwrap()[0].capture, vec!["v1/plant/#"]);
+        // Nothing on disk until a message arrives, and the connection is untouched.
+        assert!(!dir.exists());
+        assert!(rx[0].try_recv().is_err());
+
+        // space on the rule in the panel turns it off (saved), and on again.
+        app.focus = Focus::Conns;
+        app.panel_cursor = app.panel.iter().position(|r| *r == PanelRow::Capture(0, 0)).unwrap();
+        press(&mut app, &[KeyCode::Char(' ')]);
+        assert_eq!(config::load(&cfg).unwrap()[0].capture_paused, vec!["v1/plant/#"]);
+        let v = frame(&app, "capture off");
+        assert!(
+            v.contains("capture v1/plant/# · off") && !v.contains("● capturing"),
+            "{v}"
+        );
+        press(&mut app, &[KeyCode::Char(' ')]);
+        assert!(config::load(&cfg).unwrap()[0].capture_paused.is_empty());
+        assert!(app.store.lock().unwrap().conns[0].capture.active());
+
+        // ctrl+r on v1/plant again stops it altogether.
+        app.focus = Focus::Tree;
+        press(&mut app, &[KeyCode::Up]);
+        assert_eq!(selected_path(&app), "v1/plant");
+        ctrl_r(&mut app);
+        let saved = config::load(&cfg).unwrap();
+        assert!(saved[0].capture.is_empty() && saved[0].capture_paused.is_empty());
+        assert!(!app.panel.iter().any(|r| matches!(r, PanelRow::Capture(..))));
+        assert!(!frame(&app, "capture removed").contains("● capturing"));
+
+        // The connections file can add and remove rules too, live and
+        // without touching the connection.
+        let (local, staging) = (app.ctls[0].cfg.clone(), app.ctls[1].cfg.clone());
+        let only_v2 = ConnCfg {
+            capture: vec!["v2/#".into()],
+            ..local.clone()
+        };
+        app.apply_config(vec![only_v2, staging.clone()]);
+        assert!(app.store.lock().unwrap().conns[0].capture.captures("v2/fleet"));
+        assert!(rx[0].try_recv().is_err(), "capture changes don't reconnect");
+
+        // A write that fails (the capture dir can't be made) stops capture
+        // and says so, in the panel and the status line.
+        let wait = std::time::Duration::from_secs(5);
+        let blocker = dir.with_extension("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        app.store.lock().unwrap().capture_dir = blocker.join("captures");
+        let target = app
+            .store
+            .lock()
+            .unwrap()
+            .capture_target(0, "v2/fleet")
+            .expect("captured");
+        target.record("v2/fleet", b"1", 0, false, &Props::default());
+        let writer = app.store.lock().unwrap().conns[0].capture.writer().unwrap();
+        assert!(writer.flush_wait(wait));
+        app.tick();
+        let v = frame(&app, "capture failed");
+        assert!(v.contains("capture v2/#  failed: "), "{v}");
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|(t, err, _)| *err && t.starts_with("capture stopped for local: "))
+        );
+
+        let with = ConnCfg {
+            capture: vec!["v2/#".into(), "#".into()],
+            capture_paused: vec!["#".into()],
+            ..local.clone()
+        };
+        app.apply_config(vec![with, staging.clone()]);
+        {
+            let st = app.store.lock().unwrap();
+            assert!(st.conns[0].capture.err().is_none(), "an edited rule tries again");
+            let rules: Vec<_> = st.conns[0]
+                .capture
+                .rules
+                .iter()
+                .map(|r| (r.filter.as_str(), r.enabled))
+                .collect();
+            assert_eq!(rules, [("v2/#", true), ("#", false)]);
+        }
+        assert!(rx[0].try_recv().is_err(), "capture changes don't reconnect");
+
+        // Quitting waits for what's queued to be written, but not forever.
+        app.store.lock().unwrap().capture_dir = dir.clone();
+        let target = app
+            .store
+            .lock()
+            .unwrap()
+            .capture_target(0, "v2/fleet")
+            .expect("captured");
+        let go_on = app.store.lock().unwrap().conns[0].capture.writer().unwrap().stall();
+        target.record("v2/fleet", b"2", 0, false, &Props::default());
+        let start = std::time::Instant::now();
+        let late = app.flush_captures(std::time::Duration::from_millis(100));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1), "bounded");
+        assert!(
+            late.len() == 1 && late[0].starts_with("local: ") && late[0].ends_with("the disk is too slow"),
+            "{late:?}"
+        );
+        drop(go_on);
+        assert!(app.flush_captures(wait).is_empty());
+        let file = app.store.lock().unwrap().conns[0].capture.file().expect("a new file");
+        assert!(std::fs::read_to_string(file).unwrap().ends_with("\"payload\":\"2\"}\n"));
+
+        app.apply_config(vec![local, staging]);
+        assert!(app.store.lock().unwrap().conns[0].capture.rules.is_empty());
+        assert!(rx[0].try_recv().is_err());
+        let _ = std::fs::remove_file(&cfg);
+        let _ = std::fs::remove_file(&blocker);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

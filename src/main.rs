@@ -5,6 +5,7 @@ mod arrow;
 mod avro;
 mod base64;
 mod broker;
+mod capture;
 mod changeset;
 mod clipboard;
 mod compressed;
@@ -56,6 +57,8 @@ Connection flags:
       --no-save              don't add the broker to the connections file
       --config path          connections file (default: see below)
       --cafile string        PEM file of CA certificates to trust (implies TLS)
+      --capture string       topic filter to capture to disk (repeatable); also ctrl+r on a topic
+      --capture-dir path     where capture files go (default: the current directory)
       --cert string          client certificate PEM for mutual TLS
   -i, --client-id string     client id (default fss-mqtt-<random>)
       --history int          messages kept per topic (default 10)
@@ -69,8 +72,11 @@ Connection flags:
   -u, --username string      username
   -v, --version              print version and exit
 
+Nothing is written to disk unless you ask: --capture or ctrl+r appends the
+messages on those topics, whole, to fss-mqtt-<connection>-<time>.jsonl.
+
 Environment: FSS_MQTT_BROKER, FSS_MQTT_USERNAME, FSS_MQTT_PASSWORD, FSS_MQTT_CAFILE,
-FSS_MQTT_KEY_PASSWORD (the --key passphrase)";
+FSS_MQTT_KEY_PASSWORD (the --key passphrase), FSS_MQTT_CAPTURE_DIR";
 
 struct Args {
     broker: Option<String>,
@@ -92,6 +98,8 @@ struct Args {
     ca_file: Option<String>,
     cert: Option<String>,
     key: Option<String>,
+    capture: Vec<String>,
+    capture_dir: Option<String>,
 }
 
 fn main() {
@@ -123,6 +131,8 @@ fn parse_args() -> Result<Option<Args>, String> {
         ca_file: env("FSS_MQTT_CAFILE"),
         cert: None,
         key: None,
+        capture: vec![],
+        capture_dir: env("FSS_MQTT_CAPTURE_DIR"),
     };
     let num = |name: &str, v: String| v.parse::<usize>().map_err(|_| format!("{name}: invalid number {v:?}"));
 
@@ -174,6 +184,14 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--cafile" => a.ca_file = Some(val()?),
             "--cert" => a.cert = Some(val()?),
             "--key" => a.key = Some(val()?),
+            "--capture" => {
+                let f = val()?;
+                if !capture::valid_filter(&f) {
+                    return Err(format!("--capture: {f:?} is not a topic filter"));
+                }
+                a.capture.push(f);
+            }
+            "--capture-dir" => a.capture_dir = Some(val()?),
             s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown flag {s}\n\n{USAGE}")),
             _ => a.broker = Some(arg),
         }
@@ -240,6 +258,10 @@ fn cli_connection(a: &Args, b: &broker::Broker, saved: Option<&config::ConnCfg>)
     if !a.topics.is_empty() {
         c.paused.retain(|t| a.topics.contains(t));
         c.topics = a.topics.clone();
+    }
+    if !a.capture.is_empty() {
+        c.capture = a.capture.clone();
+        c.capture_paused.clear();
     }
     if c.topics.is_empty() {
         c.topics = vec!["#".into()];
@@ -314,6 +336,12 @@ fn run() -> Result<(), String> {
             .zip(&entries)
             .for_each(|(s, e)| *s |= a.connections.contains(&e.name));
         cli_idx = Some(i);
+    } else if !a.capture.is_empty() && !entries.is_empty() {
+        return Err(
+            "--capture goes with a broker on the command line; for a saved connection, \
+             add capture = [...] to its entry or press ctrl+r on a topic"
+                .into(),
+        );
     } else if !a.connections.is_empty() {
         for n in &a.connections {
             if !entries.iter().any(|e| &e.name == n) {
@@ -336,6 +364,7 @@ fn run() -> Result<(), String> {
             } else {
                 a.topics.clone()
             },
+            capture: a.capture.clone(),
             autoconnect: true,
             ..Default::default()
         });
@@ -345,7 +374,10 @@ fn run() -> Result<(), String> {
         start = entries.iter().map(|e| e.autoconnect).collect();
     }
 
-    let store = Arc::new(Mutex::new(store::Store::new(a.history, a.max_payload)));
+    let mut st = store::Store::new(a.history, a.max_payload);
+    let dir = a.capture_dir.as_deref().map_or_else(|| ".".into(), config::expand);
+    st.capture_dir = std::path::absolute(&dir).unwrap_or_else(|_| dir.into());
+    let store = Arc::new(Mutex::new(st));
     let mut ctls = Vec::new();
     let mut ask = Vec::new();
     for (i, e) in entries.iter().enumerate() {
@@ -362,10 +394,12 @@ fn run() -> Result<(), String> {
         let cfg = broker::mqtt_config(i, e, password.clone(), key_password.clone())
             .map_err(|err| format!("connection {:?}: {err}", e.name))?;
         let display = broker::display_url(e)?;
-        let idx = store
-            .lock()
-            .unwrap()
-            .add_conn(&e.name, &display, e.username.clone(), app::subs_of(e));
+        let idx = {
+            let mut st = store.lock().unwrap();
+            let idx = st.add_conn(&e.name, &display, e.username.clone(), app::subs_of(e));
+            st.conns[idx].capture.set_rules(&e.capture, &e.capture_paused);
+            idx
+        };
         debug_assert_eq!(idx, i);
         let ctl = app::ConnCtl {
             cfg: e.clone(),
@@ -393,6 +427,10 @@ fn run() -> Result<(), String> {
     let res = event_loop(&mut terminal, &mut app);
     let _ = execute!(stdout(), DisableBracketedPaste);
     ratatui::restore();
+    // What was captured reaches the disk before we exit, within a bound.
+    for late in app.flush_captures(capture::QUIT_WAIT) {
+        eprintln!("fss-mqtt: capture: {late}");
+    }
     res.map_err(|e| e.to_string())
 }
 

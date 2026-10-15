@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::broker;
+use crate::composer::{Action, Composer};
 use crate::config::{self, ConnCfg};
 use crate::mqtt::{self, Cmd};
 use crate::store::{ConnState, Filter, FilterMode, INSIDE, MATCHED, Message, ROOT, Row, Store, Sub};
@@ -159,6 +160,8 @@ pub struct App {
     pub msg_sel: Option<u64>, // seq of the selected message in the list
 
     pub viewer: Option<Viewer>,
+    /// Editing a message to publish (over everything else).
+    pub composer: Option<Composer>,
 
     pub rate: f64,
     pub(crate) rate_total: u64,
@@ -209,6 +212,7 @@ impl App {
             focus: Focus::Tree,
             msg_sel: None,
             viewer: None,
+            composer: None,
             rate: 0.0,
             rate_total: 0,
             rate_at: Instant::now(),
@@ -259,6 +263,9 @@ impl App {
         self.height = h;
         if let Some(v) = &mut self.viewer {
             v.relayout(w.saturating_sub(4) as usize, &self.th);
+        }
+        if let Some(c) = &mut self.composer {
+            c.fit(w, h);
         }
         self.clamp_cursor();
     }
@@ -415,6 +422,9 @@ impl App {
     pub fn paste(&mut self, s: &str) {
         if let Some(p) = &mut self.prompt {
             p.input.push_str(s.trim_end_matches(['\r', '\n']));
+        } else if let Some(c) = &mut self.composer {
+            c.paste(s);
+            c.fit(self.width, self.height);
         } else if self.viewer.is_none() {
             let t = format!("{}{}", self.filter_text, s.trim());
             self.set_filter(t);
@@ -451,6 +461,16 @@ impl App {
         }
         if self.prompt.is_some() {
             self.prompt_key(k);
+            return;
+        }
+        if self.composer.is_some() {
+            self.composer_key(k);
+            return;
+        }
+        // ctrl+e publishes; so does e full screen, where letters don't filter.
+        let alt = k.modifiers.contains(KeyModifiers::ALT);
+        if k.code == KeyCode::Char('e') && (ctrl || (self.viewer.is_some() && !alt)) {
+            self.open_composer();
             return;
         }
         if self.viewer.is_some() {
@@ -913,7 +933,6 @@ impl App {
 
     /// The topic node in focus: the one shown full screen, else the
     /// selected tree node (which may be a connection).
-    #[allow(dead_code)] // until an action uses it
     pub fn focused_node(&self) -> Option<usize> {
         match &self.viewer {
             Some(v) => Some(v.node),
@@ -923,7 +942,6 @@ impl App {
 
     /// The message in focus, with its topic node: the one shown full screen,
     /// the one picked in the message list, or the selected topic's latest.
-    #[allow(dead_code)] // until an action uses it
     pub fn focused_message(&self) -> Option<(usize, Arc<Message>)> {
         if let Some(v) = &self.viewer {
             return v.msgs.get(v.idx).map(|m| (v.node, m.clone()));
@@ -937,6 +955,75 @@ impl App {
             st.nodes[n].latest().cloned()
         };
         m.map(|m| (n, m))
+    }
+
+    // ── Publishing ─────────────────────────────────────────────────────────
+
+    /// Ctrl+E (e full screen): a copy of the message in focus to edit and
+    /// send, or an empty message for the topic in focus.
+    pub fn open_composer(&mut self) {
+        let msg = self.focused_message();
+        let node = msg.as_ref().map(|(n, _)| *n).or(self.focused_node());
+        let mut c = {
+            let st = self.store.lock().unwrap();
+            let conn_of = |n: usize| st.conns[st.nodes[n].conn].name.clone();
+            match (&msg, node) {
+                (Some((n, m)), _) => Composer::republish(&conn_of(*n), &st.nodes[*n].path, m),
+                (None, Some(n)) => Composer::new_message(&conn_of(n), &st.nodes[n].path),
+                (None, None) => {
+                    let up = st.live().find(|c| c.status.state == ConnState::Connected);
+                    let conn = up.or(st.live().next()).map_or(String::new(), |c| c.name.clone());
+                    Composer::new_message(&conn, "")
+                }
+            }
+        };
+        c.fit(self.width, self.height);
+        self.composer = Some(c);
+    }
+
+    fn composer_key(&mut self, k: KeyEvent) {
+        let (w, h) = (self.width, self.height);
+        let Some(c) = &mut self.composer else { return };
+        let page = c.view(w, h).rows.saturating_sub(1);
+        match c.key(k, page) {
+            Action::Send => self.publish_draft(),
+            Action::Close => self.composer = None,
+            Action::None => {}
+        }
+        if let Some(c) = &mut self.composer {
+            c.fit(w, h);
+        }
+    }
+
+    /// Ctrl+S in the composer: sends the message to its connection's thread
+    /// (which reports how it went), or shows what's wrong with it.
+    fn publish_draft(&mut self) {
+        let Some(c) = &mut self.composer else { return };
+        let Some(d) = c.draft() else { return };
+        let (target, names) = {
+            let st = self.store.lock().unwrap();
+            let live: Vec<usize> = (0..st.conns.len()).filter(|&i| !st.conns[i].removed).collect();
+            let target = live.iter().copied().find(|&i| st.conns[i].name == d.conn);
+            let names: Vec<String> = live.iter().map(|&i| st.conns[i].name.clone()).collect();
+            (target.map(|i| (i, st.conns[i].status.state)), names)
+        };
+        let i = match target {
+            Some((i, ConnState::Connected)) => i,
+            Some(_) => {
+                return c.fail_at(
+                    "connection",
+                    format!("{} isn't connected; connect it in the panel first", d.conn),
+                );
+            }
+            None => {
+                let have = names.join(", ");
+                return c.fail_at("connection", format!("no connection named {:?} (have: {have})", d.conn));
+            }
+        };
+        let what = format!("{} · {}", d.conn, d.out.topic);
+        let _ = self.ctls[i].tx.send(Cmd::Publish(Box::new(d.out)));
+        self.composer = None;
+        self.notify(format!("publishing to {what}…"), false);
     }
 
     fn viewer_key(&mut self, k: KeyEvent) {

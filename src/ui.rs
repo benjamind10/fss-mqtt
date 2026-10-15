@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Ask, Focus, PanelRow, msg_index, node_title};
+use crate::composer::{self, Editor};
 use crate::fmt::{self, ago, commas, human_bytes, human_count, msg_count, plural};
 use crate::glyph;
 use crate::pretty;
@@ -54,6 +55,13 @@ fn draw_all(f: &mut Frame, app: &App) {
     let st = app.store.lock().unwrap();
     let buf = f.buffer_mut();
 
+    if app.composer.is_some() {
+        composer_view(buf, area, app);
+        if app.prompt.is_some() {
+            prompt_box(buf, area, app, &st);
+        }
+        return;
+    }
     if app.viewer.is_some() {
         viewer(buf, area, app);
         return;
@@ -793,6 +801,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
             &[
                 ("↑↓", "messages"),
                 (glyph::ENTER, "open"),
+                ("^e", "publish"),
                 ("← esc", "back to tree"),
                 ("tab", "next pane"),
                 ("^c", "quit"),
@@ -805,6 +814,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
                 ("↑↓", "move"),
                 ("←→", "collapse/expand"),
                 (glyph::ENTER, "open"),
+                ("^e", "publish"),
                 ("esc", "clear filter"),
                 ("tab", "next pane"),
                 ("^c", "quit"),
@@ -834,7 +844,7 @@ fn viewer(buf: &mut Buffer, area: Rect, app: &App) {
     if v.max_width > v.width_now() {
         keys.push(("shift ←→", "pan"));
     }
-    keys.extend([("tab", mode.as_str()), ("esc", "back")]);
+    keys.extend([("tab", mode.as_str()), ("e", "publish"), ("esc", "back")]);
     let mut h = hint(th, &keys);
     if v.lines.len() > body_h {
         h.spans.push(Span::styled(
@@ -843,6 +853,92 @@ fn viewer(buf: &mut Buffer, area: Rect, app: &App) {
         ));
     }
     put(buf, 0, area.height - 1, with_version(app, h), area.width);
+}
+
+/// The publish composer: the message as a document over the whole screen.
+fn composer_view(buf: &mut Buffer, area: Rect, app: &App) {
+    let c = app.composer.as_ref().unwrap();
+    let th = &app.th;
+    let v = c.view(area.width, area.height);
+    let status = c.status(area.width);
+    let mut lines: Vec<Line> = status
+        .iter()
+        .map(|(t, err)| Line::styled(t.clone(), if *err { th.red } else { th.yellow }))
+        .collect();
+    let ed = &c.ed;
+    // Lines before the blank one are headers.
+    let headers = c.payload_row().map_or(ed.lines.len(), |r| r - 1);
+    for row in ed.top..(ed.top + v.rows).min(ed.lines.len()) {
+        let mut spans = vec![Span::styled(format!("{:>w$} ", row + 1, w = v.gutter - 1), th.faint)];
+        let (text, more) = editor_row(ed, row, v.cols, row < headers, th);
+        let used: usize = text.iter().map(|s| s.width()).sum();
+        spans.extend(text);
+        if more {
+            spans.push(Span::raw(" ".repeat(v.cols.saturating_sub(used))));
+            spans.push(Span::styled("›", th.faint));
+        }
+        lines.push(Line::from(spans));
+    }
+    let r = Rect::new(0, 0, area.width, area.height - 1);
+    draw_box(buf, r, &c.title, lines, true, None, th);
+
+    // The cursor, a block like the filter's.
+    let x = ed.cells_to(ed.row, ed.col).checked_sub(ed.left);
+    let y = ed.row.checked_sub(ed.top).filter(|&y| y < v.rows);
+    if let (Some(x), Some(y)) = (x.filter(|&x| x < v.cols), y) {
+        let (cx, cy) = (r.x as usize + 2 + v.gutter + x, r.y as usize + 1 + status.len() + y);
+        if cx < area.width as usize && cy < area.height as usize {
+            buf[(cx as u16, cy as u16)].set_style(th.cursor);
+        }
+    }
+
+    border_label(buf, r, &format!("ln {}, col {}", ed.row + 1, ed.col + 1), th.faint);
+    let h = hint(th, &[("^s", "send"), ("esc", "cancel"), ("^f", "JSON pretty/compact")]);
+    put(buf, 0, area.height - 1, with_version(app, h), area.width);
+}
+
+/// What shows of line `row` of the editor: `cols` cells from its sideways
+/// scroll position, a header's key in purple, tabs as a visible mark. Also
+/// whether the line goes on past the right edge.
+fn editor_row<'a>(ed: &Editor, row: usize, cols: usize, header: bool, th: &Theme) -> (Vec<Span<'a>>, bool) {
+    let line = &ed.lines[row];
+    let colon = if header {
+        line.iter().position(|&c| c == ':')
+    } else {
+        None
+    };
+    let (mut key, mut text) = (String::new(), String::new());
+    let (mut x, mut used) = (0, 0);
+    let mut more = false;
+    for (i, &c) in line.iter().enumerate() {
+        let w = composer::cell_width(c);
+        let part = if colon.is_some_and(|k| i <= k) {
+            &mut key
+        } else {
+            &mut text
+        };
+        if x < ed.left {
+            // A wide character cut by the left edge: its visible half.
+            let shown = (x + w).saturating_sub(ed.left);
+            part.extend(std::iter::repeat_n(' ', shown));
+            used += shown;
+            x += w;
+            continue;
+        }
+        if used + w > cols {
+            more = true;
+            break;
+        }
+        part.push(if c == '\t' { composer::TAB } else { c });
+        used += w;
+        x += w;
+    }
+    let mut spans = Vec::new();
+    if !key.is_empty() {
+        spans.push(Span::styled(key, th.purple));
+    }
+    spans.push(Span::styled(text, th.text));
+    (spans, more)
 }
 
 #[cfg(test)]
@@ -1397,6 +1493,132 @@ mod tests {
         app.store.lock().unwrap().notify("published", false);
         app.tick();
         assert!(matches!(&app.notice, Some((t, true, _)) if t == "capture failed"));
+    }
+
+    fn ctrl(app: &mut App, c: char) {
+        app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn compose_and_publish() {
+        let cfg = tmp_config("publish");
+        let (mut app, rx) = sample(cfg.clone());
+        typ(&mut app, "v1/plant/line1/temp");
+        press(&mut app, &[KeyCode::Down]);
+        assert!(frame(&app, "tree hints").contains("^e publish"));
+
+        // ctrl+e: a copy of the latest message, every property included.
+        ctrl(&mut app, 'e');
+        let v = frame(&app, "composer");
+        for want in [
+            "Publish · copy of the message from",
+            "1 topic: v1/plant/line1/temp",
+            "connection: local",
+            "qos: 1",
+            "retain: no",
+            "content-type: application/json",
+            "user: site = oslo",
+            "user: unit = C",
+            r#"{"t":22.5,"ok":true,"tags":["a","b"],"note":null}"#,
+            "^s send",
+        ] {
+            assert!(v.contains(want), "{want:?} missing:\n{v}");
+        }
+        // ctrl+f indents the JSON; ctrl+s sends it on local's channel.
+        ctrl(&mut app, 'f');
+        let v = frame(&app, "composer, JSON indented");
+        assert!(v.contains(r#"  "t": 22.5,"#), "{v}");
+        ctrl(&mut app, 's');
+        assert!(app.composer.is_none());
+        let Ok(Cmd::Publish(o)) = rx[0].try_recv() else {
+            panic!("no publish")
+        };
+        assert_eq!((o.topic.as_str(), o.qos, o.retain), ("v1/plant/line1/temp", 1, false));
+        assert_eq!(o.props.content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            o.props.user,
+            vec![("site".into(), "oslo".into()), ("unit".into(), "C".into())]
+        );
+        let text = String::from_utf8(o.payload).unwrap();
+        assert!(text.starts_with("{\n  \"t\": 22.5,\n  \"ok\": true,"), "{text}");
+        assert!(frame(&app, "sent").contains("publishing to local · v1/plant/line1/temp…"));
+
+        // Full screen, e edits the message shown; esc on an untouched copy
+        // goes back to it. An edited one needs esc twice, and sends nothing.
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(frame(&app, "viewer").contains("e publish"));
+        press(&mut app, &[KeyCode::Char('e')]);
+        assert!(app.composer.is_some());
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.composer.is_none() && app.viewer.is_some());
+        press(&mut app, &[KeyCode::Char('e')]);
+        typ(&mut app, "draft");
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(frame(&app, "discard?").contains("esc again discards your changes"));
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.composer.is_none() && app.viewer.is_some());
+        assert!(rx[0].try_recv().is_err());
+        press(&mut app, &[KeyCode::Esc]);
+
+        // staging isn't connected: the composer stays open and says so.
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        typ(&mut app, "devices/d9/up/temp");
+        press(&mut app, &[KeyCode::Down]);
+        ctrl(&mut app, 'e');
+        ctrl(&mut app, 's');
+        let v = frame(&app, "not connected");
+        assert!(
+            v.contains("line 2: staging isn't connected; connect it in the panel first"),
+            "{v}"
+        );
+        assert!(rx[1].try_recv().is_err());
+        press(&mut app, &[KeyCode::Esc]);
+
+        // On a topic without messages: a new, empty message for it.
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        typ(&mut app, "v1/plant");
+        ctrl(&mut app, 'e');
+        let v = frame(&app, "new message");
+        assert!(
+            v.contains("Publish · new message") && v.contains("topic: v1/plant"),
+            "{v}"
+        );
+        let _ = std::fs::remove_file(&cfg);
+    }
+
+    #[test]
+    fn composer_refuses_cut_off_payloads() {
+        let (mut app, rx) = sample(tmp_config("compose-cut"));
+        typ(&mut app, "v1/camera/frame");
+        press(&mut app, &[KeyCode::Down]);
+        ctrl(&mut app, 'e');
+        let v = frame(&app, "cut off");
+        assert!(
+            v.contains("only the first 64.0 KB of this 195.3 KB payload were kept"),
+            "{v}"
+        );
+        assert!(v.contains("encoding: base64"), "{v}");
+        ctrl(&mut app, 's');
+        let v = frame(&app, "cut off, refused");
+        assert!(v.contains("restart with --max-payload 256KiB"), "{v}");
+        assert!(app.composer.is_some() && rx[0].try_recv().is_err());
+    }
+
+    #[test]
+    fn composer_scrolls_long_lines() {
+        let (mut app, _rx) = sample(tmp_config("compose-scroll"));
+        app.resize(40, 20);
+        typ(&mut app, "v1/plant/line1/temp");
+        press(&mut app, &[KeyCode::Down]);
+        ctrl(&mut app, 'e');
+        // The payload line is longer than the box: it's marked, and End
+        // scrolls to show its end with the cursor in view.
+        let v = frame(&app, "long line");
+        assert!(v.lines().any(|l| l.contains(r#"{"t":22.5"#) && l.contains('›')), "{v}");
+        press(&mut app, &[KeyCode::End]);
+        let v = frame(&app, "long line, end");
+        assert!(v.contains(r#""note":null}"#), "{v}");
+        assert!(v.contains("ln 9, col 50"), "{v}");
     }
 
     #[test]

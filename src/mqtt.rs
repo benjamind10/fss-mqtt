@@ -1,6 +1,6 @@
-//! A minimal MQTT v5 subscriber: connect (TCP or TLS), subscribe, receive,
-//! keep alive, reconnect. One blocking thread per connection, steered by
-//! [`Cmd`]s from the UI.
+//! A minimal MQTT v5 client: connect (TCP or TLS), subscribe, receive,
+//! publish, keep alive, reconnect. One blocking thread per connection,
+//! steered by [`Cmd`]s from the UI.
 
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -58,11 +58,41 @@ pub enum Cmd {
         cfg: Box<Config>,
         connect: bool,
     },
+    /// Sends a message; the outcome is reported with `Store::notify`.
+    Publish(Box<Outgoing>),
+}
+
+/// A message to publish.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Outgoing {
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub qos: u8,
+    pub retain: bool,
+    pub props: Props, // subscription_id is never sent
+}
+
+/// Why `topic` can't be published to, if it can't: topic names (unlike
+/// filters) have no wildcards.
+pub fn topic_problem(topic: &str) -> Option<&'static str> {
+    if topic.is_empty() {
+        Some("the topic is empty")
+    } else if topic.contains(['+', '#']) {
+        Some("a topic to publish to can't contain + or #")
+    } else if topic.contains('\0') {
+        Some("the topic contains a NUL character")
+    } else if topic.len() > u16::MAX as usize {
+        Some("the topic is longer than 65535 bytes")
+    } else {
+        None
+    }
 }
 
 const KEEP_ALIVE: u16 = 30;
 const RETRY: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a QoS 1 or 2 publish may wait for the broker's acknowledgement.
+const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Why TLS couldn't be set up. Key problems are told apart because retrying
 /// won't help them: the connection stops (and the UI asks for the passphrase
@@ -247,6 +277,7 @@ pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<C
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut inbox = Inbox::default();
+        let mut outbox = Outbox::default();
         let mut want = start;
         let mut halted = None;
         loop {
@@ -262,12 +293,18 @@ pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<C
                         want = connect;
                         continue;
                     }
+                    Ok(Cmd::Publish(out)) => {
+                        not_connected(&store, cfg.conn, &out);
+                        continue;
+                    }
                     Ok(_) => continue, // subscription changes apply on the next connect
                     Err(_) => return,
                 }
             }
             set_status(&store, cfg.conn, ConnState::Connecting, None);
-            match session(&cfg, &store, &rx, &mut inbox) {
+            let end = session(&cfg, &store, &rx, &mut inbox, &mut outbox);
+            outbox.abandon(&store);
+            match end {
                 End::Stopped => want = false,
                 End::Halted(err) => {
                     halted = Some(err);
@@ -297,6 +334,7 @@ pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<C
                                 want = connect;
                                 break;
                             }
+                            Ok(Cmd::Publish(out)) => not_connected(&store, cfg.conn, &out),
                             Ok(_) => {}
                             Err(RecvTimeoutError::Timeout) => break,
                             Err(RecvTimeoutError::Disconnected) => return,
@@ -311,6 +349,20 @@ pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<C
 
 fn set_status(store: &Mutex<Store>, conn: usize, state: ConnState, err: Option<String>) {
     store.lock().unwrap().conns[conn].status = Status { state, err };
+}
+
+/// "oslo · site/x": where a publish went, for notices.
+fn target(store: &Mutex<Store>, conn: usize, topic: &str) -> String {
+    format!("{} · {topic}", store.lock().unwrap().conns[conn].name)
+}
+
+fn not_connected(store: &Mutex<Store>, conn: usize, out: &Outgoing) {
+    let mut st = store.lock().unwrap();
+    let msg = format!(
+        "not published to {}: {} isn't connected",
+        out.topic, st.conns[conn].name
+    );
+    st.notify(msg, true);
 }
 
 fn set_sub_err(store: &Mutex<Store>, conn: usize, topic: &str, err: Option<String>) {
@@ -361,8 +413,100 @@ impl Inbox {
     }
 }
 
+/// What the broker accepts, from its CONNACK.
+struct Limits {
+    max_packet: Option<u32>,
+    max_qos: u8,
+    retain: bool,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            max_packet: None,
+            max_qos: 2,
+            retain: true,
+        }
+    }
+}
+
+/// Publishes waiting for the broker's acknowledgement (QoS 1 and 2).
+#[derive(Default)]
+struct Outbox {
+    waiting: Vec<Waiting>,
+}
+
+struct Waiting {
+    pid: u16,
+    what: String, // "oslo · site/x", for the notice
+    qos: u8,
+    released: bool,       // QoS 2: PUBREC came and PUBREL went; PUBCOMP is next
+    no_subscribers: bool, // the broker said nobody subscribes to it
+    since: Instant,
+}
+
+impl Outbox {
+    /// Handles a PUBACK (4), PUBREC (5) or PUBCOMP (7); a PUBREC returns the
+    /// PUBREL to send.
+    fn ack(&mut self, store: &Mutex<Store>, kind: u8, body: &[u8]) -> Option<[u8; 4]> {
+        let pid = u16::from_be_bytes([body[0], body[1]]);
+        let code = body.get(2).copied().unwrap_or(0);
+        let i = self.waiting.iter().position(|w| {
+            w.pid == pid
+                && match kind {
+                    4 => w.qos == 1,
+                    5 => w.qos == 2 && !w.released,
+                    _ => w.qos == 2 && w.released,
+                }
+        })?;
+        let w = &mut self.waiting[i];
+        w.no_subscribers |= code == 0x10;
+        if kind == 5 && code < 0x80 {
+            w.released = true;
+            w.since = Instant::now();
+            return Some([0x62, 2, body[0], body[1]]);
+        }
+        let w = self.waiting.remove(i);
+        let msg = if code >= 0x80 {
+            Err(format!("broker refused {}: {}", w.what, pub_reason(code)))
+        } else if w.qos == 1 {
+            Ok(format!("published to {} (QoS 1, acknowledged)", w.what))
+        } else {
+            Ok(format!("published to {} (QoS 2, completed)", w.what))
+        };
+        let mut st = store.lock().unwrap();
+        match msg {
+            Ok(m) if w.no_subscribers => st.notify(m + "; no one subscribes to it", false),
+            Ok(m) => st.notify(m, false),
+            Err(m) => st.notify(m, true),
+        }
+        None
+    }
+
+    /// Gives up on publishes the broker hasn't acknowledged in time.
+    fn expire(&mut self, store: &Mutex<Store>) {
+        while let Some(i) = self.waiting.iter().position(|w| w.since.elapsed() > ACK_TIMEOUT) {
+            let w = self.waiting.remove(i);
+            let secs = ACK_TIMEOUT.as_secs();
+            let msg = format!("{} not confirmed: no acknowledgement within {secs} s", w.what);
+            store.lock().unwrap().notify(msg, true);
+        }
+    }
+
+    /// After a session: what wasn't acknowledged may not have arrived.
+    fn abandon(&mut self, store: &Mutex<Store>) {
+        for w in self.waiting.drain(..) {
+            let msg = format!(
+                "{} not confirmed: the connection closed before the broker acknowledged it",
+                w.what
+            );
+            store.lock().unwrap().notify(msg, true);
+        }
+    }
+}
+
 /// One connection's lifetime.
-fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut Inbox) -> End {
+fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut Inbox, outbox: &mut Outbox) -> End {
     let tls = match tls_config(cfg) {
         Ok(t) => t,
         Err(e @ TlsError::Key(..)) => return End::Halted(e.to_string()),
@@ -403,12 +547,16 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut I
     }
     let mut keep_alive = KEEP_ALIVE;
     let mut reason_str = None;
+    let mut limits = Limits::default();
     let mut b = Buf(&body[2..]);
     if let Some(props) = b.props() {
         for (id, v) in props {
             match (id, v) {
                 (0x13, Prop::Int(k)) => keep_alive = k as u16,
                 (0x1F, Prop::Str(s)) => reason_str = Some(s),
+                (0x24, Prop::Int(q)) => limits.max_qos = q.min(2) as u8,
+                (0x25, Prop::Int(r)) => limits.retain = r != 0,
+                (0x27, Prop::Int(n)) => limits.max_packet = Some(n),
                 _ => {}
             }
         }
@@ -449,6 +597,7 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut I
     let mut last_send = Instant::now();
     let mut last_recv = Instant::now();
 
+    let mut sent: Option<String> = None; // a QoS 0 publish, reported once written
     loop {
         // Commands from the UI.
         loop {
@@ -467,6 +616,33 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut I
                     return End::Reconfigured(cfg, connect);
                 }
                 Cmd::Connect { .. } => continue,
+                Cmd::Publish(o) => {
+                    let what = target(store, cfg.conn, &o.topic);
+                    let p = if o.qos > 0 { pid() } else { 0 };
+                    let pkt = match publish_packet(&o, p, &limits) {
+                        Ok(pkt) => pkt,
+                        Err(e) => {
+                            store
+                                .lock()
+                                .unwrap()
+                                .notify(format!("not published to {what}: {e}"), true);
+                            continue;
+                        }
+                    };
+                    if o.qos == 0 {
+                        sent = Some(format!("published to {what} (QoS 0)"));
+                    } else {
+                        outbox.waiting.push(Waiting {
+                            pid: p,
+                            what,
+                            qos: o.qos,
+                            released: false,
+                            no_subscribers: false,
+                            since: Instant::now(),
+                        });
+                    }
+                    pkt
+                }
                 Cmd::Subscribe(t) => {
                     let p = pid();
                     let pkt = subscribe_packet(p, &t, cfg.qos);
@@ -479,7 +655,11 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut I
                 return End::Failed(tidy_io(e));
             }
             last_send = Instant::now();
+            if let Some(m) = sent.take() {
+                store.lock().unwrap().notify(m, false); // QoS 0: written is all we learn
+            }
         }
+        outbox.expire(store);
 
         let pkt = match rd.next(&mut conn) {
             Ok(p) => p,
@@ -502,6 +682,7 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut I
                         _ => {}
                     }
                 }
+                4 | 5 | 7 if body.len() >= 2 => reply = outbox.ack(store, kind >> 4, &body),
                 6 if body.len() >= 2 => reply = Some([0x70, 2, body[0], body[1]]), // PUBREL → PUBCOMP
                 9 if body.len() >= 2 => {
                     // SUBACK
@@ -678,6 +859,79 @@ fn unsubscribe_packet(pid: u16, topic: &str) -> Vec<u8> {
     packet(0xA2, b)
 }
 
+/// The PUBLISH packet for `o` (with packet id `pid` for QoS 1 and 2), or why
+/// it can't be sent to a broker with these limits.
+fn publish_packet(o: &Outgoing, pid: u16, lim: &Limits) -> Result<Vec<u8>, String> {
+    if let Some(p) = topic_problem(&o.topic) {
+        return Err(p.into());
+    }
+    if o.qos > 2 {
+        return Err("QoS must be 0, 1 or 2".into());
+    }
+    if o.qos > lim.max_qos {
+        return Err(format!("the broker accepts QoS {} at most", lim.max_qos));
+    }
+    if o.retain && !lim.retain {
+        return Err("the broker doesn't keep retained messages".into());
+    }
+    let p = &o.props;
+    let mut lengths = [p.content_type.as_deref(), p.response_topic.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(str::len)
+        .chain(p.correlation_data.as_ref().map(Vec::len))
+        .chain(p.user.iter().flat_map(|(k, v)| [k.len(), v.len()]));
+    if lengths.any(|n| n > u16::MAX as usize) {
+        return Err("a property is longer than 65535 bytes".into());
+    }
+    let mut b = Vec::with_capacity(o.topic.len() + o.payload.len() + 64);
+    put_str(&mut b, o.topic.as_bytes());
+    if o.qos > 0 {
+        b.extend_from_slice(&pid.to_be_bytes());
+    }
+    let mut props = Vec::new();
+    if let Some(v) = p.payload_format {
+        props.extend([0x01, v]);
+    }
+    if let Some(v) = p.message_expiry {
+        props.push(0x02);
+        props.extend_from_slice(&v.to_be_bytes());
+    }
+    if let Some(v) = &p.content_type {
+        props.push(0x03);
+        put_str(&mut props, v.as_bytes());
+    }
+    if let Some(v) = &p.response_topic {
+        props.push(0x08);
+        put_str(&mut props, v.as_bytes());
+    }
+    if let Some(v) = &p.correlation_data {
+        props.push(0x09);
+        put_str(&mut props, v);
+    }
+    for (k, v) in &p.user {
+        props.push(0x26);
+        put_str(&mut props, k.as_bytes());
+        put_str(&mut props, v.as_bytes());
+    }
+    put_varint(&mut b, props.len());
+    b.extend(props);
+    b.extend_from_slice(&o.payload);
+    // The remaining length is a varint of at most four bytes.
+    if b.len() > 268_435_455 {
+        return Err("the message is larger than MQTT allows (256 MB)".into());
+    }
+    let pkt = packet(0x30 | o.qos << 1 | o.retain as u8, b);
+    match lim.max_packet {
+        Some(max) if pkt.len() > max as usize => Err(format!(
+            "it takes {} on the wire and the broker accepts at most {}",
+            crate::fmt::human_bytes(pkt.len()),
+            crate::fmt::human_bytes(max as usize)
+        )),
+        _ => Ok(pkt),
+    }
+}
+
 fn subscribe_packet(pid: u16, topic: &str, qos: u8) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&pid.to_be_bytes());
@@ -796,9 +1050,30 @@ fn connack_reason(code: u8) -> String {
         0x8C => "bad authentication method",
         0x8D => "keepalive timeout",
         0x8E => "session taken over",
+        0x90 => "topic name invalid",
+        0x93 => "receive maximum exceeded",
         0x95 => "packet too large",
         0x97 => "quota exceeded",
+        0x99 => "payload format invalid",
+        0x9A => "retain not supported",
+        0x9B => "QoS not supported",
         0x9F => "connection rate exceeded",
+        _ => return format!("reason code {code}"),
+    }
+    .into()
+}
+
+/// Why a broker refused a PUBLISH (PUBACK, PUBREC or PUBCOMP reason codes).
+fn pub_reason(code: u8) -> String {
+    match code {
+        0x80 => "unspecified error",
+        0x83 => "implementation specific error",
+        0x87 => "not authorized",
+        0x90 => "topic name invalid",
+        0x91 => "packet id in use",
+        0x92 => "packet id not found",
+        0x97 => "quota exceeded",
+        0x99 => "payload format invalid",
         _ => return format!("reason code {code}"),
     }
     .into()
@@ -843,6 +1118,182 @@ mod tests {
         assert_eq!((topic.as_str(), pid, payload), ("a/b", 7, &b"hi"[..]));
         assert_eq!(p.content_type.as_deref(), Some("t"));
         assert_eq!(p.user, vec![("k".to_string(), "v".to_string())]);
+    }
+
+    fn outgoing() -> Outgoing {
+        Outgoing {
+            topic: "site/oslo/t".into(),
+            payload: br#"{"t":1}"#.to_vec(),
+            qos: 2,
+            retain: true,
+            props: Props {
+                content_type: Some("application/json".into()),
+                response_topic: Some("site/reply".into()),
+                correlation_data: Some(vec![0, 1, 0xff]),
+                payload_format: Some(1),
+                message_expiry: Some(60),
+                subscription_id: None,
+                user: vec![("k".into(), "v".into()), ("k".into(), "w".into())],
+            },
+        }
+    }
+
+    #[test]
+    fn publish_packet_roundtrip() {
+        let o = outgoing();
+        let pkt = publish_packet(&o, 513, &Limits::default()).unwrap();
+        assert_eq!(pkt[0], 0x30 | 2 << 1 | 1);
+        let (kind, body) = Reader::default().next(&mut &pkt[..]).unwrap().unwrap();
+        let (topic, pid, props, payload) = parse_publish(&body, (kind >> 1) & 3).unwrap();
+        assert_eq!((topic.as_str(), pid, payload), ("site/oslo/t", 513, &o.payload[..]));
+        assert_eq!(props, o.props);
+        // QoS 0 has no packet id.
+        let q0 = Outgoing {
+            qos: 0,
+            retain: false,
+            props: Props::default(),
+            ..outgoing()
+        };
+        let pkt = publish_packet(&q0, 9, &Limits::default()).unwrap();
+        let (kind, body) = Reader::default().next(&mut &pkt[..]).unwrap().unwrap();
+        assert_eq!(kind, 0x30);
+        let (_, pid, props, payload) = parse_publish(&body, 0).unwrap();
+        assert_eq!((pid, payload), (0, &o.payload[..]));
+        assert_eq!(props, Props::default());
+    }
+
+    #[test]
+    fn publish_respects_limits() {
+        let o = Outgoing {
+            payload: vec![0; 100],
+            props: Props::default(),
+            ..outgoing()
+        };
+        let tight = Limits {
+            max_packet: Some(64),
+            max_qos: 1,
+            retain: false,
+        };
+        assert!(publish_packet(&o, 1, &tight).unwrap_err().contains("QoS 1 at most"));
+        let o = Outgoing { qos: 1, ..o };
+        assert!(publish_packet(&o, 1, &tight).unwrap_err().contains("retained"));
+        let o = Outgoing { retain: false, ..o };
+        let e = publish_packet(&o, 1, &tight).unwrap_err();
+        assert!(e.contains("at most 64 B"), "{e}");
+        let small = Outgoing {
+            payload: vec![0; 10],
+            ..o.clone()
+        };
+        assert!(publish_packet(&small, 1, &tight).is_ok());
+        let long = Outgoing {
+            props: Props {
+                content_type: Some("x".repeat(70_000)),
+                ..Props::default()
+            },
+            ..o
+        };
+        assert!(
+            publish_packet(&long, 1, &Limits::default())
+                .unwrap_err()
+                .contains("65535")
+        );
+        for (t, bad) in [
+            ("", true),
+            ("a/+/b", true),
+            ("a/#", true),
+            ("a\0b", true),
+            ("a/b c/ü", false),
+        ] {
+            assert_eq!(topic_problem(t).is_some(), bad, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn acks_complete_publishes() {
+        let store = Mutex::new(Store::new(10, 1024));
+        let mut ob = Outbox::default();
+        let wait = |pid: u16, qos| Waiting {
+            pid,
+            what: format!("c · t{pid}"),
+            qos,
+            released: false,
+            no_subscribers: false,
+            since: Instant::now(),
+        };
+        ob.waiting.extend([wait(1, 1), wait(2, 2), wait(3, 1), wait(4, 2)]);
+        // QoS 1: PUBACK (here: nobody subscribes).
+        assert_eq!(ob.ack(&store, 4, &[0, 1, 0x10]), None);
+        // QoS 2: PUBREC is answered with PUBREL; PUBCOMP completes it.
+        assert_eq!(ob.ack(&store, 5, &[0, 2]), Some([0x62, 2, 0, 2]));
+        assert_eq!(ob.ack(&store, 4, &[0, 2]), None, "a PUBACK doesn't finish QoS 2");
+        assert_eq!(ob.waiting.len(), 3);
+        assert_eq!(ob.ack(&store, 7, &[0, 2, 0]), None);
+        // Refusals; no PUBREL after a refused PUBREC.
+        assert_eq!(ob.ack(&store, 4, &[0, 3, 0x87]), None);
+        assert_eq!(ob.ack(&store, 5, &[0, 4, 0x97]), None);
+        assert!(ob.waiting.is_empty());
+        let notices = store.lock().unwrap().take_notices();
+        let got: Vec<(&str, bool)> = notices.iter().map(|(t, e)| (t.as_str(), *e)).collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "published to c · t1 (QoS 1, acknowledged); no one subscribes to it",
+                    false
+                ),
+                ("published to c · t2 (QoS 2, completed)", false),
+                ("broker refused c · t3: not authorized", true),
+                ("broker refused c · t4: quota exceeded", true),
+            ]
+        );
+        // Unconfirmed when the connection goes, or when the broker is silent.
+        ob.waiting.push(wait(5, 1));
+        ob.abandon(&store);
+        let mut old = wait(6, 2);
+        old.since = Instant::now() - ACK_TIMEOUT - Duration::from_secs(1);
+        ob.waiting.push(old);
+        ob.expire(&store);
+        let n = store.lock().unwrap().take_notices();
+        assert!(
+            n[0].1 && n[0].0.contains("t5 not confirmed: the connection closed"),
+            "{n:?}"
+        );
+        assert!(
+            n[1].1 && n[1].0.contains("t6 not confirmed: no acknowledgement within 10 s"),
+            "{n:?}"
+        );
+    }
+
+    #[test]
+    fn publish_while_disconnected_says_so() {
+        let mut st = Store::new(10, 1024);
+        st.add_conn("lab", "mqtt://127.0.0.1:1", None, vec![]);
+        let store = Arc::new(Mutex::new(st));
+        let cfg = Config {
+            conn: 0,
+            host: "127.0.0.1".into(),
+            port: 1,
+            tls: false,
+            ca_file: None,
+            cert_file: None,
+            key_file: None,
+            key_password: None,
+            insecure: false,
+            client_id: "idle".into(),
+            username: None,
+            password: None,
+            qos: 0,
+        };
+        let tx = spawn(cfg, store.clone(), false);
+        tx.send(Cmd::Publish(Box::new(outgoing()))).unwrap();
+        for _ in 0..200 {
+            if let Some((t, err)) = store.lock().unwrap().take_notices().pop() {
+                assert!(err && t == "not published to site/oslo/t: lab isn't connected", "{t}");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no notice");
     }
 
     #[test]
@@ -1032,6 +1483,58 @@ mod e2e {
         assert_eq!(wait_state(&st, ConnState::Connected).state, ConnState::Connected);
         publish(&["-p", "18830", "-q", "1", "-t", "e2e/reconfigured", "-m", "x"]);
         assert_eq!(wait_for(&st, before + 3), before + 3, "after reconfigure");
+
+        // Publishing: QoS 0, 1 and 2 come back through the subscription with
+        // their properties, and each is acknowledged as far as its QoS goes.
+        st.lock().unwrap().take_notices();
+        let props = |q: u8| Props {
+            content_type: Some("text/plain".into()),
+            response_topic: Some("e2e/reply".into()),
+            correlation_data: Some(vec![q, 0xff]),
+            payload_format: Some(1),
+            message_expiry: Some(600),
+            subscription_id: None,
+            user: vec![("k".into(), format!("v{q}")), ("k".into(), "again".into())],
+        };
+        for q in 0..=2u8 {
+            tx.send(Cmd::Publish(Box::new(Outgoing {
+                topic: format!("e2e/pub/qos{q}"),
+                payload: format!("payload {q}").into_bytes(),
+                qos: q,
+                retain: false,
+                props: props(q),
+            })))
+            .unwrap();
+        }
+        assert_eq!(wait_for(&st, before + 6), before + 6, "own publishes received");
+        for q in 0..=2u8 {
+            let m = latest(&st, &format!("e2e/pub/qos{q}")).expect("published message received");
+            assert_eq!(m.qos, q);
+            assert_eq!(m.payload, format!("payload {q}").as_bytes());
+            // The broker counts the expiry down on the way.
+            let mut got = m.props.clone();
+            assert!(got.message_expiry.is_some_and(|s| s <= 600 && s > 590), "{got:?}");
+            got.message_expiry = Some(600);
+            got.subscription_id = None;
+            assert_eq!(got, props(q));
+        }
+        let mut notices = Vec::new();
+        for _ in 0..50 {
+            notices.extend(st.lock().unwrap().take_notices());
+            if notices.len() >= 3 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let texts: Vec<&str> = notices.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(notices.iter().all(|(_, err)| !err), "{texts:?}");
+        for want in [
+            "t · e2e/pub/qos0 (QoS 0)",
+            "t · e2e/pub/qos1 (QoS 1, acknowledged)",
+            "t · e2e/pub/qos2 (QoS 2, completed)",
+        ] {
+            assert!(texts.iter().any(|t| t.contains(want)), "{want} missing: {texts:?}");
+        }
 
         // TLS with the test CA connects and receives; without it the cert is refused.
         let ca = std::env::var("FSS_TEST_CA").expect("set FSS_TEST_CA");

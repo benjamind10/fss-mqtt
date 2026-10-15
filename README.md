@@ -163,10 +163,10 @@ arrival (`--max-payload`) copies what was kept, and the status line says so.
 
 The copy goes to the system clipboard with `pbcopy` (macOS), the Windows clipboard, or `wl-copy`,
 `xclip` or `xsel` (Linux and BSD with a display). Over SSH, or with none of those, it goes through
-the terminal instead (an OSC 52 escape sequence, up to 1 MB), which lands on the clipboard of the
-machine you're sitting at. Most terminals support it (iTerm2, kitty, WezTerm, Alacritty, Windows
-Terminal, foot; Apple Terminal doesn't). In tmux, enable it with `set -g set-clipboard on`.
-`FSS_MQTT_CLIPBOARD=osc52`, `=native` or `=off` overrides the choice.
+the terminal instead (an OSC 52 escape sequence, up to 768 KB of text), which lands on the
+clipboard of the machine you're sitting at. Most terminals support it (iTerm2, kitty, WezTerm,
+Alacritty, Windows Terminal, foot; Apple Terminal doesn't). In tmux, enable it with
+`set -g set-clipboard on`. `FSS_MQTT_CLIPBOARD=osc52`, `=native` or `=off` overrides the choice.
 
 ## Payload formats
 

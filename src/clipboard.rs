@@ -9,12 +9,15 @@ use std::time::{Duration, Instant};
 
 use crate::fmt::human_bytes;
 
-/// The most that's sent through the terminal. Terminals cap the sequence's
-/// length, and some drop a longer one without a word.
-pub const OSC52_MAX: usize = 1 << 20;
+/// The longest escape sequence sent to the terminal. Terminals cap it, and
+/// some drop a longer one without a word.
+const OSC52_MAX: usize = 1 << 20;
+/// `ESC ] 52 ; c ;` and the closing BEL around the base64.
+const OSC52_FRAME: usize = 8;
 
-/// How long a clipboard tool may take before it's given up on.
-const TOOL_WAIT: Duration = Duration::from_secs(2);
+/// How long the clipboard tools may take, all together: the copy runs on the
+/// UI's thread, and one that hangs mustn't freeze it for long.
+const TOOL_WAIT: Duration = Duration::from_secs(1);
 
 /// Where copies go: the system clipboard, or (in tests) a list.
 pub struct Sink {
@@ -105,9 +108,10 @@ fn methods(os: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<Vec<Method>
 /// Copies `text` to the system clipboard; returns how.
 pub fn copy(text: &str) -> Result<&'static str, String> {
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let deadline = Instant::now() + TOOL_WAIT;
     let mut err = String::from("no way to reach the clipboard");
     for m in methods(std::env::consts::OS, &var)? {
-        match run(m, text) {
+        match run(m, text, deadline) {
             Ok(()) => return Ok(m.name()),
             Err(e) => err = format!("{}: {e}", m.name()),
         }
@@ -115,12 +119,12 @@ pub fn copy(text: &str) -> Result<&'static str, String> {
     Err(err)
 }
 
-fn run(m: Method, text: &str) -> Result<(), String> {
+fn run(m: Method, text: &str, deadline: Instant) -> Result<(), String> {
     match m {
-        Method::Pbcopy => pipe("pbcopy", &[], text),
-        Method::WlCopy => pipe("wl-copy", &[], text),
-        Method::Xclip => pipe("xclip", &["-selection", "clipboard"], text),
-        Method::Xsel => pipe("xsel", &["--clipboard", "--input"], text),
+        Method::Pbcopy => pipe("pbcopy", &[], text, deadline),
+        Method::WlCopy => pipe("wl-copy", &[], text, deadline),
+        Method::Xclip => pipe("xclip", &["-selection", "clipboard"], text, deadline),
+        Method::Xsel => pipe("xsel", &["--clipboard", "--input"], text, deadline),
         Method::Windows => windows(text),
         Method::Osc52 => {
             let seq = osc52(text)?;
@@ -136,20 +140,21 @@ fn run(m: Method, text: &str) -> Result<(), String> {
 
 /// `ESC ] 52 ; c ; <base64> BEL`: "set the clipboard to this".
 fn osc52(text: &str) -> Result<String, String> {
-    if text.len() > OSC52_MAX {
+    // Base64 takes 4 bytes for every 3.
+    if text.len().div_ceil(3) * 4 + OSC52_FRAME > OSC52_MAX {
         return Err(format!(
             "{} is more than the terminal takes ({} at most)",
             human_bytes(text.len()),
-            human_bytes(OSC52_MAX)
+            human_bytes((OSC52_MAX - OSC52_FRAME) / 4 * 3)
         ));
     }
     Ok(format!("\x1b]52;c;{}\x07", crate::base64::encode(text.as_bytes())))
 }
 
-/// Runs a clipboard tool with `text` on its stdin. wl-copy, xclip and xsel
-/// leave a process behind to serve the clipboard; with its output not tied to
-/// ours, it doesn't hold anything up.
-fn pipe(tool: &str, args: &[&str], text: &str) -> Result<(), String> {
+/// Runs a clipboard tool with `text` on its stdin, until `deadline`. wl-copy,
+/// xclip and xsel fork: the process started here exits at once, and a copy of
+/// it (its output detached from ours) serves the clipboard after that.
+fn pipe(tool: &str, args: &[&str], text: &str, deadline: Instant) -> Result<(), String> {
     let mut child = Command::new(tool)
         .args(args)
         .stdin(Stdio::piped())
@@ -162,7 +167,6 @@ fn pipe(tool: &str, args: &[&str], text: &str) -> Result<(), String> {
         })?;
     // Dropping stdin after the write closes it: the tool sees the end.
     let wrote = child.stdin.take().map(|mut s| s.write_all(text.as_bytes()));
-    let deadline = Instant::now() + TOOL_WAIT;
     let status = loop {
         match child.try_wait().map_err(|e| e.to_string())? {
             Some(status) => break status,
@@ -308,20 +312,31 @@ mod tests {
         assert_eq!(osc52("hi").unwrap(), "\x1b]52;c;aGk=\x07");
         assert_eq!(osc52("").unwrap(), "\x1b]52;c;\x07");
         assert_eq!(osc52("ø/#").unwrap(), "\x1b]52;c;w7gvIw==\x07");
-        let big = "x".repeat(OSC52_MAX + 1);
-        assert!(osc52(&big).unwrap_err().contains("more than the terminal takes"));
-        assert!(osc52(&big[1..]).is_ok());
+        // The cap is on the sequence as sent: 768 KB of text.
+        let most = "x".repeat(786_426);
+        assert_eq!(osc52(&most).unwrap().len(), OSC52_MAX);
+        let err = osc52(&format!("{most}x")).unwrap_err();
+        assert_eq!(err, "768.0 KB is more than the terminal takes (768.0 KB at most)");
     }
 
     #[cfg(unix)]
     #[test]
     fn tools_report_why_they_failed() {
-        assert_eq!(pipe("true", &[], "text"), Ok(()));
-        assert!(pipe("false", &[], "text").unwrap_err().starts_with("failed"));
-        assert_eq!(pipe("fss-mqtt-no-such-tool", &[], "text"), Err("not installed".into()));
+        let soon = || Instant::now() + TOOL_WAIT;
+        assert_eq!(pipe("true", &[], "text", soon()), Ok(()));
+        assert!(pipe("false", &[], "text", soon()).unwrap_err().starts_with("failed"));
+        assert_eq!(
+            pipe("fss-mqtt-no-such-tool", &[], "text", soon()),
+            Err("not installed".into())
+        );
         // A tool that reads everything: the text arrives whole.
         let big = "0123456789".repeat(20_000);
-        assert_eq!(pipe("sh", &["-c", "test $(wc -c) -eq 200000"], &big), Ok(()));
+        assert_eq!(pipe("sh", &["-c", "test $(wc -c) -eq 200000"], &big, soon()), Ok(()));
+        // One that hangs is stopped at the deadline.
+        let t = Instant::now();
+        let deadline = t + Duration::from_millis(200);
+        assert_eq!(pipe("sleep", &["5"], "", deadline), Err("didn't finish".into()));
+        assert!(t.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

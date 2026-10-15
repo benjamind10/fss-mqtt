@@ -44,8 +44,9 @@ const MAX_HEX: usize = 8;
 /// compressed payload may unpack to.
 const KEEP: usize = 4096;
 const MAX_UNPACKED: usize = 16 << 20;
-/// Names remembered from births, over all edge nodes and devices.
-const MAX_NAMES: usize = 200_000;
+/// Metrics whose names and types are remembered from births, over all edge
+/// nodes and devices.
+const MAX_NAMES: usize = 100_000;
 
 // DataType numbers (sparkplug_b.proto).
 const INT8: u32 = 1;
@@ -209,22 +210,29 @@ fn parse_topic(t: &str) -> Option<Topic<'_>> {
 struct Birth {
     names: HashMap<u64, (String, Option<u32>)>,
     types: HashMap<String, u32>,
-}
-
-impl Birth {
-    fn size(&self) -> usize {
-        self.names.len() + self.types.len()
-    }
+    /// Metrics remembered.
+    count: usize,
+    /// It reached the limit: its later metrics aren't remembered.
+    truncated: bool,
 }
 
 /// Metric names and types by alias, from the births a connection has seen,
 /// per edge node and per device. Kept by the connection's thread.
-#[derive(Default)]
 pub struct Aliases {
     births: HashMap<String, Birth>,
-    /// Entries over all births, against `MAX_NAMES`.
+    /// Metrics remembered over all births, and the most that may be.
     size: usize,
-    full: bool,
+    limit: usize,
+}
+
+impl Default for Aliases {
+    fn default() -> Aliases {
+        Aliases {
+            births: HashMap::new(),
+            size: 0,
+            limit: MAX_NAMES,
+        }
+    }
 }
 
 impl Aliases {
@@ -250,30 +258,34 @@ impl Aliases {
             self.births.retain(|k, b| {
                 let keep = !k.starts_with(&prefix);
                 if !keep {
-                    gone += b.size();
+                    gone += b.count;
                 }
                 keep
             });
             self.size = self.size.saturating_sub(gone);
         }
         if let Some(old) = self.births.remove(&key) {
-            self.size = self.size.saturating_sub(old.size());
+            self.size = self.size.saturating_sub(old.count);
         }
         let mut b = Birth::default();
         for m in metrics {
-            if self.size + b.size() >= MAX_NAMES {
-                self.full = true;
+            let Some(name) = &m.name else { continue };
+            if m.alias.is_none() && m.datatype.is_none() {
+                continue; // nothing to remember
+            }
+            if self.size + b.count >= self.limit {
+                b.truncated = true;
                 break;
             }
-            let Some(name) = &m.name else { continue };
             if let Some(dt) = m.datatype {
                 b.types.insert(name.to_string(), dt);
             }
             if let Some(a) = m.alias {
                 b.names.insert(a, (name.to_string(), m.datatype));
             }
+            b.count += 1;
         }
-        self.size += b.size();
+        self.size += b.count;
         self.births.insert(key, b);
     }
 
@@ -361,17 +373,29 @@ impl Aliases {
             );
         }
 
+        // Why aliases have no name, from what's remembered now: room comes
+        // back when births are replaced and a node's devices forgotten.
         if named.iter().any(|n| n.unknown) {
-            let birth = if t.device.is_some() { "DBIRTH" } else { "NBIRTH" };
-            d.notes.push(format!(
-                "names come from the birth certificate ({birth}), sent before fss-mqtt connected; \
-                 they appear after the next birth"
-            ));
-            if self.full {
-                d.notes.push(format!(
-                    "aliases of more than {} metrics seen: later births aren't remembered",
-                    commas(MAX_NAMES as u64)
-                ));
+            let kind = if t.device.is_some() { "DBIRTH" } else { "NBIRTH" };
+            let limit = format!(
+                "fss-mqtt's limit of {} remembered metric names (over all edge nodes and devices)",
+                commas(self.limit as u64)
+            );
+            match birth {
+                None => {
+                    d.notes.push(format!(
+                        "names come from the birth certificate ({kind}), sent before fss-mqtt connected; \
+                         they appear after the next birth"
+                    ));
+                    if self.size >= self.limit {
+                        d.notes.push(format!("{limit} is reached: a new birth won't fit"));
+                    }
+                }
+                Some(b) => d.notes.push(if b.truncated {
+                    format!("only part of the {kind} is remembered: {limit} was reached")
+                } else {
+                    format!("aliases shown as numbers aren't defined in the last {kind}")
+                }),
             }
         }
         if let Some(e) = err {
@@ -1445,10 +1469,10 @@ mod tests {
         assert_eq!(get(&m, "Inputs/Int64", "time"), when(T0 - 60_000, Some(T0 + 1000)));
         assert_eq!(get(&m, "Inputs/Float", "time"), "");
         assert_eq!(get(&m, "Arrays/Int8", "value"), "[1, -1]");
-        // An alias the birth didn't define stays a number, with the note.
+        // An alias the birth didn't define stays a number, and the note says why.
         assert_eq!(get(&m, "alias 99", "type"), "?");
         assert_eq!(get(&m, "alias 99", "value"), "7");
-        assert_eq!(v.notes.len(), 1);
+        assert_eq!(v.notes, ["aliases shown as numbers aren't defined in the last NBIRTH"]);
     }
 
     #[test]
@@ -1490,6 +1514,63 @@ mod tests {
             .unwrap();
         assert!(metrics(&v).contains_key("Power"));
         assert!(metrics(&a.decode(NDATA, &fixture("ndata.bin")).unwrap()).contains_key("Inputs/Int8"));
+    }
+
+    #[test]
+    fn the_limit_note_follows_what_is_remembered() {
+        use enc::*;
+        // A birth naming metrics `aliases` (each with an alias and a type), and data with one alias.
+        let birth = |aliases: std::ops::RangeInclusive<u64>| -> Vec<u8> {
+            aliases
+                .flat_map(|n| {
+                    let m = [
+                        bytes_field(1, format!("m{n}").as_bytes()),
+                        varint_field(2, n),
+                        varint_field(4, 7),
+                    ];
+                    bytes_field(2, &m.concat())
+                })
+                .collect()
+        };
+        let data = |alias: u64| bytes_field(2, &[varint_field(2, alias), varint_field(10, 1)].concat());
+        let notes = |a: &mut Aliases, topic: &str, alias: u64| a.decode(topic, &data(alias)).unwrap().notes;
+        let (d1, d2) = ("spBv1.0/Plant1/DBIRTH/Gateway1/D1", "spBv1.0/Plant1/DBIRTH/Gateway1/D2");
+        let d2_data = "spBv1.0/Plant1/DDATA/Gateway1/D2";
+        let limit = "fss-mqtt's limit of 4 remembered metric names (over all edge nodes and devices)";
+        let before = NOTE.replace("BIRTH", "NBIRTH");
+
+        // Fill it: D1's birth fits, D2's is cut after two metrics.
+        let mut a = Aliases {
+            limit: 4,
+            ..Aliases::default()
+        };
+        a.decode(d1, &birth(1..=2)).unwrap();
+        a.decode(d2, &birth(11..=13)).unwrap();
+        assert_eq!(a.size, 4);
+        assert!(notes(&mut a, d2_data, 12).is_empty());
+        assert_eq!(
+            notes(&mut a, d2_data, 13),
+            [format!("only part of the DBIRTH is remembered: {limit} was reached")]
+        );
+        // An edge node born before fss-mqtt connected: its next birth won't fit now.
+        assert_eq!(
+            notes(&mut a, NDATA, 5),
+            [before.clone(), format!("{limit} is reached: a new birth won't fit")]
+        );
+
+        // The node's birth forgets its devices: there's room again, and the notes say so.
+        a.decode(NBIRTH, &birth(5..=5)).unwrap();
+        assert_eq!(a.size, 1);
+        assert_eq!(notes(&mut a, "spBv1.0/Plant1/NDATA/Gateway2", 7), [before]);
+        assert_eq!(notes(&mut a, d2_data, 13), [NOTE.replace("BIRTH", "DBIRTH")]);
+        // Born again, D2 fits whole.
+        a.decode(d2, &birth(11..=13)).unwrap();
+        assert!(notes(&mut a, d2_data, 13).is_empty());
+        // A birth that was kept whole, used with an alias it doesn't define.
+        assert_eq!(
+            notes(&mut a, NDATA, 6),
+            ["aliases shown as numbers aren't defined in the last NBIRTH"]
+        );
     }
 
     #[test]

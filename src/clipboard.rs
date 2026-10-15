@@ -5,6 +5,7 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::fmt::human_bytes;
@@ -165,8 +166,19 @@ fn pipe(tool: &str, args: &[&str], text: &str, deadline: Instant) -> Result<(), 
             std::io::ErrorKind::NotFound => "not installed".to_string(),
             _ => e.to_string(),
         })?;
-    // Dropping stdin after the write closes it: the tool sees the end.
-    let wrote = child.stdin.take().map(|mut s| s.write_all(text.as_bytes()));
+    // The text is written from another thread: once the pipe is full, the
+    // write waits for the tool to read, and one that doesn't read must not
+    // hold up the deadline. Killing the tool ends a write stuck that way.
+    let wrote = child.stdin.take().map(|mut stdin| {
+        let (tx, rx) = mpsc::channel();
+        let text = text.to_owned();
+        std::thread::spawn(move || {
+            // Sent before stdin closes as this returns, which is when the tool
+            // sees the end of the text: by the time it exits, this is here.
+            let _ = tx.send(stdin.write_all(text.as_bytes()));
+        });
+        rx
+    });
     let status = loop {
         match child.try_wait().map_err(|e| e.to_string())? {
             Some(status) => break status,
@@ -181,9 +193,13 @@ fn pipe(tool: &str, args: &[&str], text: &str, deadline: Instant) -> Result<(), 
     if !status.success() {
         return Err(format!("failed ({status})"));
     }
-    match wrote {
-        Some(Err(e)) => Err(e.to_string()),
-        _ => Ok(()),
+    // It ended well; the write is done unless it stopped reading early (or a
+    // process it started still holds the pipe without reading).
+    let Some(wrote) = wrote else { return Ok(()) };
+    match wrote.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(e.to_string()),
+        _ => Err("didn't take all the text".into()),
     }
 }
 
@@ -323,7 +339,7 @@ mod tests {
     #[test]
     fn tools_report_why_they_failed() {
         let soon = || Instant::now() + TOOL_WAIT;
-        assert_eq!(pipe("true", &[], "text", soon()), Ok(()));
+        assert_eq!(pipe("cat", &[], "text", soon()), Ok(()));
         assert!(pipe("false", &[], "text", soon()).unwrap_err().starts_with("failed"));
         assert_eq!(
             pipe("fss-mqtt-no-such-tool", &[], "text", soon()),
@@ -332,11 +348,26 @@ mod tests {
         // A tool that reads everything: the text arrives whole.
         let big = "0123456789".repeat(20_000);
         assert_eq!(pipe("sh", &["-c", "test $(wc -c) -eq 200000"], &big, soon()), Ok(()));
-        // One that hangs is stopped at the deadline.
-        let t = Instant::now();
-        let deadline = t + Duration::from_millis(200);
-        assert_eq!(pipe("sleep", &["5"], "", deadline), Err("didn't finish".into()));
-        assert!(t.elapsed() < Duration::from_secs(2));
+        // One that exits fine without reading it all: not a copy.
+        let huge = "x".repeat(1 << 20);
+        assert_eq!(
+            pipe("head", &["-c", "10"], &huge, soon()),
+            Err("didn't take all the text".into())
+        );
+    }
+
+    /// A tool that hangs is stopped at the deadline: with a small text, and
+    /// with one bigger than the pipe holds, whose write gets stuck too.
+    #[cfg(unix)]
+    #[test]
+    fn tools_that_hang_are_stopped_at_the_deadline() {
+        for text in [String::new(), "x".repeat(1 << 20)] {
+            let t = Instant::now();
+            let deadline = t + Duration::from_millis(200);
+            assert_eq!(pipe("sleep", &["5"], &text, deadline), Err("didn't finish".into()));
+            let took = t.elapsed();
+            assert!(took < Duration::from_secs(1), "{} B: took {took:?}", text.len());
+        }
     }
 
     #[test]

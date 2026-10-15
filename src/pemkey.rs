@@ -45,7 +45,7 @@ pub fn load(pem: &[u8], passphrase: Option<&str>) -> Result<PrivateKeyDer<'stati
     let Some(b) = blocks.iter().find(|b| b.label.ends_with("PRIVATE KEY")) else {
         return Err(other("no private key found (expected a PEM \"PRIVATE KEY\" block)"));
     };
-    let der = base64(&b.body).ok_or_else(|| other("the key's base64 is damaged"))?;
+    let der = crate::base64::decode(&b.body).ok_or_else(|| other("the key's base64 is damaged"))?;
     let need = || passphrase.ok_or(KeyError::NeedsPassphrase);
     match b.label.as_str() {
         "PRIVATE KEY" => Ok(PrivatePkcs8KeyDer::from(der).into()),
@@ -106,31 +106,6 @@ fn blocks(pem: &[u8]) -> Vec<Block> {
         }
     }
     out
-}
-
-fn base64(s: &str) -> Option<Vec<u8>> {
-    let val = |c: u8| match c {
-        b'A'..=b'Z' => Some(c - b'A'),
-        b'a'..=b'z' => Some(c - b'a' + 26),
-        b'0'..=b'9' => Some(c - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    };
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let (mut acc, mut bits) = (0u32, 0);
-    for c in s.bytes().filter(|c| !c.is_ascii_whitespace()) {
-        if c == b'=' {
-            break;
-        }
-        acc = acc << 6 | val(c)? as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Some(out)
 }
 
 // ── DER (just enough for EncryptedPrivateKeyInfo) ─────────────────────────

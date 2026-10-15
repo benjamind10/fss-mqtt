@@ -265,13 +265,18 @@ impl App {
 
     pub fn tick(&mut self) {
         self.now = SystemTime::now();
-        let total = {
-            let st = self.store.lock().unwrap();
+        let (total, notices) = {
+            let mut st = self.store.lock().unwrap();
             if st.struct_ver != self.struct_ver {
                 self.need_rebuild = true;
             }
-            st.total()
+            (st.total(), st.take_notices())
         };
+        // The last one shows; an error isn't hidden by a later success.
+        let last_err = notices.iter().rposition(|(_, err)| *err);
+        if let Some((text, err)) = last_err.or(notices.len().checked_sub(1)).map(|i| notices[i].clone()) {
+            self.notify(text, err);
+        }
         let d = self.rate_at.elapsed();
         if d >= Duration::from_secs(1) {
             self.rate = total.saturating_sub(self.rate_total) as f64 / d.as_secs_f64();
@@ -901,9 +906,37 @@ impl App {
             return;
         }
         let idx = msg_index(&msgs, sel);
-        let mut v = Viewer::new(title, msgs, idx);
+        let mut v = Viewer::new(n, title, msgs, idx);
         v.relayout(self.width.saturating_sub(4) as usize, &self.th);
         self.viewer = Some(v);
+    }
+
+    /// The topic node in focus: the one shown full screen, else the
+    /// selected tree node (which may be a connection).
+    #[allow(dead_code)] // until an action uses it
+    pub fn focused_node(&self) -> Option<usize> {
+        match &self.viewer {
+            Some(v) => Some(v.node),
+            None => self.selected,
+        }
+    }
+
+    /// The message in focus, with its topic node: the one shown full screen,
+    /// the one picked in the message list, or the selected topic's latest.
+    #[allow(dead_code)] // until an action uses it
+    pub fn focused_message(&self) -> Option<(usize, Arc<Message>)> {
+        if let Some(v) = &self.viewer {
+            return v.msgs.get(v.idx).map(|m| (v.node, m.clone()));
+        }
+        let n = self.selected?;
+        let st = self.store.lock().unwrap();
+        let m = if self.focus == Focus::Msgs {
+            let msgs = st.nodes[n].messages(); // newest first
+            msgs.get(msg_index(&msgs, self.msg_sel)).cloned()
+        } else {
+            st.nodes[n].latest().cloned()
+        };
+        m.map(|m| (n, m))
     }
 
     fn viewer_key(&mut self, k: KeyEvent) {

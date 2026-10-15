@@ -1376,6 +1376,30 @@ mod tests {
     }
 
     #[test]
+    fn focus_helpers_and_thread_notices() {
+        let (mut app, _rx) = sample(tmp_config("focus"));
+        typ(&mut app, "v1/plant/line1");
+        press(&mut app, &[KeyCode::Down]);
+        let (n, latest) = app.focused_message().expect("latest message of the selected topic");
+        assert_eq!(app.focused_node(), Some(n));
+        assert_eq!(app.store.lock().unwrap().nodes[n].latest().unwrap().seq, latest.seq);
+        // In the message list: the picked one; full screen: the shown one.
+        press(&mut app, &[KeyCode::Right, KeyCode::Down]);
+        let (_, picked) = app.focused_message().unwrap();
+        assert!(picked.seq < latest.seq);
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(app.focused_message().map(|(_, m)| m.seq), Some(picked.seq));
+        assert_eq!(app.focused_node(), Some(n));
+
+        // Notices from connection threads show on the next tick; an error
+        // isn't hidden by a later success.
+        app.store.lock().unwrap().notify("capture failed", true);
+        app.store.lock().unwrap().notify("published", false);
+        app.tick();
+        assert!(matches!(&app.notice, Some((t, true, _)) if t == "capture failed"));
+    }
+
+    #[test]
     fn connections_panel() {
         let cfg = tmp_config("panel");
         let (mut app, rx) = sample(cfg.clone());

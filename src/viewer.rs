@@ -21,6 +21,7 @@ pub enum Mode {
 }
 
 pub struct Viewer {
+    pub node: usize, // the topic's node in the store
     pub path: String,
     pub msgs: Vec<Arc<Message>>,
     pub idx: usize,
@@ -36,8 +37,9 @@ pub struct Viewer {
 }
 
 impl Viewer {
-    pub fn new(path: String, msgs: Vec<Arc<Message>>, idx: usize) -> Viewer {
+    pub fn new(node: usize, path: String, msgs: Vec<Arc<Message>>, idx: usize) -> Viewer {
         Viewer {
+            node,
             path,
             msgs,
             idx,

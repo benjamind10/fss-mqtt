@@ -246,6 +246,7 @@ enum End {
 pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<Cmd> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
+        let mut inbox = Inbox::default();
         let mut want = start;
         let mut halted = None;
         loop {
@@ -266,7 +267,7 @@ pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<C
                 }
             }
             set_status(&store, cfg.conn, ConnState::Connecting, None);
-            match session(&cfg, &store, &rx) {
+            match session(&cfg, &store, &rx, &mut inbox) {
                 End::Stopped => want = false,
                 End::Halted(err) => {
                     halted = Some(err);
@@ -333,8 +334,35 @@ fn dial(host: &str, port: u16) -> Result<TcpStream, String> {
     Err(last)
 }
 
+/// What happens to each message that arrives, with whatever state that needs
+/// across messages and reconnects (one per connection thread).
+#[derive(Default)]
+struct Inbox {}
+
+impl Inbox {
+    #[allow(clippy::too_many_arguments)]
+    fn receive(
+        &mut self,
+        store: &Mutex<Store>,
+        conn: usize,
+        topic: &str,
+        payload: &[u8],
+        qos: u8,
+        retain: bool,
+        props: Props,
+    ) {
+        // Decode binary formats now, while the whole payload is here
+        // (and outside the lock).
+        let decoded = crate::pretty::decode_on_arrival(props.content_type.as_deref(), payload);
+        store
+            .lock()
+            .unwrap()
+            .add_decoded(conn, topic, payload, qos, retain, props, decoded);
+    }
+}
+
 /// One connection's lifetime.
-fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>) -> End {
+fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut Inbox) -> End {
     let tls = match tls_config(cfg) {
         Ok(t) => t,
         Err(e @ TlsError::Key(..)) => return End::Halted(e.to_string()),
@@ -467,13 +495,7 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>) -> End {
                     let Some((topic, pid, props, payload)) = parse_publish(&body, qos) else {
                         return End::Failed("malformed PUBLISH".into());
                     };
-                    // Decode binary formats now, while the whole payload is here
-                    // (and outside the lock).
-                    let decoded = crate::pretty::decode_on_arrival(props.content_type.as_deref(), payload);
-                    store
-                        .lock()
-                        .unwrap()
-                        .add_decoded(cfg.conn, &topic, payload, qos, retain, props, decoded);
+                    inbox.receive(store, cfg.conn, &topic, payload, qos, retain, props);
                     match qos {
                         1 => reply = Some([0x40, 2, (pid >> 8) as u8, pid as u8]),
                         2 => reply = Some([0x50, 2, (pid >> 8) as u8, pid as u8]),

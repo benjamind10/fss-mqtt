@@ -131,6 +131,11 @@ impl Viewer {
         }
     }
 
+    /// What the view shows, for the clipboard: see [`clip_text`].
+    pub fn clip_text(&self, th: &Theme) -> (String, String) {
+        clip_text(&self.msgs[self.idx], Some(self.mode), self.width, th)
+    }
+
     /// Handles a key; returns true when the viewer should close.
     pub fn key(&mut self, k: KeyEvent, body_h: usize, th: &Theme) -> bool {
         let page = body_h.saturating_sub(1).max(1);
@@ -173,5 +178,28 @@ impl Viewer {
         self.scroll = self.scroll.min(self.lines.len().saturating_sub(body_h));
         self.hscroll = self.hscroll.min(self.max_width.saturating_sub(self.width));
         false
+    }
+}
+
+/// A message as clipboard text, and what that text is ("payload", "formatted
+/// JSON", "hex dump"). Full screen (`mode`) it's what the view shows;
+/// elsewhere the payload itself when it's text, else its formatted view.
+/// Text comes as it is (the screen shows tabs and odd characters
+/// differently), tables give whole rows rather than the panned part, and
+/// `width` only sizes hex dumps.
+pub fn clip_text(m: &Message, mode: Option<Mode>, width: usize, th: &Theme) -> (String, String) {
+    let p = &m.payload;
+    let hex = || (fmt::plain(&fmt::hex_lines(p, width, th)), "hex dump".to_string());
+    match (mode, pretty::detect(m)) {
+        (_, Format::Empty) => (String::new(), "payload".into()),
+        (Some(Mode::Hex), _) => hex(),
+        (None | Some(Mode::Raw), _) | (Some(Mode::Pretty), Format::Text) if fmt::is_text(p) => {
+            (String::from_utf8_lossy(p).into_owned(), "payload".into())
+        }
+        (Some(Mode::Raw), _) | (_, Format::Binary) => hex(),
+        (_, f) => (
+            fmt::plain(&pretty::render(m, th, width)),
+            format!("formatted {}", f.label()),
+        ),
     }
 }

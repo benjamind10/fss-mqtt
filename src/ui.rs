@@ -772,9 +772,18 @@ fn with_version<'a>(app: &App, hints: Line<'a>) -> Line<'a> {
     join_lr(hints.spans, vec![v], app.width as usize)
 }
 
+/// The latest notice, in place of the key hints while it shows.
+fn notice_line<'a>(app: &App) -> Option<Line<'a>> {
+    let (text, error, _) = app.notice.as_ref()?;
+    Some(Line::styled(
+        format!("  {text}"),
+        if *error { app.th.red } else { app.th.yellow },
+    ))
+}
+
 fn hints<'a>(app: &App) -> Line<'a> {
-    if let Some((text, error, _)) = &app.notice {
-        return Line::styled(format!("  {text}"), if *error { app.th.red } else { app.th.yellow });
+    if let Some(line) = notice_line(app) {
+        return line;
     }
     if app.focus == Focus::Conns {
         hint(
@@ -795,6 +804,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
                 (glyph::ENTER, "open"),
                 ("← esc", "back to tree"),
                 ("tab", "next pane"),
+                ("^t ^y", "copy"),
                 ("^c", "quit"),
             ],
         )
@@ -807,6 +817,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
                 (glyph::ENTER, "open"),
                 ("esc", "clear filter"),
                 ("tab", "next pane"),
+                ("^t ^y", "copy"),
                 ("^c", "quit"),
             ],
         )
@@ -834,9 +845,9 @@ fn viewer(buf: &mut Buffer, area: Rect, app: &App) {
     if v.max_width > v.width_now() {
         keys.push(("shift ←→", "pan"));
     }
-    keys.extend([("tab", mode.as_str()), ("esc", "back")]);
-    let mut h = hint(th, &keys);
-    if v.lines.len() > body_h {
+    keys.extend([("tab", mode.as_str()), ("t y", "copy"), ("esc", "back")]);
+    let mut h = notice_line(app).unwrap_or_else(|| hint(th, &keys));
+    if v.lines.len() > body_h && app.notice.is_none() {
         h.spans.push(Span::styled(
             format!("  {}–{} of {} lines", v.scroll + 1, end, v.lines.len()),
             th.faint,
@@ -1397,6 +1408,127 @@ mod tests {
         app.store.lock().unwrap().notify("published", false);
         app.tick();
         assert!(matches!(&app.notice, Some((t, true, _)) if t == "capture failed"));
+    }
+
+    #[test]
+    fn copy_topic_and_message() {
+        let (mut app, _rx) = sample(tmp_config("copy"));
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let copied = |a: &App| a.clipboard.recorded.clone().unwrap();
+        let last = |a: &App| copied(a).last().cloned().unwrap_or_default();
+        let notice = |a: &App| a.notice.clone().map(|(t, err, _)| (t, err)).unwrap();
+        let select = |a: &mut App, filter: &str| {
+            press(a, &[KeyCode::Esc]);
+            typ(a, filter);
+        };
+
+        // The first row is a connection: there's no topic to copy.
+        app.key(ctrl('t'));
+        let (t, err) = notice(&app);
+        assert!(err && t.contains("connection has no topic"), "{t}");
+        assert!(copied(&app).is_empty());
+
+        // A topic: its path without the connection, and the payload as it is.
+        select(&mut app, "v1/+/line1/temp");
+        app.key(ctrl('t'));
+        assert_eq!(last(&app), "v1/plant/line1/temp");
+        assert!(notice(&app).0.starts_with("copied topic v1/plant/line1/temp · "));
+        app.key(ctrl('y'));
+        let payload = r#"{"t":22.5,"ok":true,"tags":["a","b"],"note":null}"#;
+        assert_eq!(last(&app), payload);
+        let (t, err) = notice(&app);
+        assert!(
+            !err && t.starts_with(&format!("copied payload, {} B · ", payload.len())),
+            "{t}"
+        );
+
+        // In the message list: the picked message.
+        press(&mut app, &[KeyCode::Right, KeyCode::Down, KeyCode::Down]);
+        app.key(ctrl('y'));
+        assert_eq!(last(&app), payload.replace("22.5", "20.5"));
+
+        // Full screen: what the view shows, in each mode; the notice shows there.
+        press(&mut app, &[KeyCode::Enter]);
+        typ(&mut app, "y");
+        let pretty = last(&app);
+        assert!(
+            pretty.starts_with("{\n  \"t\": 20.5,\n  \"ok\": true,") && pretty.ends_with("\n}"),
+            "{pretty}"
+        );
+        let v = frame(&app, "copied full screen");
+        assert!(v.contains("copied formatted JSON, "), "notice full screen");
+        press(&mut app, &[KeyCode::Tab]);
+        typ(&mut app, "y");
+        assert_eq!(last(&app), payload.replace("22.5", "20.5"), "raw");
+        press(&mut app, &[KeyCode::Tab]);
+        typ(&mut app, "y");
+        assert!(
+            last(&app).starts_with("00000000  7b 22 74 22 3a 32 30 2e"),
+            "hex: {}",
+            last(&app)
+        );
+        assert!(notice(&app).0.starts_with("copied hex dump, "));
+        typ(&mut app, "t");
+        assert_eq!(last(&app), "v1/plant/line1/temp");
+        press(&mut app, &[KeyCode::Esc, KeyCode::Esc]);
+
+        // A table full screen gives whole rows, even narrow and panned.
+        select(&mut app, "daily");
+        app.resize(40, 30);
+        press(&mut app, &[KeyCode::Enter, KeyCode::Char('>')]);
+        assert!(app.viewer.as_ref().unwrap().hscroll > 0, "panned");
+        typ(&mut app, "y");
+        let table = last(&app);
+        let row = table.lines().find(|l| l.contains("T01")).unwrap_or_default();
+        assert!(
+            row.contains("28450.5") && row.contains("99.2") && row.contains("RUNNING"),
+            "{table}"
+        );
+        assert!(notice(&app).0.starts_with("copied formatted CSV, "));
+        press(&mut app, &[KeyCode::Esc]);
+        app.resize(110, 36);
+
+        // Binary elsewhere: decoded formats as their view, the rest as hex.
+        select(&mut app, "fastlog");
+        app.key(ctrl('y'));
+        assert!(notice(&app).0.starts_with("copied formatted Parquet, "));
+        assert!(last(&app).contains("TIMESTAMP(ms, UTC)"));
+        select(&mut app, "v2/fleet/truck7/bin");
+        app.key(ctrl('y'));
+        let hex = last(&app);
+        assert!(
+            hex.starts_with("00000000  00 01 02 ff 68 69 ") && hex.ends_with(" ....hi"),
+            "{hex}"
+        );
+        assert!(notice(&app).0.starts_with("copied hex dump, "));
+        // Cut on arrival: what was kept, and the notice says so.
+        select(&mut app, "v1/camera/frame");
+        app.key(ctrl('y'));
+        let (t, _) = notice(&app);
+        assert!(
+            t.contains("only the first 64.0 KB of 195.3 KB was kept, see --max-payload"),
+            "{t}"
+        );
+        assert_eq!(last(&app).lines().count(), 64 * 1024 / 16);
+
+        // An empty payload: nothing to copy.
+        app.store
+            .lock()
+            .unwrap()
+            .add(0, "v1/empty", b"", 0, false, Props::default());
+        app.tick();
+        let before = copied(&app).len();
+        select(&mut app, "v1/empty");
+        app.key(ctrl('y'));
+        assert_eq!(
+            notice(&app),
+            ("nothing to copy: the payload is empty".to_string(), false)
+        );
+        // In the connections panel the keys do nothing.
+        app.focus = Focus::Conns;
+        app.key(ctrl('t'));
+        app.key(ctrl('y'));
+        assert_eq!(copied(&app).len(), before);
     }
 
     #[test]

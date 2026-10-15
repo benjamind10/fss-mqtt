@@ -6,6 +6,7 @@ mod avro;
 mod base64;
 mod broker;
 mod changeset;
+mod clipboard;
 mod compressed;
 mod config;
 mod crc32;

@@ -286,6 +286,19 @@ pub fn fit<'a>(spans: Vec<Span<'a>>, w: usize) -> Line<'a> {
     Line::from(out)
 }
 
+/// Styled lines as plain text, one per line, without trailing blanks.
+pub fn plain(lines: &[Line]) -> String {
+    let mut out = String::new();
+    for (i, l) in lines.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+        out.push_str(text.trim_end());
+    }
+    out
+}
+
 pub fn hex_lines(b: &[u8], w: usize, th: &Theme) -> Vec<Line<'static>> {
     let mut per = 16;
     while per > 4 && 10 + per * 3 + 2 + per > w {
@@ -329,6 +342,23 @@ mod tests {
         assert!(is_text(b"hello"));
         assert!(!is_text(&[0, 1, 2, 0xff]));
         assert_eq!(trunc_left("v1/plant/temp", 6), "…/temp");
+    }
+
+    #[test]
+    fn plain_text_of_styled_lines() {
+        let th = Theme::new(false);
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("key", th.purple),
+                Span::raw("  "),
+                Span::styled("value", th.text),
+            ]),
+            Line::raw("padded   "),
+            Line::default(),
+            Line::raw("end"),
+        ];
+        assert_eq!(plain(&lines), "key  value\npadded\n\nend");
+        assert_eq!(plain(&[]), "");
     }
 
     #[test]

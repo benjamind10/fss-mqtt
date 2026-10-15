@@ -9,7 +9,9 @@ use std::time::{Duration, Instant, SystemTime};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::broker;
+use crate::clipboard;
 use crate::config::{self, ConnCfg};
+use crate::fmt;
 use crate::mqtt::{self, Cmd};
 use crate::store::{ConnState, Filter, FilterMode, INSIDE, MATCHED, Message, ROOT, Row, Store, Sub};
 use crate::theme::Theme;
@@ -20,6 +22,8 @@ const AUTO_EXPAND_LIMIT: u32 = 300;
 const NOTICE_FOR: Duration = Duration::from_secs(6);
 /// How often the connections file is checked for changes.
 const CONFIG_EVERY: Duration = Duration::from_secs(1);
+/// Hex dumps copied outside the full screen view: 16 bytes a line.
+const CLIP_HEX_WIDTH: usize = 80;
 
 /// The connections file's modified time and size, to notice edits.
 type Stamp = Option<(SystemTime, u64)>;
@@ -159,6 +163,7 @@ pub struct App {
     pub msg_sel: Option<u64>, // seq of the selected message in the list
 
     pub viewer: Option<Viewer>,
+    pub clipboard: clipboard::Sink,
 
     pub rate: f64,
     pub(crate) rate_total: u64,
@@ -209,6 +214,7 @@ impl App {
             focus: Focus::Tree,
             msg_sel: None,
             viewer: None,
+            clipboard: clipboard::Sink::default(),
             rate: 0.0,
             rate_total: 0,
             rate_at: Instant::now(),
@@ -464,6 +470,13 @@ impl App {
         }
         if self.focus == Focus::Conns && self.panel_key(k) {
             return;
+        }
+        if ctrl && self.focus != Focus::Conns {
+            match k.code {
+                KeyCode::Char('t') => return self.copy_topic(),
+                KeyCode::Char('y') => return self.copy_message(),
+                _ => {}
+            }
         }
         match k.code {
             KeyCode::Char(c) if !ctrl && !k.modifiers.contains(KeyModifiers::ALT) => {
@@ -913,7 +926,6 @@ impl App {
 
     /// The topic node in focus: the one shown full screen, else the
     /// selected tree node (which may be a connection).
-    #[allow(dead_code)] // until an action uses it
     pub fn focused_node(&self) -> Option<usize> {
         match &self.viewer {
             Some(v) => Some(v.node),
@@ -923,7 +935,6 @@ impl App {
 
     /// The message in focus, with its topic node: the one shown full screen,
     /// the one picked in the message list, or the selected topic's latest.
-    #[allow(dead_code)] // until an action uses it
     pub fn focused_message(&self) -> Option<(usize, Arc<Message>)> {
         if let Some(v) = &self.viewer {
             return v.msgs.get(v.idx).map(|m| (v.node, m.clone()));
@@ -939,7 +950,60 @@ impl App {
         m.map(|m| (n, m))
     }
 
+    // ── Clipboard ──────────────────────────────────────────────────────────
+
+    /// Copies the focused topic's path (ctrl+t; t full screen).
+    fn copy_topic(&mut self) {
+        let Some(n) = self.focused_node() else {
+            return self.notify("no topic to copy: select one in the tree", true);
+        };
+        let (path, is_conn) = {
+            let st = self.store.lock().unwrap();
+            (st.nodes[n].path.clone(), st.nodes[n].is_conn())
+        };
+        if is_conn {
+            return self.notify("a connection has no topic to copy: select a topic", true);
+        }
+        self.copy(&path, format!("topic {path}"));
+    }
+
+    /// Copies the focused message (ctrl+y; y full screen): what the full
+    /// screen view shows, else the payload (formatted when it's binary).
+    fn copy_message(&mut self) {
+        let Some((_, m)) = self.focused_message() else {
+            return self.notify("no message to copy here", true);
+        };
+        let (text, what) = match &self.viewer {
+            Some(v) => v.clip_text(&self.th),
+            None => crate::viewer::clip_text(&m, None, CLIP_HEX_WIDTH, &self.th),
+        };
+        if text.is_empty() {
+            return self.notify("nothing to copy: the payload is empty", false);
+        }
+        let mut what = format!("{what}, {}", fmt::human_bytes(text.len()));
+        if m.truncated() {
+            what += &format!(
+                " (only the first {} of {} was kept, see --max-payload)",
+                fmt::human_bytes(m.payload.len()),
+                fmt::human_bytes(m.size)
+            );
+        }
+        self.copy(&text, what);
+    }
+
+    fn copy(&mut self, text: &str, what: String) {
+        match self.clipboard.put(text) {
+            Ok(how) => self.notify(format!("copied {what} · {how}"), false),
+            Err(e) => self.notify(format!("couldn't copy: {e}"), true),
+        }
+    }
+
     fn viewer_key(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Char('t') => return self.copy_topic(),
+            KeyCode::Char('y') => return self.copy_message(),
+            _ => {}
+        }
         let body_h = self.viewer_body_h();
         let v = self.viewer.as_mut().unwrap();
         if v.key(k, body_h, &self.th) {

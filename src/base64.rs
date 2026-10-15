@@ -1,9 +1,7 @@
 //! Standard base64 (RFC 4648, with padding).
 
-#[allow(dead_code)] // until a feature encodes
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-#[allow(dead_code)]
 pub fn encode(b: &[u8]) -> String {
     let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
     for chunk in b.chunks(3) {

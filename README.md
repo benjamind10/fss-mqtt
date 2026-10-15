@@ -143,6 +143,8 @@ clears. Clearing keeps the tree open at the topic you were on.
 | full screen | `shift ←→` `<` `>` | pan wide tables (CSV, Parquet) |
 | full screen | `tab` | cycle formatted / raw / hex |
 | full screen | `esc q ⏎` | close |
+| tree, messages | `ctrl+t` / `ctrl+y` | copy the topic / the message (see [Clipboard](#clipboard)) |
+| full screen | `t` / `y` | copy the topic / what the view shows |
 | anywhere | `ctrl+c` | quit |
 
 A green `•`/`▸` means the topic (or something under it) received a message in the last 1.5 s.
@@ -151,6 +153,20 @@ Colours follow `$COLORFGBG` for light terminals (e.g. `export COLORFGBG='0;15'`)
 Terminals without 24-bit colour (Apple Terminal, for one) get the nearest colours from the
 256-colour palette instead; 24-bit colour is used when `COLORTERM=truecolor` is set, in iTerm2,
 WezTerm, VS Code, Ghostty and on Windows. `FSS_MQTT_COLOR=truecolor` or `=256` overrides the guess.
+
+### Clipboard
+
+`ctrl+t` copies the selected topic's path (without the connection name). `ctrl+y` copies the
+message: a text payload as it is, a binary one as its formatted view (or a hex dump). Full screen,
+`y` copies what the view shows: formatted, raw or hex, with tables as whole rows. A payload cut on
+arrival (`--max-payload`) copies what was kept, and the status line says so.
+
+The copy goes to the system clipboard with `pbcopy` (macOS), the Windows clipboard, or `wl-copy`,
+`xclip` or `xsel` (Linux and BSD with a display). Over SSH, or with none of those, it goes through
+the terminal instead (an OSC 52 escape sequence, up to 768 KB of text), which lands on the
+clipboard of the machine you're sitting at. Most terminals support it (iTerm2, kitty, WezTerm,
+Alacritty, Windows Terminal, foot; Apple Terminal doesn't). In tmux, enable it with
+`set -g set-clipboard on`. `FSS_MQTT_CLIPBOARD=osc52`, `=native` or `=off` overrides the choice.
 
 ## Payload formats
 

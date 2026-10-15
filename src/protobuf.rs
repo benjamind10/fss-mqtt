@@ -231,7 +231,7 @@ impl Parser {
     }
 }
 
-fn varint(b: &[u8], pos: &mut usize) -> Result<u64, &'static str> {
+pub(crate) fn varint(b: &[u8], pos: &mut usize) -> Result<u64, &'static str> {
     let mut v = 0u64;
     for i in 0..10 {
         let byte = *b.get(*pos).ok_or("truncated varint")?;
@@ -247,7 +247,7 @@ fn varint(b: &[u8], pos: &mut usize) -> Result<u64, &'static str> {
     Err("varint longer than 10 bytes")
 }
 
-fn take<const N: usize>(b: &[u8], pos: &mut usize, at: usize) -> Result<[u8; N], String> {
+pub(crate) fn take<const N: usize>(b: &[u8], pos: &mut usize, at: usize) -> Result<[u8; N], String> {
     let s = pos
         .checked_add(N)
         .and_then(|end| b.get(*pos..end))

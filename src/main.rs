@@ -16,6 +16,7 @@ mod parquet;
 mod pemkey;
 mod pretty;
 mod protobuf;
+mod sparkplug;
 mod sqlite;
 mod store;
 mod theme;

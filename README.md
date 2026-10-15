@@ -169,6 +169,7 @@ format comes from the `content-type` property when there is one, otherwise from 
 | MessagePack, CBOR (by `content-type`) | decoded and shown as JSON |
 | gzip, zstd | unpacked on arrival; what's inside is detected and formatted like any other payload |
 | Protobuf (by content-type) | raw field numbers and values, nested messages indented; no schema needed |
+| Sparkplug B (on `spBv1.0/…` topics) | message type, seq and timestamp; the metrics as a table with names, types and values; data sets and templates as tables |
 | SQLite changeset / patchset | per table, the inserts, updates (old → new) and deletes |
 | other text / binary | text / hex dump |
 
@@ -183,6 +184,14 @@ like one of these formats but can't be read, the reason is shown above a hex dum
 - **Protobuf:** shown without a schema, like `protoc --decode_raw` (a gRPC message frame is stripped
   first): each length-delimited field is shown as text, a nested message, a packed list of small
   numbers or bytes, whichever it most likely is.
+- **Sparkplug B:** recognised by its topic, `spBv1.0/{group}/{type}/{edge node}[/{device}]` with
+  type `NBIRTH`, `NDATA`, `NCMD`, `NDEATH` or their `D…` device versions (`STATE` messages are
+  JSON). Data and command messages usually name their metrics by alias only; the names and types
+  come from the edge node's `NBIRTH` or the device's `DBIRTH`, which each connection remembers. A
+  birth sent before fss-mqtt connected can't be seen, so its metrics show as `alias 7` until the
+  next one (edge nodes send one when a host application asks for a rebirth). All Sparkplug 3.0 types
+  are shown, arrays, data sets and templates included; payloads compressed the way Eclipse Tahu does
+  are unpacked first.
 - **Avro:** container files are read with the schema in their header (uncompressed, Deflate, Snappy
   or Zstandard), nested values shown as compact JSON; Avro without its schema (Confluent
   schema-registry framing, single-object encoding) can't be decoded and says so.

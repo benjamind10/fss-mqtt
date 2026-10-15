@@ -131,7 +131,7 @@ fn gzip_header(b: &[u8]) -> Result<usize, String> {
 }
 
 /// Inflates every member of a gzip stream into `out`; true when capped.
-fn gunzip(b: &[u8], out: &mut Vec<u8>, notes: &mut Vec<String>) -> Result<bool, String> {
+pub(crate) fn gunzip(b: &[u8], out: &mut Vec<u8>, notes: &mut Vec<String>) -> Result<bool, String> {
     let mut state = InflateState::new_boxed(DataFormat::Raw);
     let mut buf = vec![0u8; CHUNK];
     let mut p = 0;

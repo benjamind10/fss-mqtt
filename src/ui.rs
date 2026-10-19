@@ -370,6 +370,14 @@ fn header<'a>(app: &App, st: &Store) -> Line<'a> {
     if st.live().any(|c| c.capture.active()) {
         left.push(Span::styled("  ● capturing", th.red));
     }
+    if let Some(v) = app.upgrade.as_ref().and_then(|w| w.installed()) {
+        let v = if v == "?" || v == env!("CARGO_PKG_VERSION") {
+            "new build"
+        } else {
+            v
+        };
+        left.push(Span::styled(format!("  ↑ {v} · ^n restart"), th.accent_b));
+    }
     let right = vec![
         Span::styled(commas(st.topic_count() as u64), th.text),
         Span::styled(" topics  ", th.dim),
@@ -922,50 +930,39 @@ fn hints<'a>(app: &App) -> Line<'a> {
     // Ranks: the new actions stay longest; arrows are the first to go. (The
     // main screen's version sits on the input box, not on this line.)
     let room = (app.width as usize).saturating_sub(1);
-    if app.focus == Focus::Conns {
-        hint(
-            &app.th,
-            &[
-                ("↑↓", "move", 3),
-                (&format!("space {}", glyph::ENTER), "connect / on-off", 1),
-                ("tab", "pane", 2),
-                ("type", "filter", 2),
-                ("^c", "quit", 0),
-            ],
-            room,
-        )
-    } else if app.focus == Focus::Msgs {
-        hint(
-            &app.th,
-            &[
-                ("↑↓", "messages", 3),
-                (glyph::ENTER, "open", 2),
-                ("^e", "publish", 1),
-                ("^t ^y", "copy", 1),
-                ("^r", "capture", 1),
-                ("← esc", "back", 2),
-                ("tab", "pane", 2),
-                ("^c", "quit", 0),
-            ],
-            room,
-        )
-    } else {
-        hint(
-            &app.th,
-            &[
-                ("↑↓", "move", 3),
-                ("←→", "collapse/expand", 3),
-                (glyph::ENTER, "open", 2),
-                ("^e", "publish", 1),
-                ("^t ^y", "copy", 1),
-                ("^r", "capture", 1),
-                ("esc", "clear filter", 2),
-                ("tab", "pane", 2),
-                ("^c", "quit", 0),
-            ],
-            room,
-        )
+    let space = format!("space {}", glyph::ENTER);
+    let mut keys: Vec<(&str, &str, u8)> = match app.focus {
+        Focus::Conns => vec![
+            ("↑↓", "move", 3),
+            (&space, "connect / on-off", 1),
+            ("tab", "pane", 2),
+            ("type", "filter", 2),
+        ],
+        Focus::Msgs => vec![
+            ("↑↓", "messages", 3),
+            (glyph::ENTER, "open", 2),
+            ("^e", "publish", 1),
+            ("^t ^y", "copy", 1),
+            ("^r", "capture", 1),
+            ("← esc", "back", 2),
+            ("tab", "pane", 2),
+        ],
+        Focus::Tree => vec![
+            ("↑↓", "move", 3),
+            ("←→", "collapse/expand", 3),
+            (glyph::ENTER, "open", 2),
+            ("^e", "publish", 1),
+            ("^t ^y", "copy", 1),
+            ("^r", "capture", 1),
+            ("esc", "clear filter", 2),
+            ("tab", "pane", 2),
+        ],
+    };
+    if app.upgrade.as_ref().is_some_and(|w| w.installed().is_some()) {
+        keys.push(("^n", "restart", 0));
     }
+    keys.push(("^c", "quit", 0));
+    hint(&app.th, &keys, room)
 }
 
 fn viewer(buf: &mut Buffer, area: Rect, app: &App) {
@@ -2298,6 +2295,34 @@ mod tests {
         assert_eq!(back.rate, 0.0);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&cfg);
+    }
+
+    #[test]
+    fn ctrl_n_restarts_into_a_newer_version() {
+        let (mut app, _rx) = sample(tmp_config("restart"));
+        let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        app.key(ctrl_n);
+        assert!(!app.quit && app.notice.as_ref().unwrap().0 == "no newer fss-mqtt is installed");
+        assert!(!frame(&app, "nothing new").contains("^n"));
+
+        app.notice = None;
+        app.upgrade = Some(crate::upgrade::Watch::found("/x/fss-mqtt".into(), "9.9.9"));
+        assert_eq!(app.upgrade_note().as_deref(), Some("fss-mqtt 9.9.9 is installed"));
+        let v = frame(&app, "newer installed");
+        assert!(
+            v.contains("↑ 9.9.9 · ^n restart") && v.contains("^n restart · ^c quit"),
+            "{v}"
+        );
+        app.key(ctrl_n);
+        assert!(app.restart && app.quit);
+
+        // The same version rebuilt says so.
+        app.upgrade = Some(crate::upgrade::Watch::found(
+            "/x/fss-mqtt".into(),
+            env!("CARGO_PKG_VERSION"),
+        ));
+        assert_eq!(app.upgrade_note().as_deref(), Some("fss-mqtt was rebuilt"));
+        assert!(frame(&app, "rebuilt").contains("↑ new build · ^n restart"));
     }
 
     #[test]

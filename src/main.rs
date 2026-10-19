@@ -28,6 +28,7 @@ mod sqlite;
 mod store;
 mod theme;
 mod ui;
+mod upgrade;
 mod values;
 mod view;
 mod viewer;
@@ -79,6 +80,7 @@ Connection flags:
 
 Sessions and files:
       --resume               continue the last session: its messages, connections and view
+                             (ctrl+n restarts into a newer fss-mqtt installed meanwhile, continuing it)
       --no-session           don't save the session when quitting
       --open path            browse a capture file offline (repeatable; .jsonl or .jsonl.gz);
                              add -c NAME or a broker to send its messages on with ctrl+e
@@ -595,6 +597,7 @@ fn run() -> Result<(), String> {
     if let Some(view) = &restored {
         app.restore_view(view);
     }
+    app.upgrade = upgrade::Watch::new();
     if let Some((text, err)) = notice {
         app.notify(text, err);
     }
@@ -608,6 +611,9 @@ fn run() -> Result<(), String> {
     for late in app.flush_captures(capture::QUIT_WAIT) {
         eprintln!("fss-mqtt: capture: {late}");
     }
+    if app.restart {
+        return restart(&a, &app, session_path.as_deref());
+    }
     if !a.no_session
         && let Some(p) = &session_path
     {
@@ -618,6 +624,40 @@ fn run() -> Result<(), String> {
         }
     }
     res.map_err(|e| e.to_string())
+}
+
+/// ctrl+n: saves the session, then becomes the fss-mqtt installed in our
+/// place, continuing it (on Windows, which can't, says how to).
+fn restart(a: &Args, app: &app::App, session: Option<&std::path::Path>) -> Result<(), String> {
+    let w = app.upgrade.as_ref().ok_or("nothing to restart into")?;
+    let resume = match session {
+        Some(p) if !a.no_session => match save_session(app, p) {
+            Ok(n) => n > 0,
+            Err(e) => return Err(format!("couldn't save the session, so not restarting: {e}")),
+        },
+        _ => false,
+    };
+    let args = upgrade::restart_args(&std::env::args_os().skip(1).collect::<Vec<_>>(), resume);
+    let note = app.upgrade_note().unwrap_or_else(|| "fss-mqtt changed on disk".into());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        println!(
+            "{note}: restarting{}…",
+            if resume { ", continuing the session" } else { "" }
+        );
+        let err = std::process::Command::new(&w.path).args(&args).exec();
+        Err(format!("couldn't start {}: {err}", w.path.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (w, args);
+        println!("{note}.");
+        if resume {
+            println!("Continue session: {}", resume_command(a));
+        }
+        Ok(())
+    }
 }
 
 /// Saves what's in memory for `--resume`; 0 when there was nothing to save

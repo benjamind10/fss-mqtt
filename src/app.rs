@@ -175,6 +175,10 @@ pub struct App {
     pub(crate) rate_total: u64,
     pub(crate) rate_at: Instant,
     pub quit: bool,
+    /// Watching for a newer fss-mqtt in our place (not in tests).
+    pub upgrade: Option<crate::upgrade::Watch>,
+    /// Quit to restart into it (ctrl+n), continuing the session.
+    pub restart: bool,
 }
 
 impl App {
@@ -228,6 +232,8 @@ impl App {
             rate_total: store_total,
             rate_at: Instant::now(),
             quit: false,
+            upgrade: None,
+            restart: false,
         };
         app.refresh_panel();
         app.next_prompt();
@@ -305,6 +311,15 @@ impl App {
             && at.elapsed() > NOTICE_FOR
         {
             self.notice = None;
+        }
+        if let Some(w) = &mut self.upgrade
+            && w.check()
+            && let Some(note) = self.upgrade_note()
+        {
+            self.notify(
+                format!("{note} · ctrl+n restarts into it, continuing this session"),
+                false,
+            );
         }
         if self.config_checked.elapsed() >= CONFIG_EVERY {
             self.config_checked = Instant::now();
@@ -470,6 +485,16 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && k.code == KeyCode::Char('c') {
             self.quit = true;
+            return;
+        }
+        if ctrl && k.code == KeyCode::Char('n') {
+            match self.upgrade_note() {
+                Some(_) => {
+                    self.restart = true;
+                    self.quit = true;
+                }
+                None => self.notify("no newer fss-mqtt is installed", false),
+            }
             return;
         }
         if self.prompt.is_some() {
@@ -792,6 +817,18 @@ impl App {
                 format!("{name}: {left} of captured messages not written, the disk is too slow")
             })
             .collect()
+    }
+
+    /// What was installed in our place, if anything: "fss-mqtt 0.7.0 is installed".
+    pub fn upgrade_note(&self) -> Option<String> {
+        let v = self.upgrade.as_ref()?.installed()?;
+        Some(if v == env!("CARGO_PKG_VERSION") {
+            "fss-mqtt was rebuilt".into()
+        } else if v == "?" {
+            "fss-mqtt changed on disk".into()
+        } else {
+            format!("fss-mqtt {v} is installed")
+        })
     }
 
     // ── Sessions ───────────────────────────────────────────────────────────

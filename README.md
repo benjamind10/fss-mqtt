@@ -151,7 +151,8 @@ clears. Clearing keeps the tree open at the topic you were on.
 | tree, messages | `ctrl+t` / `ctrl+y` | copy the topic / the message (see [Clipboard](#clipboard)) |
 | full screen | `t` / `y` | copy the topic / what the view shows |
 | tree, messages | `ctrl+r` | capture this topic and everything below it to disk; again to stop |
-| anywhere | `ctrl+c` | quit |
+| anywhere | `ctrl+n` | when a newer fss-mqtt was installed meanwhile: restart into it, continuing the session |
+| anywhere | `ctrl+c` | quit (saving the session for `--resume`) |
 
 A green `•`/`▸` means the topic (or something under it) received a message in the last 1.5 s.
 
@@ -346,6 +347,12 @@ fss-mqtt                 # … quit: "Continue session: fss-mqtt --resume"
 brew upgrade fss-mqtt
 fss-mqtt --resume
 ```
+
+You don't even have to quit to upgrade: fss-mqtt notices when the fss-mqtt it was started as is
+replaced on disk (`brew upgrade`, `scoop update`, a new build) and says so in the header
+(`↑ 0.7.0 · ^n restart`). `ctrl+n` then saves the session and restarts into the new version with
+`--resume`, with the same command-line arguments. On Windows, where a program can't replace itself
+in place, it saves the session, quits and prints the command to continue.
 
 The session is one gzip-compressed [JSON Lines](https://jsonlines.org) file, readable by you only:
 `~/Library/Application Support/fss-mqtt/session.jsonl.gz` on macOS, `$XDG_STATE_HOME/fss-mqtt/`

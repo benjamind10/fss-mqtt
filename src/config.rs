@@ -129,7 +129,9 @@ fn upsert(text: &str, c: &ConnCfg) -> Result<String, String> {
     Ok(out)
 }
 
-fn render(c: &ConnCfg) -> String {
+/// The entry as a `[[connection]]` block (also kept in sessions for
+/// connections that aren't in the file).
+pub(crate) fn render(c: &ConnCfg) -> String {
     let mut s = String::from("[[connection]]\n");
     let mut kv = |k: &str, v: String| s.push_str(&format!("{k:<12} = {v}\n"));
     kv("name", quote(&c.name));

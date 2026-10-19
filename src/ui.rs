@@ -88,6 +88,14 @@ fn draw_all(f: &mut Frame, app: &App) {
 }
 
 fn status_dot<'a>(th: &Theme, c: &ConnInfo) -> Span<'a> {
+    if let Some(f) = &c.file {
+        let style = match (&f.err, f.done) {
+            (Some(_), _) => th.red,
+            (None, false) => th.yellow,
+            (None, true) => th.text,
+        };
+        return Span::styled(glyph::FILE, style);
+    }
     match (c.status.state, c.status.err.is_some()) {
         (ConnState::Connected, _) => Span::styled("●", th.green),
         (ConnState::Connecting, false) => Span::styled(glyph::CONNECTING, th.yellow),
@@ -97,6 +105,15 @@ fn status_dot<'a>(th: &Theme, c: &ConnInfo) -> Span<'a> {
 }
 
 fn status_text(c: &ConnInfo) -> String {
+    if let Some(f) = &c.file {
+        return match (&f.err, f.done) {
+            (Some(e), _) => format!("couldn't read · {e}"),
+            (None, false) if f.total > 0 => format!("reading {}%", f.read * 100 / f.total),
+            (None, false) => "reading…".into(),
+            (None, true) if f.skipped > 0 => format!("file · {} lines skipped", fmt::commas(f.skipped as u64)),
+            (None, true) => "file".into(),
+        };
+    }
     match (&c.status.state, &c.status.err) {
         (ConnState::Connected, _) => "connected".into(),
         (ConnState::Connecting, None) => "connecting…".into(),
@@ -155,7 +172,8 @@ fn panel_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
                 if let Some(u) = &ci.username {
                     left.push(Span::styled(format!("  {u}"), th.dim));
                 }
-                let state_style = match (ci.status.state, ci.status.err.is_some()) {
+                let failed = ci.status.err.is_some() || ci.file.as_ref().is_some_and(|f| f.err.is_some());
+                let state_style = match (ci.status.state, failed) {
                     (_, true) => th.red,
                     (ConnState::Connected, _) => th.green,
                     _ => th.dim,
@@ -185,7 +203,13 @@ fn panel_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
         lines.push(line);
     }
     let up = st.live().filter(|c| c.status.state == ConnState::Connected).count();
-    let title = format!("Connections {up}/{}", st.live().count());
+    let brokers = st.live().filter(|c| c.file.is_none()).count();
+    let files = st.live().count() - brokers;
+    let title = match files {
+        0 => format!("Connections {up}/{brokers}"),
+        1 => format!("Connections {up}/{brokers} · 1 file"),
+        n => format!("Connections {up}/{brokers} · {n} files"),
+    };
     draw_box(buf, r, &title, lines, focused, sel_line, th);
     // Where the connections live; edits to the file apply while running.
     border_label(buf, r, &crate::config::tilde(&app.config_path), th.faint);
@@ -330,12 +354,13 @@ fn header<'a>(app: &App, st: &Store) -> Line<'a> {
     let th = &app.th;
     let up = st.live().filter(|c| c.status.state == ConnState::Connected).count();
     let failing = st.live().filter(|c| c.status.err.is_some()).count();
+    let brokers = st.live().filter(|c| c.file.is_none()).count();
     let mut left = vec![
         Span::raw(" "),
         Span::styled(format!("{} fss-mqtt", glyph::LOGO), th.accent_b),
         Span::raw("  "),
         Span::styled(
-            format!("{up}/{} connected", st.live().count()),
+            format!("{up}/{brokers} connected"),
             if up > 0 { th.green } else { th.dim },
         ),
     ];
@@ -344,6 +369,10 @@ fn header<'a>(app: &App, st: &Store) -> Line<'a> {
     }
     if st.live().any(|c| c.capture.active()) {
         left.push(Span::styled("  ● capturing", th.red));
+    }
+    if let Some(v) = app.upgrade.as_ref().and_then(|w| w.offering()) {
+        let v = if v == env!("CARGO_PKG_VERSION") { "new build" } else { v };
+        left.push(Span::styled(format!("  ↑ {v} · ^n restart"), th.accent_b));
     }
     let right = vec![
         Span::styled(commas(st.topic_count() as u64), th.text),
@@ -686,6 +715,25 @@ fn conn_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> Vec<Line<'a>> {
     if let Some(u) = &c.username {
         out.push(Line::styled(format!("user {u}"), th.dim));
     }
+    if let Some(f) = &c.file {
+        out.push(Line::default());
+        out.push(Line::styled("Opened file", th.section));
+        out.push(Line::styled(format!("  {}", f.path.display()), th.text));
+        out.push(Line::styled(
+            format!(
+                "  {} · read once, nothing to connect to · ^e sends one to a broker",
+                msg_count(st.nodes[n].sub_msgs)
+            ),
+            th.dim,
+        ));
+        if let Some(e) = &f.first_skip {
+            out.push(Line::styled(
+                format!("  skipped {} lines; first: {e}", f.skipped),
+                th.yellow,
+            ));
+        }
+        return out;
+    }
     out.push(Line::default());
     out.push(Line::styled("Subscriptions", th.section));
     for s in &c.subs {
@@ -878,50 +926,39 @@ fn hints<'a>(app: &App) -> Line<'a> {
     // Ranks: the new actions stay longest; arrows are the first to go. (The
     // main screen's version sits on the input box, not on this line.)
     let room = (app.width as usize).saturating_sub(1);
-    if app.focus == Focus::Conns {
-        hint(
-            &app.th,
-            &[
-                ("↑↓", "move", 3),
-                (&format!("space {}", glyph::ENTER), "connect / on-off", 1),
-                ("tab", "pane", 2),
-                ("type", "filter", 2),
-                ("^c", "quit", 0),
-            ],
-            room,
-        )
-    } else if app.focus == Focus::Msgs {
-        hint(
-            &app.th,
-            &[
-                ("↑↓", "messages", 3),
-                (glyph::ENTER, "open", 2),
-                ("^e", "publish", 1),
-                ("^t ^y", "copy", 1),
-                ("^r", "capture", 1),
-                ("← esc", "back", 2),
-                ("tab", "pane", 2),
-                ("^c", "quit", 0),
-            ],
-            room,
-        )
-    } else {
-        hint(
-            &app.th,
-            &[
-                ("↑↓", "move", 3),
-                ("←→", "collapse/expand", 3),
-                (glyph::ENTER, "open", 2),
-                ("^e", "publish", 1),
-                ("^t ^y", "copy", 1),
-                ("^r", "capture", 1),
-                ("esc", "clear filter", 2),
-                ("tab", "pane", 2),
-                ("^c", "quit", 0),
-            ],
-            room,
-        )
+    let space = format!("space {}", glyph::ENTER);
+    let mut keys: Vec<(&str, &str, u8)> = match app.focus {
+        Focus::Conns => vec![
+            ("↑↓", "move", 3),
+            (&space, "connect / on-off", 1),
+            ("tab", "pane", 2),
+            ("type", "filter", 2),
+        ],
+        Focus::Msgs => vec![
+            ("↑↓", "messages", 3),
+            (glyph::ENTER, "open", 2),
+            ("^e", "publish", 1),
+            ("^t ^y", "copy", 1),
+            ("^r", "capture", 1),
+            ("← esc", "back", 2),
+            ("tab", "pane", 2),
+        ],
+        Focus::Tree => vec![
+            ("↑↓", "move", 3),
+            ("←→", "collapse/expand", 3),
+            (glyph::ENTER, "open", 2),
+            ("^e", "publish", 1),
+            ("^t ^y", "copy", 1),
+            ("^r", "capture", 1),
+            ("esc", "clear filter", 2),
+            ("tab", "pane", 2),
+        ],
+    };
+    if app.upgrade.as_ref().is_some_and(|w| w.offering().is_some()) {
+        keys.push(("^n", "restart", 0));
     }
+    keys.push(("^c", "quit", 0));
+    hint(&app.th, &keys, room)
 }
 
 fn viewer(buf: &mut Buffer, area: Rect, app: &App) {
@@ -1080,6 +1117,12 @@ mod tests {
     /// Two connections: "local" (connected, with data) and "staging"
     /// (disconnected, needs a password). Returns the receivers of their commands.
     fn sample(config_path: PathBuf) -> (App, Vec<Receiver<Cmd>>) {
+        app_with(sample_store(), config_path)
+    }
+
+    /// local (connected, with messages) and staging (needs a password and
+    /// a key passphrase).
+    fn sample_store() -> Store {
         let mut st = Store::new(10, 64 * 1024);
         let local = st.add_conn("local", "mqtts://127.0.0.1:8883", None, vec![sub("v1/#"), sub("v2/#")]);
         let staging = st.add_conn(
@@ -1162,6 +1205,10 @@ mod tests {
             decoded,
         );
 
+        st
+    }
+
+    fn app_with(st: Store, config_path: PathBuf) -> (App, Vec<Receiver<Cmd>>) {
         let mut rxs = Vec::new();
         let mut ctls = Vec::new();
         for (name, user, topics) in [
@@ -2059,6 +2106,225 @@ mod tests {
         let _ = std::fs::remove_file(&cfg);
         let _ = std::fs::remove_file(&blocker);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_opened_file_is_browsed_and_sent_on_to_a_broker() {
+        let (mut app, rx) = sample(tmp_config("open"));
+        // A capture file, as the capture writer makes it.
+        let path = std::env::temp_dir().join(format!("fss-mqtt-test-{}-open.jsonl", std::process::id()));
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let props = Props {
+            content_type: Some("application/json".into()),
+            ..Props::default()
+        };
+        let text: String = (0..3)
+            .map(|i| {
+                crate::capture::encode(
+                    t,
+                    "plant/line9/temp",
+                    format!("{{\"t\":{i}}}").as_bytes(),
+                    1,
+                    false,
+                    &props,
+                )
+            })
+            .collect();
+        std::fs::write(&path, text).unwrap();
+        let idx = {
+            let mut st = app.store.lock().unwrap();
+            let i = st.add_conn("open.jsonl", "file ~/open.jsonl", None, vec![]);
+            st.conns[i].file = Some(crate::store::FileSource {
+                path: path.clone(),
+                ..Default::default()
+            });
+            i
+        };
+        app.ctls.push(ConnCtl {
+            cfg: ConnCfg {
+                name: "open.jsonl".into(),
+                ..Default::default()
+            },
+            saved: false,
+            tx: mpsc::channel().0,
+            password: None,
+            key_password: None,
+        });
+        app.refresh_panel();
+        crate::session::open(path.clone(), app.store.clone(), idx)
+            .join()
+            .unwrap();
+        app.tick();
+        let v = frame(&app, "opened file");
+        assert!(
+            v.contains(&format!("{} open.jsonl", glyph::FILE)) && v.contains("file ~/open.jsonl"),
+            "{v}"
+        );
+        assert!(
+            v.contains("Connections 1/2 · 1 file") && v.contains("1/2 connected"),
+            "{v}"
+        );
+        assert!(v.contains("opened open.jsonl: 3 messages"), "{v}");
+
+        // Its topic: browsed like any other, an hour old.
+        typ(&mut app, "plant/line9/temp");
+        press(&mut app, &[KeyCode::Down]);
+        let v = frame(&app, "file topic");
+        assert!(v.contains("3 msgs · last 1h ago · qos 1"), "{v}");
+        // Capture doesn't apply; space on it in the panel connects nothing.
+        app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(
+            app.notice
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("is a file: capture works on messages as they arrive")
+        );
+        app.toggle_conn(idx);
+        assert!(app.notice.as_ref().unwrap().0.contains("is a file: it was read once"));
+
+        // ctrl+e sends it on to a broker: the connected one.
+        app.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        let text = app.composer.as_ref().unwrap().ed.text();
+        assert!(
+            text.contains("connection: local\n") && text.contains("topic: plant/line9/temp\n"),
+            "{text}"
+        );
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(matches!(rx[0].try_recv(), Ok(Cmd::Publish(o)) if o.payload == br#"{"t":2}"#));
+        // Naming the file as the connection is refused, with the brokers to pick from.
+        app.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        let c = app.composer.as_mut().unwrap();
+        let doc = c.ed.text().replace("connection: local", "connection: open.jsonl");
+        *c = crate::composer::Composer::restored(&doc, None);
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let err = app.composer.as_ref().unwrap().error.clone().unwrap_or_default();
+        assert!(
+            err.contains("open.jsonl is a file; send to a broker: local, staging"),
+            "{err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_session_comes_back_as_it_was() {
+        let cfg = tmp_config("resume");
+        let (mut app, _rx) = sample(cfg.clone());
+        // Filtered, in the message list on an older message, a draft open.
+        typ(&mut app, "v1/+/line1/temp");
+        press(&mut app, &[KeyCode::Right, KeyCode::Down]);
+        app.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        typ(&mut app, "draft!");
+        let view = app.session_view();
+        assert_eq!(
+            (view.filter.as_str(), view.focus.as_str()),
+            ("v1/+/line1/temp", "messages")
+        );
+        assert_eq!(view.selected, Some(("local".into(), "v1/plant/line1/temp".into())));
+        assert!(view.draft.as_ref().unwrap().0.contains("draft!"));
+        let conns = app.session_conns();
+        let up: Vec<_> = conns
+            .iter()
+            .map(|c| (c.name.as_str(), c.connected, c.config.is_some()))
+            .collect();
+        assert_eq!(
+            up,
+            [("local", true, false), ("staging", false, false)],
+            "saved entries aren't copied"
+        );
+        let path = std::env::temp_dir().join(format!("fss-mqtt-test-{}-resume.jsonl.gz", std::process::id()));
+        let saved = crate::session::save(&path, &view, &conns, &app.store.lock().unwrap()).unwrap();
+        assert_eq!(saved as u64, app.store.lock().unwrap().total());
+
+        // A new run with the same connections replays it.
+        let mut st = Store::new(10, 64 * 1024);
+        st.add_conn("local", "mqtts://127.0.0.1:8883", None, vec![sub("v1/#"), sub("v2/#")]);
+        st.add_conn(
+            "staging",
+            "mqtt://staging:1883",
+            Some("backend".into()),
+            vec![sub("devices/+/up/#")],
+        );
+        let (mut back, _rx2) = app_with(st, cfg.clone());
+        let l = crate::session::load(&path).unwrap();
+        for r in l.records {
+            let i = ["local", "staging"]
+                .iter()
+                .position(|n| Some(*n) == r.conn.as_deref())
+                .unwrap();
+            crate::session::restore(&back.store, i, r);
+        }
+        back.restore_view(&l.header.view);
+        back.tick();
+        assert_eq!(back.session_view(), view);
+        // Times are kept to the millisecond.
+        let msgs = |a: &App| -> Vec<(usize, String, Vec<u8>, usize, u8, u128)> {
+            let st = a.store.lock().unwrap();
+            st.all_messages()
+                .into_iter()
+                .map(|(c, t, m)| {
+                    let ms = m.time.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+                    (c, t.to_string(), m.payload.clone(), m.size, m.qos, ms)
+                })
+                .collect()
+        };
+        assert!(msgs(&back) == msgs(&app), "same messages, same arrival times");
+        // The decoded Parquet view (kept whole on arrival) is there again.
+        let pq = |a: &App| {
+            let st = a.store.lock().unwrap();
+            let n = st.find(0, "v2/turbine/T01/fastlog").unwrap();
+            st.nodes[n]
+                .latest()
+                .unwrap()
+                .decoded
+                .as_ref()
+                .map(|d| (d.format, d.sections.len()))
+        };
+        assert_eq!(pq(&back), pq(&app));
+        assert_eq!(
+            back.composer.as_ref().unwrap().ed.text(),
+            app.composer.as_ref().unwrap().ed.text()
+        );
+        // No message rate from the restored messages.
+        back.rate_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        back.tick();
+        assert_eq!(back.rate, 0.0);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&cfg);
+    }
+
+    #[test]
+    fn ctrl_n_restarts_into_a_newer_version() {
+        let (mut app, _rx) = sample(tmp_config("restart"));
+        let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        app.key(ctrl_n);
+        assert!(!app.quit && app.notice.as_ref().unwrap().0 == "no newer fss-mqtt is installed");
+        assert!(!frame(&app, "nothing new").contains("^n"));
+
+        app.notice = None;
+        let bin = std::env::temp_dir().join(format!("fss-mqtt-test-{}-ctrl-n", std::process::id()));
+        std::fs::write(&bin, "v9").unwrap();
+        app.upgrade = Some(crate::upgrade::Watch::found(bin.clone(), "9.9.9"));
+        assert_eq!(app.upgrade_note().as_deref(), Some("fss-mqtt 9.9.9 is installed"));
+        let v = frame(&app, "newer installed");
+        assert!(
+            v.contains("↑ 9.9.9 · ^n restart") && v.contains("^n restart · ^c quit"),
+            "{v}"
+        );
+        // Changing again since it said its version: not now.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&bin, "v10, being written").unwrap();
+        app.key(ctrl_n);
+        assert!(!app.quit && app.notice.as_ref().unwrap().0.contains("changing on disk"));
+        app.upgrade = Some(crate::upgrade::Watch::found(bin.clone(), "9.9.9"));
+        app.key(ctrl_n);
+        assert!(app.restart && app.quit);
+
+        // The same version rebuilt says so.
+        app.upgrade = Some(crate::upgrade::Watch::found(bin.clone(), env!("CARGO_PKG_VERSION")));
+        assert_eq!(app.upgrade_note().as_deref(), Some("fss-mqtt was rebuilt"));
+        assert!(frame(&app, "rebuilt").contains("↑ new build · ^n restart"));
+        let _ = std::fs::remove_file(&bin);
     }
 
     #[test]

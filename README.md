@@ -151,7 +151,8 @@ clears. Clearing keeps the tree open at the topic you were on.
 | tree, messages | `ctrl+t` / `ctrl+y` | copy the topic / the message (see [Clipboard](#clipboard)) |
 | full screen | `t` / `y` | copy the topic / what the view shows |
 | tree, messages | `ctrl+r` | capture this topic and everything below it to disk; again to stop |
-| anywhere | `ctrl+c` | quit |
+| anywhere | `ctrl+n` | when a newer fss-mqtt was installed meanwhile: restart into it, continuing the session |
+| anywhere | `ctrl+c` | quit (saving the session for `--resume`) |
 
 A green `•`/`▸` means the topic (or something under it) received a message in the last 1.5 s.
 
@@ -266,7 +267,8 @@ like one of these formats but can't be read, the reason is shown above a hex dum
 
 ## Capture to disk
 
-Nothing is written to disk unless you ask for it, per topic. `ctrl+r` on a topic in the tree or the
+Messages are captured only when you ask for it, per topic (apart from the session saved when you
+quit, see [Sessions](#sessions)). `ctrl+r` on a topic in the tree or the
 message list captures that topic and everything below it (`topic/#`; on a connection's row, all of
 it), and `ctrl+r` again stops. A topic inside a subtree that's already captured says so rather than
 getting a rule of its own. The rules are listed in the connections panel, where `space` turns one off
@@ -301,6 +303,64 @@ One message per line ([JSON Lines](https://jsonlines.org)):
 # T01's power readings, one number per line
 jq -r 'select(.topic | endswith("T01/telemetry")) | .payload | fromjson | .power_kw' fss-mqtt-oslo-*.jsonl
 ```
+
+### Opening a capture
+
+```sh
+fss-mqtt --open fss-mqtt-oslo-20261015-102030.jsonl            # browse it offline
+fss-mqtt --open fss-mqtt-oslo-20261015-102030.jsonl -c staging # …and send messages on to staging
+```
+
+`--open` (repeatable) reads a capture file, plain or gzip-compressed (`.jsonl.gz`), into the tree
+under a connection named after the file (`≡` in the panel), as if its messages were arriving: the
+last 10 per topic are kept, binary formats are decoded, Sparkplug B names come from its births, and
+each message keeps the time it arrived. Large files load in the background, with the progress in
+the panel; lines that can't be read are skipped and counted. A file never connects: saved
+connections stay disconnected unless you name them (`-c`) or give a broker, and `ctrl+e` on a
+message from the file opens it to send to one of those (a connected one is filled in).
+
+## Sessions
+
+When you quit, fss-mqtt saves the session and tells you how to continue it:
+
+```
+$ fss-mqtt
+…
+Continue session: fss-mqtt --resume
+```
+
+`fss-mqtt --resume` brings back the messages it held (the last 10 per topic, as kept), the
+connections that were open (a `--no-save` broker included, never its password) and where you were:
+the filter, the expanded topics, the selected one, the pane, and an unsent publish draft.
+Connections that were connected connect again, asking for passwords as usual, and new messages
+arrive on top. Without `--resume` it starts fresh, as always; the session stays until the next quit
+that received something from a broker (only browsing files with `--open` leaves it as it was).
+
+Restored messages come back through the same decoders as arriving ones, so a format a newer version
+added shows on messages saved before it; views decoded from payloads that were cut on arrival
+(`--max-payload`) and Sparkplug B views are kept as they were, as are the names Sparkplug births
+gave to aliases, so data arriving after `--resume` is still named. Each message keeps the time it
+arrived (to the millisecond). Typical use, across an upgrade:
+
+```sh
+fss-mqtt                 # … quit: "Continue session: fss-mqtt --resume"
+brew upgrade fss-mqtt
+fss-mqtt --resume
+```
+
+You don't even have to quit to upgrade: fss-mqtt notices when the fss-mqtt it was started as is
+replaced on disk (`brew upgrade`, `scoop update`, a new build) and says so in the header
+(`↑ 0.7.0 · ^n restart`). `ctrl+n` then saves the session and restarts into the new version with
+`--resume`, with the same command-line arguments. On Windows, where a program can't replace itself
+in place, it saves the session, quits and prints the command to continue.
+
+The session is one gzip-compressed [JSON Lines](https://jsonlines.org) file, readable by you only:
+`~/Library/Application Support/fss-mqtt/session.jsonl.gz` on macOS, `$XDG_STATE_HOME/fss-mqtt/`
+(`~/.local/state/fss-mqtt/`) on Linux, `%LOCALAPPDATA%\fss-mqtt\` on Windows. Its lines are capture
+lines with the connection added, under one header line; `--open` reads it too. A session saved by a
+newer fss-mqtt, in a newer format, is refused with a message rather than misread; a damaged one is
+continued as far as it can be read, and the status line says so. `--no-session`
+(or `FSS_MQTT_SESSION=off`) never writes one, for machines where payloads must not touch the disk.
 
 ## Performance notes
 

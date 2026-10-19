@@ -175,6 +175,10 @@ pub struct App {
     pub(crate) rate_total: u64,
     pub(crate) rate_at: Instant,
     pub quit: bool,
+    /// Watching for a newer fss-mqtt in our place (not in tests).
+    pub upgrade: Option<crate::upgrade::Watch>,
+    /// Quit to restart into it (ctrl+n), continuing the session.
+    pub restart: bool,
 }
 
 impl App {
@@ -189,6 +193,7 @@ impl App {
     ) -> App {
         // Connections start expanded so their top-level topics show.
         let expanded: HashSet<usize> = store.lock().unwrap().conns.iter().map(|c| c.node).collect();
+        let store_total = store.lock().unwrap().received;
         let mut app = App {
             store,
             opts,
@@ -223,9 +228,12 @@ impl App {
             clipboard: clipboard::Sink::default(),
             composer: None,
             rate: 0.0,
-            rate_total: 0,
+            // The rate counts what arrives from now on.
+            rate_total: store_total,
             rate_at: Instant::now(),
             quit: false,
+            upgrade: None,
+            restart: false,
         };
         app.refresh_panel();
         app.next_prompt();
@@ -286,7 +294,7 @@ impl App {
             if st.struct_ver != self.struct_ver {
                 self.need_rebuild = true;
             }
-            (st.total(), st.take_notices())
+            (st.received, st.take_notices())
         };
         // The last one shows; an error isn't hidden by a later success.
         let last_err = notices.iter().rposition(|(_, err)| *err);
@@ -304,6 +312,15 @@ impl App {
         {
             self.notice = None;
         }
+        if let Some(w) = &mut self.upgrade
+            && w.check()
+            && let Some(note) = self.upgrade_note()
+        {
+            self.notify(
+                format!("{note} · ctrl+n restarts into it, continuing this session"),
+                false,
+            );
+        }
         if self.config_checked.elapsed() >= CONFIG_EVERY {
             self.config_checked = Instant::now();
             self.check_config();
@@ -311,7 +328,7 @@ impl App {
         self.rebuild(false);
     }
 
-    fn refresh_panel(&mut self) {
+    pub(crate) fn refresh_panel(&mut self) {
         let st = self.store.lock().unwrap();
         self.panel.clear();
         for (i, c) in st.conns.iter().enumerate().filter(|(_, c)| !c.removed) {
@@ -470,6 +487,17 @@ impl App {
             self.quit = true;
             return;
         }
+        if ctrl && k.code == KeyCode::Char('n') {
+            match (self.upgrade_note(), self.upgrade.as_ref().is_some_and(|w| w.ready())) {
+                (Some(_), true) => {
+                    self.restart = true;
+                    self.quit = true;
+                }
+                (Some(_), false) => self.notify("fss-mqtt is changing on disk; try again in a moment", false),
+                (None, _) => self.notify("no newer fss-mqtt is installed", false),
+            }
+            return;
+        }
         if self.prompt.is_some() {
             self.prompt_key(k);
             return;
@@ -616,6 +644,12 @@ impl App {
     }
 
     pub fn toggle_conn(&mut self, i: usize) {
+        if let Some(name) = self.file_name(i) {
+            return self.notify(
+                format!("{name} is a file: it was read once, there's nothing to connect"),
+                false,
+            );
+        }
         let state = self.store.lock().unwrap().conns[i].status.state;
         if state == ConnState::Disconnected {
             self.connect_or_ask(i);
@@ -677,6 +711,12 @@ impl App {
             let st = self.store.lock().unwrap();
             (st.nodes[n].conn, st.nodes[n].path.clone())
         };
+        if let Some(name) = self.file_name(i) {
+            return self.notify(
+                format!("{name} is a file: capture works on messages as they arrive"),
+                false,
+            );
+        }
         self.check_config(); // apply pending edits before saving over them
         if self.is_removed(i) {
             return;
@@ -780,6 +820,96 @@ impl App {
             .collect()
     }
 
+    /// What was installed in our place, if anything: "fss-mqtt 0.7.0 is installed".
+    pub fn upgrade_note(&self) -> Option<String> {
+        let v = self.upgrade.as_ref()?.installed()?;
+        Some(if v == env!("CARGO_PKG_VERSION") {
+            "fss-mqtt was rebuilt".into()
+        } else {
+            format!("fss-mqtt {v} is installed")
+        })
+    }
+
+    // ── Sessions ───────────────────────────────────────────────────────────
+
+    /// The view, to save with the session.
+    pub fn session_view(&self) -> crate::session::View {
+        let st = self.store.lock().unwrap();
+        let key = |n: usize| {
+            let node = &st.nodes[n];
+            let c = &st.conns[node.conn];
+            (!c.removed).then(|| (c.name.clone(), node.path.clone()))
+        };
+        let mut expanded: Vec<(String, String)> = self.expanded.iter().filter_map(|&n| key(n)).collect();
+        expanded.sort();
+        crate::session::View {
+            filter: self.filter_text.clone(),
+            expanded,
+            selected: self.selected.and_then(key),
+            focus: match self.focus {
+                Focus::Conns => "connections",
+                Focus::Tree => "tree",
+                Focus::Msgs => "messages",
+            }
+            .into(),
+            draft: self.composer.as_ref().map(Composer::save_state),
+        }
+    }
+
+    /// The connections, to save with the session: whether each was in use,
+    /// and the entries that aren't in the connections file.
+    pub fn session_conns(&self) -> Vec<crate::session::Conn> {
+        let st = self.store.lock().unwrap();
+        (0..st.conns.len())
+            .filter(|&i| !st.conns[i].removed)
+            .map(|i| {
+                let c = &st.conns[i];
+                let file = c.file.as_ref().map(|f| f.path.clone());
+                crate::session::Conn {
+                    name: c.name.clone(),
+                    url: c.url.clone(),
+                    connected: file.is_none() && c.status.state != ConnState::Disconnected,
+                    config: (!self.ctls[i].saved && file.is_none()).then(|| config::render(&self.ctls[i].cfg)),
+                    file,
+                }
+            })
+            .collect()
+    }
+
+    /// Brings back the view saved with a session (after its messages).
+    pub fn restore_view(&mut self, v: &crate::session::View) {
+        let (expanded, selected, has_msgs) = {
+            let st = self.store.lock().unwrap();
+            let node = |(c, p): &(String, String)| {
+                let i = st.conns.iter().position(|x| &x.name == c && !x.removed)?;
+                st.find(i, p)
+            };
+            let selected = v.selected.as_ref().and_then(node);
+            let has_msgs = selected.is_some_and(|n| st.nodes[n].has_messages());
+            (v.expanded.iter().filter_map(node).collect(), selected, has_msgs)
+        };
+        self.expanded = expanded;
+        self.need_rebuild = true;
+        if !v.filter.is_empty() {
+            self.set_filter(v.filter.clone());
+        }
+        if let Some(n) = selected {
+            self.selected = Some(n);
+            self.need_rebuild = true;
+            self.rebuild(false);
+        }
+        self.focus = match v.focus.as_str() {
+            "messages" if has_msgs && self.selected == selected => Focus::Msgs,
+            "connections" => Focus::Conns,
+            _ => Focus::Tree,
+        };
+        if let Some((text, guard)) = &v.draft {
+            let mut c = Composer::restored(text, guard.clone());
+            c.fit(self.width, self.height);
+            self.composer = Some(c);
+        }
+    }
+
     // ── Live reload of the connections file ────────────────────────────────
 
     /// Re-reads the connections file if it changed since we last read it.
@@ -839,6 +969,13 @@ impl App {
             self.notify(format!("connections reloaded: {}", parts.join(", ")), false);
         }
         self.next_prompt();
+    }
+
+    /// The name of connection `i` when it is a file opened with `--open`.
+    pub fn file_name(&self, i: usize) -> Option<String> {
+        let st = self.store.lock().unwrap();
+        let c = st.conns.get(i)?;
+        c.file.as_ref().map(|_| c.name.clone())
     }
 
     fn conn_named(&self, name: &str) -> Option<usize> {
@@ -949,9 +1086,7 @@ impl App {
         ctl.tx = mpsc::channel().0; // dropping the old sender ends the thread
         ctl.saved = false;
         let mut st = self.store.lock().unwrap();
-        // Its messages leave the total; keep the rate's baseline in step.
-        let msgs = st.remove_conn(i);
-        self.rate_total = self.rate_total.saturating_sub(msgs);
+        st.remove_conn(i); // the rate counts arrivals, so it isn't affected
         self.expanded.remove(&st.conns[i].node);
         if self.selected.is_some_and(|n| st.nodes[n].conn == i) {
             self.selected = None;
@@ -1168,7 +1303,16 @@ impl App {
         let node = msg.as_ref().map(|(n, _)| *n).or(self.focused_node());
         let mut c = {
             let st = self.store.lock().unwrap();
-            let conn_of = |n: usize| st.conns[st.nodes[n].conn].name.clone();
+            // A message from a file goes to a broker: a connected one if any.
+            let broker = || {
+                let brokers = || st.live().filter(|c| c.file.is_none());
+                let up = brokers().find(|c| c.status.state == ConnState::Connected);
+                up.or(brokers().next()).map_or(String::new(), |c| c.name.clone())
+            };
+            let conn_of = |n: usize| {
+                let c = &st.conns[st.nodes[n].conn];
+                if c.file.is_some() { broker() } else { c.name.clone() }
+            };
             match (&msg, node) {
                 (Some((n, m)), _) => Composer::republish(&conn_of(*n), &st.nodes[*n].path, m),
                 (None, Some(n)) => Composer::new_message(&conn_of(n), &st.nodes[n].path),
@@ -1202,15 +1346,27 @@ impl App {
     fn publish_draft(&mut self) {
         let Some(c) = &mut self.composer else { return };
         let Some(d) = c.draft() else { return };
-        let (target, names) = {
+        let (target, names, brokers) = {
             let st = self.store.lock().unwrap();
             let live: Vec<usize> = (0..st.conns.len()).filter(|&i| !st.conns[i].removed).collect();
             let target = live.iter().copied().find(|&i| st.conns[i].name == d.conn);
             let names: Vec<String> = live.iter().map(|&i| st.conns[i].name.clone()).collect();
-            (target.map(|i| (i, st.conns[i].status.state)), names)
+            let brokers: Vec<String> = live
+                .iter()
+                .filter(|&&i| st.conns[i].file.is_none())
+                .map(|&i| st.conns[i].name.clone())
+                .collect();
+            let target = target.map(|i| (i, st.conns[i].status.state, st.conns[i].file.is_some()));
+            (target, names, brokers)
         };
         let i = match target {
-            Some((i, ConnState::Connected)) => i,
+            Some((_, _, true)) => {
+                return c.fail_at(
+                    "connection",
+                    format!("{} is a file; send to a broker: {}", d.conn, brokers.join(", ")),
+                );
+            }
+            Some((i, ConnState::Connected, _)) => i,
             Some(_) => {
                 return c.fail_at(
                     "connection",

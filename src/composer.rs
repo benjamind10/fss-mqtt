@@ -769,6 +769,22 @@ impl Composer {
         c
     }
 
+    /// A document saved unsent (with a session), and the payload it may not
+    /// send unchanged with the reason (cut on arrival).
+    pub fn restored(text: &str, guard: Option<(String, String)>) -> Composer {
+        let mut c = Composer::with("Publish · draft from the last session".into(), text);
+        c.guard = guard;
+        if c.guard.is_some() {
+            c.warning = Some("this draft's payload was cut on arrival, so it can't be sent unchanged".into());
+        }
+        c
+    }
+
+    /// The document, and its guard (see `restored`), to save unsent.
+    pub fn save_state(&self) -> (String, Option<(String, String)>) {
+        (self.ed.text(), self.guard.clone())
+    }
+
     /// A new, empty message for `topic` on `conn`.
     pub fn new_message(conn: &str, topic: &str) -> Composer {
         let d = Draft {

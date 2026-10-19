@@ -180,6 +180,12 @@ impl Topic<'_> {
     }
 }
 
+/// Whether `topic` carries Sparkplug B payloads (decoded with the names
+/// from births, so a session keeps their views as they were).
+pub fn is_topic(topic: &str) -> bool {
+    parse_topic(topic).is_some()
+}
+
 /// `spBv1.0/{group}/{type}/{edge node}[/{device}]` with a message type whose
 /// payload is Sparkplug protobuf; `STATE` (JSON or text) and anything else is
 /// `None`.
@@ -236,6 +242,80 @@ impl Default for Aliases {
 }
 
 impl Aliases {
+    /// The names learned, as a JSON object, kept in sessions: births'
+    /// payloads are often cut on arrival, so they can't be read again.
+    pub fn write_json(&self, out: &mut String) {
+        use crate::json::write_str;
+        let mut keys: Vec<&String> = self.births.keys().collect();
+        keys.sort();
+        out.push('{');
+        for (i, k) in keys.into_iter().enumerate() {
+            let b = &self.births[k];
+            if i > 0 {
+                out.push(',');
+            }
+            write_str(out, k);
+            out.push_str(":{\"names\":[");
+            let mut names: Vec<_> = b.names.iter().collect();
+            names.sort_by_key(|(a, _)| **a);
+            for (j, (a, (name, dt))) in names.into_iter().enumerate() {
+                out.push_str(&format!("{}[\"{a}\",", if j > 0 { "," } else { "" }));
+                write_str(out, name);
+                out.push_str(&match dt {
+                    Some(d) => format!(",{d}]"),
+                    None => ",null]".into(),
+                });
+            }
+            out.push_str("],\"types\":[");
+            let mut types: Vec<_> = b.types.iter().collect();
+            types.sort();
+            for (j, (name, dt)) in types.into_iter().enumerate() {
+                out.push_str(if j > 0 { ",[" } else { "[" });
+                write_str(out, name);
+                out.push_str(&format!(",{dt}]"));
+            }
+            out.push_str(&format!("],\"count\":{},\"truncated\":{}}}", b.count, b.truncated));
+        }
+        out.push('}');
+    }
+
+    /// Reads what `write_json` wrote; anything that doesn't fit is skipped.
+    pub fn from_json(j: &crate::json::Json) -> Aliases {
+        use crate::json::Json;
+        let mut a = Aliases::default();
+        let Json::Obj(births) = j else { return a };
+        for (key, b) in births {
+            let mut birth = Birth::default();
+            for n in b.get("names").and_then(Json::arr).unwrap_or_default() {
+                if let Some([alias, name, dt]) = n.arr()
+                    && let (Some(alias), Some(name)) = (alias.str().and_then(|s| s.parse().ok()), name.str())
+                {
+                    let dt = dt.u64().map(|d| d.min(u32::MAX as u64) as u32);
+                    birth.names.insert(alias, (name.to_string(), dt));
+                }
+            }
+            for t in b.get("types").and_then(Json::arr).unwrap_or_default() {
+                if let Some([name, dt]) = t.arr()
+                    && let (Some(name), Some(dt)) = (name.str(), dt.u64())
+                {
+                    birth.types.insert(name.to_string(), dt.min(u32::MAX as u64) as u32);
+                }
+            }
+            let least = birth.names.len().max(birth.types.len());
+            birth.count = b
+                .get("count")
+                .and_then(Json::u64)
+                .map_or(least, |c| (c as usize).max(least));
+            birth.truncated = b.get("truncated").and_then(Json::bool).unwrap_or(false);
+            if a.size + birth.count > a.limit {
+                continue;
+            }
+            a.size += birth.count;
+            a.births.insert(key.clone(), birth);
+        }
+        a
+    }
+
     /// The view of a Sparkplug B message on `topic`, or `None` if `topic`
     /// isn't one (it's left to the generic decoders). A birth updates the
     /// aliases first.

@@ -75,6 +75,13 @@ pub struct Header {
     pub sparkplug: Vec<(String, Json)>,
 }
 
+/// Whether quitting should save the session: when there's something, and
+/// it came from a broker or a resumed session (`always`), so that only
+/// browsing files with --open doesn't replace the last real session.
+pub fn worth_saving(total: u64, received: u64, always: bool) -> bool {
+    total > 0 && (always || received > 0)
+}
+
 /// Writes the session: `store`'s messages, oldest first, under a header.
 /// Written to a temporary file first, so a failure leaves the last one.
 /// Returns how many messages were saved.
@@ -210,9 +217,12 @@ pub struct Loaded {
     /// Lines that couldn't be read, and the first reason.
     pub skipped: usize,
     pub first_skip: Option<String>,
+    /// Why reading stopped early (a damaged or cut file): the messages
+    /// before that are kept.
+    pub damaged: Option<String>,
 }
 
-/// Reads a session saved by `save`.
+/// Reads a session saved by `save`; only its header must be intact.
 pub fn load(path: &Path) -> Result<Loaded, String> {
     let mut lines = open_lines(path)?.lines;
     let mut first = Vec::new();
@@ -225,15 +235,16 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
         records: Vec::new(),
         skipped: 0,
         first_skip: None,
+        damaged: None,
     };
-    for_each_record(&mut lines, 1, |r| match r {
+    let res = for_each_record(&mut lines, 1, |r| match r {
         Ok(r) => loaded.records.push(r),
         Err(e) => {
             loaded.skipped += 1;
             loaded.first_skip.get_or_insert(e);
         }
-    })
-    .map_err(|e| format!("{}: {e}", path.display()))?;
+    });
+    loaded.damaged = res.err();
     Ok(loaded)
 }
 
@@ -538,6 +549,49 @@ mod tests {
         let big = &l.records[2];
         assert_eq!((big.payload.len(), big.size), (64, 100));
         assert_eq!(big.decoded.as_ref().unwrap().notes, ["decoded whole"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn browsing_files_keeps_the_last_session() {
+        assert!(!worth_saving(0, 0, true), "nothing at all");
+        assert!(!worth_saving(500, 0, false), "only opened files");
+        assert!(worth_saving(500, 3, false), "a broker sent something");
+        assert!(worth_saving(500, 0, true), "a resumed session, or a restart");
+    }
+
+    #[test]
+    fn a_cut_session_keeps_what_came_before() {
+        let mut st = store_with(&["a"]);
+        for i in 0..2000 {
+            st.add_decoded(
+                0,
+                &format!("t/{}", i % 50),
+                format!("{{\"i\":{i}}}").as_bytes(),
+                0,
+                false,
+                Props::default(),
+                None,
+            );
+        }
+        let path = tmp("cut.jsonl.gz");
+        let conns = [Conn {
+            name: "a".into(),
+            url: "u".into(),
+            connected: false,
+            config: None,
+            file: None,
+        }];
+        save(&path, &View::default(), &conns, &st).unwrap();
+        let whole = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &whole[..whole.len() * 2 / 3]).unwrap();
+        let l = load(&path).unwrap();
+        assert!(l.damaged.unwrap().contains("ends early"));
+        assert!(!l.records.is_empty() && l.records.len() < 500, "{}", l.records.len());
+        assert_eq!(l.header.conns, conns, "the header is intact");
+        // A damaged header is still refused.
+        std::fs::write(&path, &whole[..20]).unwrap();
+        assert!(load(&path).is_err());
         let _ = std::fs::remove_file(&path);
     }
 

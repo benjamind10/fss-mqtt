@@ -26,11 +26,14 @@ pub struct Watch {
     pub path: PathBuf,
     stamp: Option<Stamp>,
     checked: Instant,
-    /// The version found by the last probe, filled in from its thread.
-    probe: Arc<Mutex<Option<String>>>,
+    /// The last probe's answer, filled in by its thread: the version, or
+    /// `None` when the binary couldn't say (being written, say).
+    probe: Arc<Mutex<Option<Option<String>>>>,
     probing: bool,
-    /// The version installed now, once it differs from what's running.
+    /// The version installed now, once it differs from what's running,
+    /// and the file as it was when it said so.
     installed: Option<String>,
+    probed: Option<Stamp>,
 }
 
 impl Watch {
@@ -47,6 +50,7 @@ impl Watch {
             probe: Arc::default(),
             probing: false,
             installed: None,
+            probed: None,
         }
     }
 
@@ -55,6 +59,7 @@ impl Watch {
     pub fn found(path: PathBuf, version: &str) -> Watch {
         let mut w = Watch::at(path);
         w.installed = Some(version.into());
+        w.probed = w.stamp.clone();
         w
     }
 
@@ -67,12 +72,16 @@ impl Watch {
     /// Looks again (every few seconds); true when a change was just found.
     pub fn check(&mut self) -> bool {
         if self.probing {
-            let Some(v) = self.probe.lock().unwrap().take() else {
+            let Some(answer) = self.probe.lock().unwrap().take() else {
                 return false;
             };
             self.probing = false;
+            // No answer: not a working binary (yet); the next change to the
+            // file is looked at again.
+            let Some(v) = answer else { return false };
             let fresh = self.installed.as_deref() != Some(&v);
             self.installed = Some(v);
+            self.probed = self.stamp.clone();
             return fresh;
         }
         if self.checked.elapsed() < CHECK_EVERY {
@@ -88,10 +97,16 @@ impl Watch {
         let (path, slot) = (self.path.clone(), self.probe.clone());
         self.probing = true;
         std::thread::spawn(move || {
-            let v = probe(&path).unwrap_or_else(|| "?".into());
+            let v = probe(&path);
             *slot.lock().unwrap() = Some(v);
         });
         false
+    }
+
+    /// Whether the file is still the one that told its version, so it's
+    /// safe to start (not changing again under a new build).
+    pub fn ready(&self) -> bool {
+        self.installed.is_some() && self.probed.is_some() && stamp(&self.path) == self.probed
     }
 }
 
@@ -215,9 +230,34 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(w.installed(), Some("10.0.0"));
+        assert!(w.ready());
         // Noticed once; nothing more until it changes again.
         due(&mut w);
         assert!(!w.check());
+
+        // Caught while being written (it can't say its version): not
+        // announced, and not started; the next change is looked at again.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&bin, "\x7fELF half a binary").unwrap();
+        assert!(!w.ready(), "changed since it said its version");
+        due(&mut w);
+        let start = Instant::now();
+        while w.probing || start.elapsed() < Duration::from_millis(50) {
+            assert!(!w.check(), "a binary that can't answer isn't news");
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(w.installed(), Some("10.0.0"));
+        assert!(!w.ready());
+        std::thread::sleep(Duration::from_millis(20));
+        install("11.0.0");
+        due(&mut w);
+        let start = Instant::now();
+        while !w.check() {
+            assert!(start.elapsed() < Duration::from_secs(5), "never noticed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(w.installed() == Some("11.0.0") && w.ready());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

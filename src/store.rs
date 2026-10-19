@@ -284,7 +284,6 @@ impl Store {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn add_decoded(
         &mut self,
         conn: usize,

@@ -371,11 +371,7 @@ fn header<'a>(app: &App, st: &Store) -> Line<'a> {
         left.push(Span::styled("  ● capturing", th.red));
     }
     if let Some(v) = app.upgrade.as_ref().and_then(|w| w.installed()) {
-        let v = if v == "?" || v == env!("CARGO_PKG_VERSION") {
-            "new build"
-        } else {
-            v
-        };
+        let v = if v == env!("CARGO_PKG_VERSION") { "new build" } else { v };
         left.push(Span::styled(format!("  ↑ {v} · ^n restart"), th.accent_b));
     }
     let right = vec![
@@ -2306,23 +2302,29 @@ mod tests {
         assert!(!frame(&app, "nothing new").contains("^n"));
 
         app.notice = None;
-        app.upgrade = Some(crate::upgrade::Watch::found("/x/fss-mqtt".into(), "9.9.9"));
+        let bin = std::env::temp_dir().join(format!("fss-mqtt-test-{}-ctrl-n", std::process::id()));
+        std::fs::write(&bin, "v9").unwrap();
+        app.upgrade = Some(crate::upgrade::Watch::found(bin.clone(), "9.9.9"));
         assert_eq!(app.upgrade_note().as_deref(), Some("fss-mqtt 9.9.9 is installed"));
         let v = frame(&app, "newer installed");
         assert!(
             v.contains("↑ 9.9.9 · ^n restart") && v.contains("^n restart · ^c quit"),
             "{v}"
         );
+        // Changing again since it said its version: not now.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&bin, "v10, being written").unwrap();
+        app.key(ctrl_n);
+        assert!(!app.quit && app.notice.as_ref().unwrap().0.contains("changing on disk"));
+        app.upgrade = Some(crate::upgrade::Watch::found(bin.clone(), "9.9.9"));
         app.key(ctrl_n);
         assert!(app.restart && app.quit);
 
         // The same version rebuilt says so.
-        app.upgrade = Some(crate::upgrade::Watch::found(
-            "/x/fss-mqtt".into(),
-            env!("CARGO_PKG_VERSION"),
-        ));
+        app.upgrade = Some(crate::upgrade::Watch::found(bin.clone(), env!("CARGO_PKG_VERSION")));
         assert_eq!(app.upgrade_note().as_deref(), Some("fss-mqtt was rebuilt"));
         assert!(frame(&app, "rebuilt").contains("↑ new build · ^n restart"));
+        let _ = std::fs::remove_file(&bin);
     }
 
     #[test]

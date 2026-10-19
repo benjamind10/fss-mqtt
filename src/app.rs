@@ -488,12 +488,13 @@ impl App {
             return;
         }
         if ctrl && k.code == KeyCode::Char('n') {
-            match self.upgrade_note() {
-                Some(_) => {
+            match (self.upgrade_note(), self.upgrade.as_ref().is_some_and(|w| w.ready())) {
+                (Some(_), true) => {
                     self.restart = true;
                     self.quit = true;
                 }
-                None => self.notify("no newer fss-mqtt is installed", false),
+                (Some(_), false) => self.notify("fss-mqtt is changing on disk; try again in a moment", false),
+                (None, _) => self.notify("no newer fss-mqtt is installed", false),
             }
             return;
         }
@@ -824,8 +825,6 @@ impl App {
         let v = self.upgrade.as_ref()?.installed()?;
         Some(if v == env!("CARGO_PKG_VERSION") {
             "fss-mqtt was rebuilt".into()
-        } else if v == "?" {
-            "fss-mqtt changed on disk".into()
         } else {
             format!("fss-mqtt {v} is installed")
         })

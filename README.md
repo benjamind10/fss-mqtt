@@ -334,7 +334,7 @@ connections that were open (a `--no-save` broker included, never its password) a
 the filter, the expanded topics, the selected one, the pane, and an unsent publish draft.
 Connections that were connected connect again, asking for passwords as usual, and new messages
 arrive on top. Without `--resume` it starts fresh, as always; the session stays until the next quit
-that has something to save.
+that received something from a broker (only browsing files with `--open` leaves it as it was).
 
 Restored messages come back through the same decoders as arriving ones, so a format a newer version
 added shows on messages saved before it; views decoded from payloads that were cut on arrival
@@ -358,7 +358,8 @@ The session is one gzip-compressed [JSON Lines](https://jsonlines.org) file, rea
 `~/Library/Application Support/fss-mqtt/session.jsonl.gz` on macOS, `$XDG_STATE_HOME/fss-mqtt/`
 (`~/.local/state/fss-mqtt/`) on Linux, `%LOCALAPPDATA%\fss-mqtt\` on Windows. Its lines are capture
 lines with the connection added, under one header line; `--open` reads it too. A session saved by a
-newer fss-mqtt, in a newer format, is refused with a message rather than misread. `--no-session`
+newer fss-mqtt, in a newer format, is refused with a message rather than misread; a damaged one is
+continued as far as it can be read, and the status line says so. `--no-session`
 (or `FSS_MQTT_SESSION=off`) never writes one, for machines where payloads must not touch the disk.
 
 ## Performance notes

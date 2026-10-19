@@ -588,6 +588,10 @@ fn run() -> Result<(), String> {
             text += &format!("; {} lines skipped ({})", l.skipped, l.first_skip.unwrap_or_default());
             err = true;
         }
+        if let Some(e) = l.damaged {
+            text += &format!("; the rest of the file is damaged ({e})");
+            err = true;
+        }
         notice = Some((text, err));
         restored = Some(l.header.view);
     }
@@ -617,7 +621,9 @@ fn run() -> Result<(), String> {
     if !a.no_session
         && let Some(p) = &session_path
     {
-        match save_session(&app, p) {
+        // Only browsing files (nothing from a broker, nothing resumed)
+        // leaves the last session as it was.
+        match save_session(&app, p, restored.is_some()) {
             Ok(0) => {}
             Ok(_) => println!("Continue session: {}", resume_command(&a)),
             Err(e) => eprintln!("fss-mqtt: couldn't save the session: {e}"),
@@ -631,7 +637,9 @@ fn run() -> Result<(), String> {
 fn restart(a: &Args, app: &app::App, session: Option<&std::path::Path>) -> Result<(), String> {
     let w = app.upgrade.as_ref().ok_or("nothing to restart into")?;
     let resume = match session {
-        Some(p) if !a.no_session => match save_session(app, p) {
+        // Everything goes, even what --open read: the restart doesn't open
+        // files again, it continues the session.
+        Some(p) if !a.no_session => match save_session(app, p, true) {
             Ok(n) => n > 0,
             Err(e) => return Err(format!("couldn't save the session, so not restarting: {e}")),
         },
@@ -661,12 +669,14 @@ fn restart(a: &Args, app: &app::App, session: Option<&std::path::Path>) -> Resul
 }
 
 /// Saves what's in memory for `--resume`; 0 when there was nothing to save
-/// (the last session is then left as it was).
-fn save_session(app: &app::App, path: &std::path::Path) -> Result<usize, String> {
+/// (the last session is then left as it was). Unless `always`, that
+/// includes when nothing came from a broker: browsing files with --open
+/// doesn't replace the session of a real run.
+fn save_session(app: &app::App, path: &std::path::Path, always: bool) -> Result<usize, String> {
     let view = app.session_view();
     let conns = app.session_conns();
     let st = app.store.lock().unwrap();
-    if st.total() == 0 {
+    if !session::worth_saving(st.total(), st.received, always) {
         return Ok(0);
     }
     if st.total() > 200_000 {

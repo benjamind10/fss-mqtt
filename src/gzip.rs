@@ -85,6 +85,8 @@ pub struct Reader<R: Read> {
     pos: usize,
     eof: bool,
     in_member: bool,
+    /// Members read whole so far.
+    members: usize,
     crc: u32,
     len: u32,
 }
@@ -98,6 +100,7 @@ impl<R: Read> Reader<R> {
             pos: 0,
             eof: false,
             in_member: false,
+            members: 0,
             crc: 0,
             len: 0,
         }
@@ -140,9 +143,14 @@ impl<R: Read> Reader<R> {
         Ok(true)
     }
 
-    /// Starts the next member; false at a clean end of the stream.
+    /// Starts the next member; false at a clean end of the stream. Like
+    /// gzip(1), bytes after a member that don't start another one (zero
+    /// padding, say) end it too.
     fn start_member(&mut self) -> io::Result<bool> {
         if !self.need(1)? {
+            return Ok(false);
+        }
+        if self.members > 0 && (!self.need(2)? || !self.avail().starts_with(MAGIC)) {
             return Ok(false);
         }
         loop {
@@ -177,6 +185,7 @@ impl<R: Read> Reader<R> {
         );
         self.pos += 8;
         self.in_member = false;
+        self.members += 1;
         if crc != self.crc || len != self.len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -303,5 +312,17 @@ mod tests {
         assert!(gunzip(&z[..z.len() - 3], 64).is_err(), "cut trailer");
         assert!(gunzip(&z[..z.len() / 2], 64).is_err(), "cut data");
         assert!(gunzip(b"not gzip at all", 64).is_err());
+
+        // Like gzip(1): what follows the last member and isn't a member is
+        // ignored (zero padding); a damaged member after it is not.
+        let mut padded = gzip(b"padded");
+        padded.extend([0u8; 512]);
+        assert_eq!(gunzip(&padded, 64).unwrap(), b"padded");
+        let mut one_byte = gzip(b"x");
+        one_byte.push(0);
+        assert_eq!(gunzip(&one_byte, 64).unwrap(), b"x");
+        let mut bad_second = gzip(b"first");
+        bad_second.extend(&z[..z.len() / 2]);
+        assert!(gunzip(&bad_second, 64).is_err());
     }
 }

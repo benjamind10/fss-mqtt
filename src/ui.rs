@@ -1124,6 +1124,12 @@ mod tests {
     /// Two connections: "local" (connected, with data) and "staging"
     /// (disconnected, needs a password). Returns the receivers of their commands.
     fn sample(config_path: PathBuf) -> (App, Vec<Receiver<Cmd>>) {
+        app_with(sample_store(), config_path)
+    }
+
+    /// local (connected, with messages) and staging (needs a password and
+    /// a key passphrase).
+    fn sample_store() -> Store {
         let mut st = Store::new(10, 64 * 1024);
         let local = st.add_conn("local", "mqtts://127.0.0.1:8883", None, vec![sub("v1/#"), sub("v2/#")]);
         let staging = st.add_conn(
@@ -1206,6 +1212,10 @@ mod tests {
             decoded,
         );
 
+        st
+    }
+
+    fn app_with(st: Store, config_path: PathBuf) -> (App, Vec<Receiver<Cmd>>) {
         let mut rxs = Vec::new();
         let mut ctls = Vec::new();
         for (name, user, topics) in [
@@ -2201,6 +2211,93 @@ mod tests {
             "{err}"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_session_comes_back_as_it_was() {
+        let cfg = tmp_config("resume");
+        let (mut app, _rx) = sample(cfg.clone());
+        // Filtered, in the message list on an older message, a draft open.
+        typ(&mut app, "v1/+/line1/temp");
+        press(&mut app, &[KeyCode::Right, KeyCode::Down]);
+        app.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        typ(&mut app, "draft!");
+        let view = app.session_view();
+        assert_eq!(
+            (view.filter.as_str(), view.focus.as_str()),
+            ("v1/+/line1/temp", "messages")
+        );
+        assert_eq!(view.selected, Some(("local".into(), "v1/plant/line1/temp".into())));
+        assert!(view.draft.as_ref().unwrap().0.contains("draft!"));
+        let conns = app.session_conns();
+        let up: Vec<_> = conns
+            .iter()
+            .map(|c| (c.name.as_str(), c.connected, c.config.is_some()))
+            .collect();
+        assert_eq!(
+            up,
+            [("local", true, false), ("staging", false, false)],
+            "saved entries aren't copied"
+        );
+        let path = std::env::temp_dir().join(format!("fss-mqtt-test-{}-resume.jsonl.gz", std::process::id()));
+        let saved = crate::session::save(&path, &view, &conns, &app.store.lock().unwrap()).unwrap();
+        assert_eq!(saved as u64, app.store.lock().unwrap().total());
+
+        // A new run with the same connections replays it.
+        let mut st = Store::new(10, 64 * 1024);
+        st.add_conn("local", "mqtts://127.0.0.1:8883", None, vec![sub("v1/#"), sub("v2/#")]);
+        st.add_conn(
+            "staging",
+            "mqtt://staging:1883",
+            Some("backend".into()),
+            vec![sub("devices/+/up/#")],
+        );
+        let (mut back, _rx2) = app_with(st, cfg.clone());
+        let l = crate::session::load(&path).unwrap();
+        for r in l.records {
+            let i = ["local", "staging"]
+                .iter()
+                .position(|n| Some(*n) == r.conn.as_deref())
+                .unwrap();
+            crate::session::restore(&back.store, i, r);
+        }
+        back.restore_view(&l.header.view);
+        back.tick();
+        assert_eq!(back.session_view(), view);
+        // Times are kept to the millisecond.
+        let msgs = |a: &App| -> Vec<(usize, String, Vec<u8>, usize, u8, u128)> {
+            let st = a.store.lock().unwrap();
+            st.all_messages()
+                .into_iter()
+                .map(|(c, t, m)| {
+                    let ms = m.time.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+                    (c, t.to_string(), m.payload.clone(), m.size, m.qos, ms)
+                })
+                .collect()
+        };
+        assert!(msgs(&back) == msgs(&app), "same messages, same arrival times");
+        // The decoded Parquet view (kept whole on arrival) is there again.
+        let pq = |a: &App| {
+            let st = a.store.lock().unwrap();
+            let n = st.find(0, "v2/turbine/T01/fastlog").unwrap();
+            st.nodes[n]
+                .latest()
+                .unwrap()
+                .decoded
+                .as_ref()
+                .map(|d| (d.format, d.sections.len()))
+        };
+        assert_eq!(pq(&back), pq(&app));
+        assert_eq!(
+            back.composer.as_ref().unwrap().ed.text(),
+            app.composer.as_ref().unwrap().ed.text()
+        );
+        // No message rate from the restored messages.
+        back.rate_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        back.tick();
+        assert_eq!(back.rate, 0.0);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&cfg);
     }
 
     #[test]

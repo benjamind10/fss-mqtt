@@ -1959,5 +1959,52 @@ mod e2e {
         };
         assert_eq!(rows[0][0].as_deref(), Some("Inputs/Int8"), "named from the birth");
         assert_eq!(rows[0][3].as_deref(), Some("-24"));
+
+        // Saved as a session and continued in a new store: the messages come
+        // back with their views, and data arriving after that is named from
+        // the births of before (their names are kept with the session).
+        let path = std::env::temp_dir().join(format!("fss-mqtt-e2e-{}-session.jsonl.gz", std::process::id()));
+        let conns = vec![crate::session::Conn {
+            name: "t".into(),
+            url: "test".into(),
+            connected: true,
+            config: None,
+            file: None,
+        }];
+        let saved = crate::session::save(&path, &Default::default(), &conns, &st.lock().unwrap()).unwrap();
+        assert_eq!(saved, 2);
+        let (st2, mut cfg2) = setup(18830, false, None, &["spBv1.0/#"]);
+        cfg2.client_id = "e2e-sparkplug-resumed".into();
+        let l = crate::session::load(&path).unwrap();
+        for r in l.records {
+            crate::session::restore(&st2, 0, r);
+        }
+        for (name, names) in &l.header.sparkplug {
+            assert_eq!(name, "t");
+            let table = st2.lock().unwrap().conns[0].sparkplug.clone();
+            *table.lock().unwrap() = crate::sparkplug::Aliases::from_json(names);
+        }
+        let back = latest(&st2, "spBv1.0/E2E/NDATA/Gateway1").expect("restored");
+        assert_eq!(back.decoded.as_deref().map(|v| v.format), Some("Sparkplug B"));
+        let _tx2 = spawn(cfg2, st2.clone(), true);
+        assert_eq!(wait_state(&st2, ConnState::Connected).state, ConnState::Connected);
+        let before = st2.lock().unwrap().total();
+        publish(&[
+            "-p",
+            "18830",
+            "-q",
+            "1",
+            "-t",
+            "spBv1.0/E2E/NDATA/Gateway1",
+            "-f",
+            &format!("{dir}/ndata.bin"),
+        ]);
+        assert_eq!(wait_for(&st2, before + 1), before + 1);
+        let m = latest(&st2, "spBv1.0/E2E/NDATA/Gateway1").unwrap();
+        let crate::view::Body::Table { rows, .. } = &m.decoded.as_deref().unwrap().sections[0].body else {
+            panic!("no metrics table")
+        };
+        assert_eq!(rows[0][0].as_deref(), Some("Inputs/Int8"), "named after the resume");
+        let _ = std::fs::remove_file(&path);
     }
 }

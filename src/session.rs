@@ -214,7 +214,7 @@ pub struct Loaded {
 
 /// Reads a session saved by `save`.
 pub fn load(path: &Path) -> Result<Loaded, String> {
-    let (mut lines, _, _) = open_lines(path)?;
+    let mut lines = open_lines(path)?.lines;
     let mut first = Vec::new();
     lines
         .read_until(b'\n', &mut first)
@@ -316,9 +316,15 @@ impl<R: Read> Read for Counting<R> {
     }
 }
 
-/// The lines of a JSON Lines file, gzip-compressed or not, with a counter
-/// of the (compressed) bytes read so far and the file's size.
-fn open_lines(path: &Path) -> Result<(Box<dyn BufRead + Send>, Arc<AtomicU64>, u64), String> {
+/// The lines of a JSON Lines file, gzip-compressed or not.
+struct Lines {
+    lines: Box<dyn BufRead + Send>,
+    /// (Compressed) bytes read so far, of the file's `total`.
+    read: Arc<AtomicU64>,
+    total: u64,
+}
+
+fn open_lines(path: &Path) -> Result<Lines, String> {
     let err = |e: std::io::Error| format!("{}: {e}", path.display());
     let file = File::open(path).map_err(err)?;
     let total = file.metadata().map_err(err)?.len();
@@ -336,7 +342,7 @@ fn open_lines(path: &Path) -> Result<(Box<dyn BufRead + Send>, Arc<AtomicU64>, u
     } else {
         Box::new(raw)
     };
-    Ok((lines, read, total))
+    Ok(Lines { lines, read, total })
 }
 
 /// Calls `f` with each line read as a message; blank lines are skipped and
@@ -390,7 +396,7 @@ pub fn open(path: PathBuf, store: Arc<Mutex<Store>>, conn: usize) -> std::thread
                 f(src);
             }
         };
-        let (mut lines, read, total) = match open_lines(&path) {
+        let Lines { mut lines, read, total } = match open_lines(&path) {
             Ok(l) => l,
             Err(e) => {
                 set(&|s| {

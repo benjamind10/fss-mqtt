@@ -77,15 +77,19 @@ Connection flags:
   -u, --username string      username
   -v, --version              print version and exit
 
-Files:
+Sessions and files:
+      --resume               continue the last session: its messages, connections and view
+      --no-session           don't save the session when quitting
       --open path            browse a capture file offline (repeatable; .jsonl or .jsonl.gz);
                              add -c NAME or a broker to send its messages on with ctrl+e
 
-Nothing is written to disk unless you ask: --capture or ctrl+r appends the
+Quitting saves the session (what's in memory, the connections, the view) for
+--resume; --no-session or FSS_MQTT_SESSION=off turns that off. Messages are
+written anywhere else only when you ask: --capture or ctrl+r appends the
 messages on those topics, whole, to fss-mqtt-<connection>-<time>.jsonl.
 
 Environment: FSS_MQTT_BROKER, FSS_MQTT_USERNAME, FSS_MQTT_PASSWORD, FSS_MQTT_CAFILE,
-FSS_MQTT_KEY_PASSWORD (the --key passphrase), FSS_MQTT_CAPTURE_DIR";
+FSS_MQTT_KEY_PASSWORD (the --key passphrase), FSS_MQTT_CAPTURE_DIR, FSS_MQTT_SESSION";
 
 struct Args {
     broker: Option<String>,
@@ -110,6 +114,9 @@ struct Args {
     capture: Vec<String>,
     capture_dir: Option<String>,
     open: Vec<PathBuf>,
+    resume: bool,
+    /// Don't save the session at quit (--no-session, FSS_MQTT_SESSION=off).
+    no_session: bool,
 }
 
 fn main() {
@@ -144,6 +151,8 @@ fn parse_args() -> Result<Option<Args>, String> {
         capture: vec![],
         capture_dir: env("FSS_MQTT_CAPTURE_DIR"),
         open: vec![],
+        resume: false,
+        no_session: env("FSS_MQTT_SESSION").is_some_and(|v| v.eq_ignore_ascii_case("off")),
     };
     let num = |name: &str, v: String| v.parse::<usize>().map_err(|_| format!("{name}: invalid number {v:?}"));
 
@@ -203,6 +212,8 @@ fn parse_args() -> Result<Option<Args>, String> {
                 a.capture.push(f);
             }
             "--capture-dir" => a.capture_dir = Some(val()?),
+            "--resume" => a.resume = true,
+            "--no-session" => a.no_session = true,
             "--open" => {
                 let p = PathBuf::from(config::expand(&val()?));
                 if !p.is_file() {
@@ -302,9 +313,42 @@ fn run() -> Result<(), String> {
     let mut entries = config::load(&path)?;
     let mut notice: Option<(String, bool)> = None;
 
+    // --resume: the last session, whose connections join the file's.
+    let session_path = session::default_path();
+    let resumed = match (a.resume, &session_path) {
+        (false, _) => None,
+        (true, Some(p)) if p.is_file() => {
+            Some(session::load(p).map_err(|e| format!("can't continue the last session: {e}"))?)
+        }
+        (true, _) => {
+            notice = Some(("no saved session to continue".into(), false));
+            None
+        }
+    };
+    let mut saved: Vec<bool> = vec![true; entries.len()];
+    if let Some(l) = &resumed {
+        for c in l.header.conns.iter().filter(|c| c.file.is_none()) {
+            if entries.iter().any(|e| e.name == c.name) {
+                continue; // saved: the file's entry is the one to use
+            }
+            // A --no-save broker, or one since removed from the file.
+            let entry = c
+                .config
+                .as_deref()
+                .and_then(|t| config::parse(t).ok())
+                .and_then(|mut v| v.pop())
+                .unwrap_or_else(|| config::ConnCfg {
+                    name: c.name.clone(),
+                    url: c.url.clone(),
+                    ..Default::default()
+                });
+            entries.push(entry);
+            saved.push(false);
+        }
+    }
+
     // Decide which connections to show and which to start.
     let mut cli_idx = None;
-    let mut saved: Vec<bool> = vec![true; entries.len()];
     let mut start: Vec<bool>;
     if let Some(broker) = &a.broker {
         let b = broker::parse_broker(broker, a.ca_file.is_some() || a.cert.is_some())?;
@@ -394,6 +438,15 @@ fn run() -> Result<(), String> {
     } else {
         start = entries.iter().map(|e| e.autoconnect).collect();
     }
+    if let Some(l) = &resumed {
+        // What was connected when it was saved connects again (with
+        // anything named on the command line), instead of autoconnect.
+        let named = a.broker.is_some() || !a.connections.is_empty();
+        for (s, e) in start.iter_mut().zip(&entries) {
+            let was = l.header.conns.iter().any(|c| c.name == e.name && c.connected);
+            *s = was || (named && *s);
+        }
+    }
 
     let mut st = store::Store::new(a.history, a.max_payload);
     let dir = a.capture_dir.as_deref().map_or_else(|| ".".into(), config::expand);
@@ -470,8 +523,78 @@ fn run() -> Result<(), String> {
         session::open(path.clone(), store.clone(), idx);
     }
 
+    // A resumed session: its files come back as they were (not read
+    // again), then its messages, as if arriving, and the Sparkplug names.
+    let mut restored = None;
+    if let Some(l) = resumed {
+        for c in &l.header.conns {
+            let Some(file) = &c.file else { continue };
+            let mut st = store.lock().unwrap();
+            if st.conns.iter().any(|x| x.name == c.name) {
+                continue;
+            }
+            let idx = st.add_conn(&c.name, &c.url, None, vec![]);
+            st.conns[idx].file = Some(store::FileSource {
+                path: file.clone(),
+                done: true,
+                ..Default::default()
+            });
+            drop(st);
+            ctls.push(app::ConnCtl {
+                cfg: config::ConnCfg {
+                    name: c.name.clone(),
+                    ..Default::default()
+                },
+                saved: false,
+                tx: std::sync::mpsc::channel().0,
+                password: None,
+                key_password: None,
+            });
+        }
+        let index = |name: &str| {
+            store
+                .lock()
+                .unwrap()
+                .conns
+                .iter()
+                .position(|c| c.name == name && !c.removed)
+        };
+        let count = l.records.len();
+        for r in l.records {
+            if let Some(i) = r.conn.as_deref().and_then(index) {
+                session::restore(&store, i, r);
+            }
+        }
+        for (name, names) in &l.header.sparkplug {
+            if let Some(i) = index(name) {
+                let table = store.lock().unwrap().conns[i].sparkplug.clone();
+                *table.lock().unwrap() = sparkplug::Aliases::from_json(names);
+            }
+        }
+        let ago = fmt::ago(std::time::SystemTime::now(), l.header.saved);
+        let by = if l.header.version == VERSION {
+            String::new()
+        } else {
+            format!(" (saved by fss-mqtt {})", l.header.version)
+        };
+        let mut text = format!(
+            "continued the session saved {ago}{by}: {} messages",
+            fmt::commas(count as u64)
+        );
+        let mut err = false;
+        if l.skipped > 0 {
+            text += &format!("; {} lines skipped ({})", l.skipped, l.first_skip.unwrap_or_default());
+            err = true;
+        }
+        notice = Some((text, err));
+        restored = Some(l.header.view);
+    }
+
     let opts = app::Options { inline_bytes: a.inline };
     let mut app = app::App::new(store, opts, theme::Theme::detect(), ctls, path, ask);
+    if let Some(view) = &restored {
+        app.restore_view(view);
+    }
     if let Some((text, err)) = notice {
         app.notify(text, err);
     }
@@ -485,7 +608,59 @@ fn run() -> Result<(), String> {
     for late in app.flush_captures(capture::QUIT_WAIT) {
         eprintln!("fss-mqtt: capture: {late}");
     }
+    if !a.no_session
+        && let Some(p) = &session_path
+    {
+        match save_session(&app, p) {
+            Ok(0) => {}
+            Ok(_) => println!("Continue session: {}", resume_command(&a)),
+            Err(e) => eprintln!("fss-mqtt: couldn't save the session: {e}"),
+        }
+    }
     res.map_err(|e| e.to_string())
+}
+
+/// Saves what's in memory for `--resume`; 0 when there was nothing to save
+/// (the last session is then left as it was).
+fn save_session(app: &app::App, path: &std::path::Path) -> Result<usize, String> {
+    let view = app.session_view();
+    let conns = app.session_conns();
+    let st = app.store.lock().unwrap();
+    if st.total() == 0 {
+        return Ok(0);
+    }
+    if st.total() > 200_000 {
+        eprintln!("Saving session…");
+    }
+    session::save(path, &view, &conns, &st)
+}
+
+/// How to continue this session: as fss-mqtt was started, with --resume.
+fn resume_command(a: &Args) -> String {
+    let arg0 = std::env::args().next().unwrap_or_default();
+    // Run from a path (./target/release/fss-mqtt): say so; from $PATH: its name.
+    let prog = if arg0.contains('/') || arg0.contains(std::path::MAIN_SEPARATOR) {
+        shell_quote(&arg0)
+    } else {
+        "fss-mqtt".into()
+    };
+    let mut cmd = format!("{prog} --resume");
+    if let Some(c) = &a.config {
+        cmd += &format!(" --config {}", shell_quote(&c.to_string_lossy()));
+    }
+    cmd
+}
+
+/// `s` as one shell word: as it is when that's safe, else single-quoted.
+fn shell_quote(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%~,=".contains(c) || !c.is_ascii());
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut app::App) -> std::io::Result<()> {
@@ -518,6 +693,17 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut app::App) -> st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_hint_quotes_what_the_shell_would_split() {
+        assert_eq!(shell_quote("fss-mqtt"), "fss-mqtt");
+        assert_eq!(shell_quote("./target/release/fss-mqtt"), "./target/release/fss-mqtt");
+        assert_eq!(shell_quote("~/x/conn,1=2@h:9.toml"), "~/x/conn,1=2@h:9.toml");
+        assert_eq!(shell_quote("/Users/me/My Files/c.toml"), "'/Users/me/My Files/c.toml'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote("a$b"), "'a$b'");
+        assert_eq!(shell_quote(""), "''");
+    }
 
     #[test]
     fn sizes() {

@@ -189,6 +189,7 @@ impl App {
     ) -> App {
         // Connections start expanded so their top-level topics show.
         let expanded: HashSet<usize> = store.lock().unwrap().conns.iter().map(|c| c.node).collect();
+        let store_total = store.lock().unwrap().received;
         let mut app = App {
             store,
             opts,
@@ -223,7 +224,8 @@ impl App {
             clipboard: clipboard::Sink::default(),
             composer: None,
             rate: 0.0,
-            rate_total: 0,
+            // The rate counts what arrives from now on.
+            rate_total: store_total,
             rate_at: Instant::now(),
             quit: false,
         };
@@ -286,7 +288,7 @@ impl App {
             if st.struct_ver != self.struct_ver {
                 self.need_rebuild = true;
             }
-            (st.total(), st.take_notices())
+            (st.received, st.take_notices())
         };
         // The last one shows; an error isn't hidden by a later success.
         let last_err = notices.iter().rposition(|(_, err)| *err);
@@ -792,6 +794,86 @@ impl App {
             .collect()
     }
 
+    // ── Sessions ───────────────────────────────────────────────────────────
+
+    /// The view, to save with the session.
+    pub fn session_view(&self) -> crate::session::View {
+        let st = self.store.lock().unwrap();
+        let key = |n: usize| {
+            let node = &st.nodes[n];
+            let c = &st.conns[node.conn];
+            (!c.removed).then(|| (c.name.clone(), node.path.clone()))
+        };
+        let mut expanded: Vec<(String, String)> = self.expanded.iter().filter_map(|&n| key(n)).collect();
+        expanded.sort();
+        crate::session::View {
+            filter: self.filter_text.clone(),
+            expanded,
+            selected: self.selected.and_then(key),
+            focus: match self.focus {
+                Focus::Conns => "connections",
+                Focus::Tree => "tree",
+                Focus::Msgs => "messages",
+            }
+            .into(),
+            draft: self.composer.as_ref().map(Composer::save_state),
+        }
+    }
+
+    /// The connections, to save with the session: whether each was in use,
+    /// and the entries that aren't in the connections file.
+    pub fn session_conns(&self) -> Vec<crate::session::Conn> {
+        let st = self.store.lock().unwrap();
+        (0..st.conns.len())
+            .filter(|&i| !st.conns[i].removed)
+            .map(|i| {
+                let c = &st.conns[i];
+                let file = c.file.as_ref().map(|f| f.path.clone());
+                crate::session::Conn {
+                    name: c.name.clone(),
+                    url: c.url.clone(),
+                    connected: file.is_none() && c.status.state != ConnState::Disconnected,
+                    config: (!self.ctls[i].saved && file.is_none()).then(|| config::render(&self.ctls[i].cfg)),
+                    file,
+                }
+            })
+            .collect()
+    }
+
+    /// Brings back the view saved with a session (after its messages).
+    pub fn restore_view(&mut self, v: &crate::session::View) {
+        let (expanded, selected, has_msgs) = {
+            let st = self.store.lock().unwrap();
+            let node = |(c, p): &(String, String)| {
+                let i = st.conns.iter().position(|x| &x.name == c && !x.removed)?;
+                st.find(i, p)
+            };
+            let selected = v.selected.as_ref().and_then(node);
+            let has_msgs = selected.is_some_and(|n| st.nodes[n].has_messages());
+            (v.expanded.iter().filter_map(node).collect(), selected, has_msgs)
+        };
+        self.expanded = expanded;
+        self.need_rebuild = true;
+        if !v.filter.is_empty() {
+            self.set_filter(v.filter.clone());
+        }
+        if let Some(n) = selected {
+            self.selected = Some(n);
+            self.need_rebuild = true;
+            self.rebuild(false);
+        }
+        self.focus = match v.focus.as_str() {
+            "messages" if has_msgs && self.selected == selected => Focus::Msgs,
+            "connections" => Focus::Conns,
+            _ => Focus::Tree,
+        };
+        if let Some((text, guard)) = &v.draft {
+            let mut c = Composer::restored(text, guard.clone());
+            c.fit(self.width, self.height);
+            self.composer = Some(c);
+        }
+    }
+
     // ── Live reload of the connections file ────────────────────────────────
 
     /// Re-reads the connections file if it changed since we last read it.
@@ -968,9 +1050,7 @@ impl App {
         ctl.tx = mpsc::channel().0; // dropping the old sender ends the thread
         ctl.saved = false;
         let mut st = self.store.lock().unwrap();
-        // Its messages leave the total; keep the rate's baseline in step.
-        let msgs = st.remove_conn(i);
-        self.rate_total = self.rate_total.saturating_sub(msgs);
+        st.remove_conn(i); // the rate counts arrivals, so it isn't affected
         self.expanded.remove(&st.conns[i].node);
         if self.selected.is_some_and(|n| st.nodes[n].conn == i) {
             self.selected = None;

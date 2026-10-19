@@ -165,6 +165,9 @@ pub struct Store {
     max_payload: usize,
     seq: u64,
     pub struct_ver: u64,
+    /// Messages that arrived from brokers (not restored from files), ever:
+    /// the message rate is counted from this.
+    pub received: u64,
     /// Messages for the status line from the connection threads (a publish
     /// acknowledged, a capture file that failed), shown on the next tick.
     notices: Vec<(String, bool)>,
@@ -181,6 +184,7 @@ impl Store {
             max_payload,
             seq: 0,
             struct_ver: 0,
+            received: 0,
             notices: Vec::new(),
             capture_dir: PathBuf::from("."),
         }
@@ -244,11 +248,10 @@ impl Store {
     }
 
     /// Retires connection `i`: its topics leave the tree (and the totals).
-    /// Returns how many messages it had, by which `total()` went down.
-    pub fn remove_conn(&mut self, i: usize) -> u64 {
+    pub fn remove_conn(&mut self, i: usize) {
         let c = &mut self.conns[i];
         if c.removed {
-            return 0;
+            return;
         }
         c.removed = true;
         c.subs.clear();
@@ -266,7 +269,6 @@ impl Store {
         root.sub_msgs -= msgs;
         root.topics -= topics;
         self.struct_ver += 1;
-        msgs
     }
 
     pub fn total(&self) -> u64 {
@@ -294,6 +296,9 @@ impl Store {
         decoded: Option<crate::pretty::Decoded>,
     ) {
         let now = SystemTime::now();
+        if !self.conns[conn].removed {
+            self.received += 1;
+        }
         self.insert(conn, topic, now, payload, payload.len(), qos, retain, props, decoded);
     }
 

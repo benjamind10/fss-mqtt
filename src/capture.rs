@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::store::{Props, Store};
 
@@ -561,90 +561,17 @@ fn local_stamp(t: SystemTime) -> String {
     format!("{}-{}", &digits[..8], &digits[8..14])
 }
 
-/// RFC 3339 in UTC with milliseconds: `2026-10-15T08:20:30.123Z`.
-fn rfc3339(t: SystemTime) -> String {
-    let ms = t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
-    let (days, ms) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000));
-    let s = ms / 1000;
-    format!(
-        "{}T{:02}:{:02}:{:02}.{:03}Z",
-        crate::values::date(days),
-        s / 3600,
-        s / 60 % 60,
-        s % 60,
-        ms % 1000
-    )
-}
-
-fn json_str(out: &mut String, s: &str) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-}
-
 /// One message as a line of JSON (with the newline): its time, topic, QoS,
 /// retain flag, the properties it has, its size and the whole payload, as
 /// text when it is UTF-8 and as base64 otherwise.
 pub fn encode(t: SystemTime, topic: &str, payload: &[u8], qos: u8, retain: bool, p: &Props) -> String {
-    let mut s = String::with_capacity(payload.len() * 4 / 3 + topic.len() + 128);
-    s.push_str("{\"time\":\"");
-    s.push_str(&rfc3339(t));
-    s.push_str("\",\"topic\":");
-    json_str(&mut s, topic);
-    s.push_str(&format!(",\"qos\":{qos},\"retain\":{retain}"));
-    if let Some(v) = &p.content_type {
-        s.push_str(",\"content_type\":");
-        json_str(&mut s, v);
-    }
-    if let Some(v) = &p.response_topic {
-        s.push_str(",\"response_topic\":");
-        json_str(&mut s, v);
-    }
-    if let Some(v) = &p.correlation_data {
-        s.push_str(&format!(",\"correlation_data\":\"{}\"", crate::base64::encode(v)));
-    }
-    if let Some(v) = p.message_expiry {
-        s.push_str(&format!(",\"message_expiry\":{v}"));
-    }
-    if let Some(v) = p.payload_format {
-        s.push_str(&format!(",\"payload_format\":{v}"));
-    }
-    if !p.user.is_empty() {
-        s.push_str(",\"user\":[");
-        for (i, (k, v)) in p.user.iter().enumerate() {
-            s.push_str(if i == 0 { "[" } else { ",[" });
-            json_str(&mut s, k);
-            s.push(',');
-            json_str(&mut s, v);
-            s.push(']');
-        }
-        s.push(']');
-    }
-    s.push_str(&format!(",\"size\":{}", payload.len()));
-    match std::str::from_utf8(payload) {
-        Ok(text) => {
-            s.push_str(",\"payload\":");
-            json_str(&mut s, text);
-        }
-        Err(_) => s.push_str(&format!(",\"payload_base64\":\"{}\"", crate::base64::encode(payload))),
-    }
-    s.push_str("}\n");
-    s
+    crate::record::line(None, t, topic, payload, payload.len(), qos, retain, p, None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn filters_match_like_mqtt() {

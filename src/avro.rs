@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::io::Read;
 
 use crate::fmt::commas;
+use crate::json::Json;
 use crate::values::{be_i128, clip, date, decimal, hex, time_of_day, timestamp, uuid};
 use crate::view::{Body, DocView, Fact};
 
@@ -108,7 +109,7 @@ pub fn decode(file: &[u8]) -> Result<DocView, String> {
 
     let schema = match get("avro.schema") {
         None => Err("the header has no schema".to_string()),
-        Some(s) => Json::parse(s).and_then(|j| Schema::parse(&j)),
+        Some(s) => schema_json(s).and_then(|j| Schema::parse(&j)),
     };
     d.summary = vec![
         Fact::new(commas(total), if total == 1 { "record" } else { "records" }),
@@ -768,178 +769,9 @@ fn logical_name(l: Logical) -> Option<String> {
     })
 }
 
-// ── JSON (just enough for schemas) ─────────────────────────────────────────
-
-enum Json {
-    /// `true`, `false` or `null`: never needed in a schema.
-    Literal,
-    Num(f64),
-    Str(String),
-    Arr(Vec<Json>),
-    Obj(Vec<(String, Json)>),
-}
-
-impl Json {
-    fn parse(b: &[u8]) -> Result<Json, String> {
-        let mut p = JsonParser { b, p: 0 };
-        p.value(0)
-    }
-
-    fn get(&self, k: &str) -> Option<&Json> {
-        match self {
-            Json::Obj(m) => m.iter().find(|(n, _)| n == k).map(|(_, v)| v),
-            _ => None,
-        }
-    }
-
-    fn str(&self) -> Option<&str> {
-        match self {
-            Json::Str(s) => Some(s),
-            _ => None,
-        }
-    }
-
-    fn num(&self) -> Option<f64> {
-        match self {
-            Json::Num(n) => Some(*n),
-            _ => None,
-        }
-    }
-}
-
-struct JsonParser<'a> {
-    b: &'a [u8],
-    p: usize,
-}
-
-impl JsonParser<'_> {
-    fn peek(&mut self) -> Option<u8> {
-        while self.b.get(self.p).is_some_and(|c| c.is_ascii_whitespace()) {
-            self.p += 1;
-        }
-        self.b.get(self.p).copied()
-    }
-
-    fn eat(&mut self, c: u8) -> bool {
-        let ok = self.peek() == Some(c);
-        if ok {
-            self.p += 1;
-        }
-        ok
-    }
-
-    fn value(&mut self, depth: usize) -> Result<Json, String> {
-        if depth > 2 * MAX_DEPTH {
-            return Err("schema nested too deeply".into());
-        }
-        let bad = || Err("the schema isn't valid JSON".to_string());
-        match self.peek() {
-            Some(b'{') => {
-                self.p += 1;
-                let mut m = Vec::new();
-                if self.eat(b'}') {
-                    return Ok(Json::Obj(m));
-                }
-                loop {
-                    if self.peek() != Some(b'"') {
-                        return bad();
-                    }
-                    let k = self.string()?;
-                    if !self.eat(b':') {
-                        return bad();
-                    }
-                    m.push((k, self.value(depth + 1)?));
-                    if self.eat(b'}') {
-                        return Ok(Json::Obj(m));
-                    }
-                    if !self.eat(b',') {
-                        return bad();
-                    }
-                }
-            }
-            Some(b'[') => {
-                self.p += 1;
-                let mut a = Vec::new();
-                if self.eat(b']') {
-                    return Ok(Json::Arr(a));
-                }
-                loop {
-                    a.push(self.value(depth + 1)?);
-                    if self.eat(b']') {
-                        return Ok(Json::Arr(a));
-                    }
-                    if !self.eat(b',') {
-                        return bad();
-                    }
-                }
-            }
-            Some(b'"') => Ok(Json::Str(self.string()?)),
-            Some(b'-' | b'0'..=b'9') => {
-                let start = self.p;
-                while self.b.get(self.p).is_some_and(|c| b"+-.eE0123456789".contains(c)) {
-                    self.p += 1;
-                }
-                let s = std::str::from_utf8(&self.b[start..self.p]).unwrap_or("");
-                s.parse().map(Json::Num).or_else(|_| bad())
-            }
-            _ => {
-                for word in ["true", "false", "null"] {
-                    if self.b[self.p..].starts_with(word.as_bytes()) {
-                        self.p += word.len();
-                        return Ok(Json::Literal);
-                    }
-                }
-                bad()
-            }
-        }
-    }
-
-    /// A string; the cursor is on its opening quote.
-    fn string(&mut self) -> Result<String, String> {
-        self.p += 1;
-        let mut s = Vec::new();
-        loop {
-            let c = *self.b.get(self.p).ok_or("unterminated string in the schema")?;
-            self.p += 1;
-            match c {
-                b'"' => return Ok(String::from_utf8_lossy(&s).into_owned()),
-                b'\\' => {
-                    let e = *self.b.get(self.p).ok_or("unterminated string in the schema")?;
-                    self.p += 1;
-                    let ch = match e {
-                        b'n' => '\n',
-                        b't' => '\t',
-                        b'r' => '\r',
-                        b'b' => '\u{8}',
-                        b'f' => '\u{c}',
-                        b'u' => {
-                            let hi = self.hex4()?;
-                            let code = if (0xd800..0xdc00).contains(&hi) && self.b[self.p..].starts_with(b"\\u") {
-                                self.p += 2;
-                                let lo = self.hex4()?;
-                                0x10000 + ((hi - 0xd800) << 10) + lo.wrapping_sub(0xdc00).min(0x3ff)
-                            } else {
-                                hi
-                            };
-                            char::from_u32(code).unwrap_or('\u{fffd}')
-                        }
-                        other => other as char,
-                    };
-                    s.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
-                }
-                _ => s.push(c),
-            }
-        }
-    }
-
-    fn hex4(&mut self) -> Result<u32, String> {
-        let h = self.b.get(self.p..self.p + 4).ok_or("bad escape in the schema")?;
-        self.p += 4;
-        std::str::from_utf8(h)
-            .ok()
-            .and_then(|h| u32::from_str_radix(h, 16).ok())
-            .ok_or_else(|| "bad escape in the schema".into())
-    }
+/// The schema's JSON; depth is bounded by the schema's own nesting limit.
+fn schema_json(b: &[u8]) -> Result<Json, String> {
+    Json::parse(b, 2 * MAX_DEPTH).map_err(|e| format!("the schema isn't valid JSON: {e}"))
 }
 
 #[cfg(test)]
@@ -1106,7 +938,7 @@ mod tests {
 
     #[test]
     fn schemas_and_logical_types() {
-        let s = |json: &str| Schema::parse(&Json::parse(json.as_bytes()).unwrap()).unwrap();
+        let s = |json: &str| Schema::parse(&schema_json(json.as_bytes()).unwrap()).unwrap();
         let t = s(r#"{"type":"record","name":"a.b.Node","fields":[
             {"name":"next","type":["null","Node"]},
             {"name":"id","type":{"type":"fixed","name":"Id","size":16,"logicalType":"uuid"}},
@@ -1183,7 +1015,7 @@ mod tests {
             (vec!["value".to_string()], vec![vec![Some(r#"["a"]"#.to_string())]])
         );
         assert!(
-            Json::parse(br#"{"type":"record","name":"x","fields":[{"name":"a\u0041\"","type":"Nope"}]}"#)
+            schema_json(br#"{"type":"record","name":"x","fields":[{"name":"a\u0041\"","type":"Nope"}]}"#)
                 .and_then(|j| Schema::parse(&j))
                 .is_err()
         );
@@ -1289,13 +1121,13 @@ mod tests {
             }
         }
         // Records that claim huge collections of nothing.
-        let s = Schema::parse(&Json::parse(br#"{"type":"array","items":"null"}"#).unwrap()).unwrap();
+        let s = Schema::parse(&schema_json(br#"{"type":"array","items":"null"}"#).unwrap()).unwrap();
         let b = [0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
         assert!(s.row(&mut Reader::new(&b)).is_err());
         let s =
-            Schema::parse(&Json::parse(br#"{"type":"record","name":"R","fields":[{"name":"r","type":"R"}]}"#).unwrap())
+            Schema::parse(&schema_json(br#"{"type":"record","name":"R","fields":[{"name":"r","type":"R"}]}"#).unwrap())
                 .unwrap();
         assert!(s.row(&mut Reader::new(b"")).is_err());
-        assert!(Json::parse(&[b'['; 10_000]).is_err());
+        assert!(schema_json(&[b'['; 10_000]).is_err());
     }
 }

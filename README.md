@@ -302,6 +302,21 @@ One message per line ([JSON Lines](https://jsonlines.org)):
 jq -r 'select(.topic | endswith("T01/telemetry")) | .payload | fromjson | .power_kw' fss-mqtt-oslo-*.jsonl
 ```
 
+### Opening a capture
+
+```sh
+fss-mqtt --open fss-mqtt-oslo-20261015-102030.jsonl            # browse it offline
+fss-mqtt --open fss-mqtt-oslo-20261015-102030.jsonl -c staging # …and send messages on to staging
+```
+
+`--open` (repeatable) reads a capture file, plain or gzip-compressed (`.jsonl.gz`), into the tree
+under a connection named after the file (`≡` in the panel), as if its messages were arriving: the
+last 10 per topic are kept, binary formats are decoded, Sparkplug B names come from its births, and
+each message keeps the time it arrived. Large files load in the background, with the progress in
+the panel; lines that can't be read are skipped and counted. A file never connects: saved
+connections stay disconnected unless you name them (`-c`) or give a broker, and `ctrl+e` on a
+message from the file opens it to send to one of those (a connected one is filled in).
+
 ## Performance notes
 
 Messages are written straight into an in-memory tree; the UI redraws at ~15 fps rather than per

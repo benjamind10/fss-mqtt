@@ -14,11 +14,15 @@ mod config;
 mod crc32;
 mod fmt;
 mod glyph;
+mod gzip;
+mod json;
 mod mqtt;
 mod parquet;
 mod pemkey;
 mod pretty;
 mod protobuf;
+mod record;
+mod session;
 mod sparkplug;
 mod sqlite;
 mod store;
@@ -73,6 +77,10 @@ Connection flags:
   -u, --username string      username
   -v, --version              print version and exit
 
+Files:
+      --open path            browse a capture file offline (repeatable; .jsonl or .jsonl.gz);
+                             add -c NAME or a broker to send its messages on with ctrl+e
+
 Nothing is written to disk unless you ask: --capture or ctrl+r appends the
 messages on those topics, whole, to fss-mqtt-<connection>-<time>.jsonl.
 
@@ -101,6 +109,7 @@ struct Args {
     key: Option<String>,
     capture: Vec<String>,
     capture_dir: Option<String>,
+    open: Vec<PathBuf>,
 }
 
 fn main() {
@@ -134,6 +143,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         key: None,
         capture: vec![],
         capture_dir: env("FSS_MQTT_CAPTURE_DIR"),
+        open: vec![],
     };
     let num = |name: &str, v: String| v.parse::<usize>().map_err(|_| format!("{name}: invalid number {v:?}"));
 
@@ -193,6 +203,13 @@ fn parse_args() -> Result<Option<Args>, String> {
                 a.capture.push(f);
             }
             "--capture-dir" => a.capture_dir = Some(val()?),
+            "--open" => {
+                let p = PathBuf::from(config::expand(&val()?));
+                if !p.is_file() {
+                    return Err(format!("--open: {}: no such file", p.display()));
+                }
+                a.open.push(std::path::absolute(&p).unwrap_or(p));
+            }
             s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown flag {s}\n\n{USAGE}")),
             _ => a.broker = Some(arg),
         }
@@ -355,6 +372,9 @@ fn run() -> Result<(), String> {
             }
         }
         start = entries.iter().map(|e| a.connections.contains(&e.name)).collect();
+    } else if !a.open.is_empty() {
+        // Browsing files: brokers connect only when asked for.
+        start = vec![false; entries.len()];
     } else if entries.is_empty() {
         // First run: a local broker, not saved.
         entries.push(config::ConnCfg {
@@ -415,6 +435,39 @@ fn run() -> Result<(), String> {
             ask.push(i);
         }
         ctls.push(ctl);
+    }
+
+    // Files to browse: a "connection" each, read on a thread of its own.
+    for path in &a.open {
+        let base = path
+            .file_name()
+            .map_or("file".into(), |n| n.to_string_lossy().into_owned());
+        let mut name = base.clone();
+        let mut k = 1;
+        while ctls.iter().any(|c: &app::ConnCtl| c.cfg.name == name) {
+            k += 1;
+            name = format!("{base} ({k})");
+        }
+        let idx = {
+            let mut st = store.lock().unwrap();
+            let idx = st.add_conn(&name, &format!("file {}", config::tilde(path)), None, vec![]);
+            st.conns[idx].file = Some(store::FileSource {
+                path: path.clone(),
+                ..Default::default()
+            });
+            idx
+        };
+        ctls.push(app::ConnCtl {
+            cfg: config::ConnCfg {
+                name,
+                ..Default::default()
+            },
+            saved: false,
+            tx: std::sync::mpsc::channel().0,
+            password: None,
+            key_password: None,
+        });
+        session::open(path.clone(), store.clone(), idx);
     }
 
     let opts = app::Options { inline_bytes: a.inline };

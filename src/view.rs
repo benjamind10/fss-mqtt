@@ -61,6 +61,21 @@ pub enum Body {
     },
 }
 
+/// A format name read back from a session as the `&'static str` views
+/// carry; each distinct name is allocated once.
+fn intern(name: &str) -> &'static str {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut names = NAMES.get_or_init(Default::default).lock().unwrap();
+    if let Some(&n) = names.get(name) {
+        return n;
+    }
+    let n: &'static str = Box::leak(name.to_string().into_boxed_str());
+    names.insert(n);
+    n
+}
+
 /// Raw bytes shown under a decoding error.
 const RAW_BYTES: usize = 256;
 /// Hex dumps (error views and `Body::Payload`) are laid out for this many cells (16 bytes a row).
@@ -100,6 +115,150 @@ impl DocView {
             v.section("Raw bytes", detail, Body::Lines(lines));
         }
         v
+    }
+
+    /// Appends the view as a JSON object (kept in sessions for payloads cut
+    /// on arrival, whose view can't be decoded again).
+    pub fn write_json(&self, out: &mut String) {
+        use crate::json::write_str;
+        let list = |out: &mut String, items: &[String]| {
+            out.push('[');
+            for (i, s) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_str(out, s);
+            }
+            out.push(']');
+        };
+        let pairs = |out: &mut String, items: &mut dyn Iterator<Item = (&str, &str)>| {
+            out.push('[');
+            for (i, (a, b)) in items.enumerate() {
+                out.push_str(if i == 0 { "[" } else { ",[" });
+                write_str(out, a);
+                out.push(',');
+                write_str(out, b);
+                out.push(']');
+            }
+            out.push(']');
+        };
+        out.push_str("{\"format\":");
+        write_str(out, self.format);
+        out.push_str(",\"summary\":");
+        pairs(
+            out,
+            &mut self.summary.iter().map(|f| (f.value.as_str(), f.label.as_str())),
+        );
+        out.push_str(",\"meta\":");
+        pairs(out, &mut self.meta.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        out.push_str(",\"sections\":[");
+        for (i, s) in self.sections.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"title\":");
+            write_str(out, &s.title);
+            out.push_str(",\"detail\":");
+            write_str(out, &s.detail);
+            match &s.body {
+                Body::Table { header, rows } => {
+                    out.push_str(",\"header\":");
+                    list(out, header);
+                    out.push_str(",\"rows\":[");
+                    for (r, row) in rows.iter().enumerate() {
+                        out.push_str(if r == 0 { "[" } else { ",[" });
+                        for (c, cell) in row.iter().enumerate() {
+                            if c > 0 {
+                                out.push(',');
+                            }
+                            match cell {
+                                Some(v) => write_str(out, v),
+                                None => out.push_str("null"),
+                            }
+                        }
+                        out.push(']');
+                    }
+                    out.push(']');
+                }
+                Body::Json(text) => {
+                    out.push_str(",\"json\":");
+                    write_str(out, text);
+                }
+                Body::Lines(lines) => {
+                    out.push_str(",\"lines\":");
+                    list(out, lines);
+                }
+                Body::Payload {
+                    bytes,
+                    size,
+                    content_type,
+                } => {
+                    out.push_str(&format!(
+                        ",\"payload_base64\":\"{}\",\"size\":{size},\"content_type\":",
+                        crate::base64::encode(bytes)
+                    ));
+                    write_str(out, content_type);
+                }
+            }
+            out.push('}');
+        }
+        out.push_str("],\"notes\":");
+        list(out, &self.notes);
+        out.push('}');
+    }
+
+    /// Reads what `write_json` wrote; `None` if it doesn't hold together.
+    pub fn from_json(j: &crate::json::Json) -> Option<DocView> {
+        use crate::json::Json;
+        let strs =
+            |v: Option<&Json>| -> Option<Vec<String>> { v?.arr()?.iter().map(|s| s.str().map(String::from)).collect() };
+        let pairs = |v: Option<&Json>| -> Option<Vec<(String, String)>> {
+            v?.arr()?
+                .iter()
+                .map(|p| match p.arr()? {
+                    [a, b] => Some((a.str()?.to_string(), b.str()?.to_string())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut v = DocView::new(intern(j.get("format")?.str()?));
+        v.summary = pairs(j.get("summary"))?
+            .into_iter()
+            .map(|(a, b)| Fact::new(a, b))
+            .collect();
+        v.meta = pairs(j.get("meta"))?;
+        v.notes = strs(j.get("notes"))?;
+        for s in j.get("sections")?.arr()? {
+            let body = if let Some(header) = strs(s.get("header")) {
+                let rows = s
+                    .get("rows")?
+                    .arr()?
+                    .iter()
+                    .map(|r| {
+                        r.arr()?
+                            .iter()
+                            .map(|c| match c {
+                                Json::Null => Some(None),
+                                c => c.str().map(|s| Some(s.to_string())),
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Body::Table { header, rows }
+            } else if let Some(text) = s.get("json") {
+                Body::Json(text.str()?.to_string())
+            } else if let Some(lines) = strs(s.get("lines")) {
+                Body::Lines(lines)
+            } else {
+                Body::Payload {
+                    bytes: crate::base64::decode(s.get("payload_base64")?.str()?)?,
+                    size: s.get("size")?.u64()? as usize,
+                    content_type: s.get("content_type")?.str()?.to_string(),
+                }
+            };
+            v.section(s.get("title")?.str()?, s.get("detail")?.str()?, body);
+        }
+        Some(v)
     }
 
     pub fn section(&mut self, title: impl Into<String>, detail: impl Into<String>, body: Body) {

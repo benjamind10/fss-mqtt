@@ -311,7 +311,7 @@ impl App {
         self.rebuild(false);
     }
 
-    fn refresh_panel(&mut self) {
+    pub(crate) fn refresh_panel(&mut self) {
         let st = self.store.lock().unwrap();
         self.panel.clear();
         for (i, c) in st.conns.iter().enumerate().filter(|(_, c)| !c.removed) {
@@ -616,6 +616,12 @@ impl App {
     }
 
     pub fn toggle_conn(&mut self, i: usize) {
+        if let Some(name) = self.file_name(i) {
+            return self.notify(
+                format!("{name} is a file: it was read once, there's nothing to connect"),
+                false,
+            );
+        }
         let state = self.store.lock().unwrap().conns[i].status.state;
         if state == ConnState::Disconnected {
             self.connect_or_ask(i);
@@ -677,6 +683,12 @@ impl App {
             let st = self.store.lock().unwrap();
             (st.nodes[n].conn, st.nodes[n].path.clone())
         };
+        if let Some(name) = self.file_name(i) {
+            return self.notify(
+                format!("{name} is a file: capture works on messages as they arrive"),
+                false,
+            );
+        }
         self.check_config(); // apply pending edits before saving over them
         if self.is_removed(i) {
             return;
@@ -839,6 +851,13 @@ impl App {
             self.notify(format!("connections reloaded: {}", parts.join(", ")), false);
         }
         self.next_prompt();
+    }
+
+    /// The name of connection `i` when it is a file opened with `--open`.
+    pub fn file_name(&self, i: usize) -> Option<String> {
+        let st = self.store.lock().unwrap();
+        let c = st.conns.get(i)?;
+        c.file.as_ref().map(|_| c.name.clone())
     }
 
     fn conn_named(&self, name: &str) -> Option<usize> {
@@ -1168,7 +1187,16 @@ impl App {
         let node = msg.as_ref().map(|(n, _)| *n).or(self.focused_node());
         let mut c = {
             let st = self.store.lock().unwrap();
-            let conn_of = |n: usize| st.conns[st.nodes[n].conn].name.clone();
+            // A message from a file goes to a broker: a connected one if any.
+            let broker = || {
+                let brokers = || st.live().filter(|c| c.file.is_none());
+                let up = brokers().find(|c| c.status.state == ConnState::Connected);
+                up.or(brokers().next()).map_or(String::new(), |c| c.name.clone())
+            };
+            let conn_of = |n: usize| {
+                let c = &st.conns[st.nodes[n].conn];
+                if c.file.is_some() { broker() } else { c.name.clone() }
+            };
             match (&msg, node) {
                 (Some((n, m)), _) => Composer::republish(&conn_of(*n), &st.nodes[*n].path, m),
                 (None, Some(n)) => Composer::new_message(&conn_of(n), &st.nodes[n].path),
@@ -1202,15 +1230,27 @@ impl App {
     fn publish_draft(&mut self) {
         let Some(c) = &mut self.composer else { return };
         let Some(d) = c.draft() else { return };
-        let (target, names) = {
+        let (target, names, brokers) = {
             let st = self.store.lock().unwrap();
             let live: Vec<usize> = (0..st.conns.len()).filter(|&i| !st.conns[i].removed).collect();
             let target = live.iter().copied().find(|&i| st.conns[i].name == d.conn);
             let names: Vec<String> = live.iter().map(|&i| st.conns[i].name.clone()).collect();
-            (target.map(|i| (i, st.conns[i].status.state)), names)
+            let brokers: Vec<String> = live
+                .iter()
+                .filter(|&&i| st.conns[i].file.is_none())
+                .map(|&i| st.conns[i].name.clone())
+                .collect();
+            let target = target.map(|i| (i, st.conns[i].status.state, st.conns[i].file.is_some()));
+            (target, names, brokers)
         };
         let i = match target {
-            Some((i, ConnState::Connected)) => i,
+            Some((_, _, true)) => {
+                return c.fail_at(
+                    "connection",
+                    format!("{} is a file; send to a broker: {}", d.conn, brokers.join(", ")),
+                );
+            }
+            Some((i, ConnState::Connected, _)) => i,
             Some(_) => {
                 return c.fail_at(
                     "connection",

@@ -11,6 +11,7 @@ mod set {
     pub const CONNECTING: &str = "◌";
     pub const NEWLINE: char = '↵';
     pub const EMPTY: &str = "∅";
+    pub const FILE: &str = "≡";
 }
 
 #[cfg(windows)]
@@ -23,6 +24,7 @@ mod set {
     pub const CONNECTING: &str = "○";
     pub const NEWLINE: char = '¶';
     pub const EMPTY: &str = "\"\"";
+    pub const FILE: &str = "≡";
 }
 
 pub use set::*;

@@ -275,8 +275,9 @@ enum End {
 /// commands; after a failure it retries every few seconds until told to stop.
 pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<Cmd> {
     let (tx, rx) = mpsc::channel();
+    let sparkplug = store.lock().unwrap().conns[cfg.conn].sparkplug.clone();
     std::thread::spawn(move || {
-        let mut inbox = Inbox::default();
+        let mut inbox = Inbox { sparkplug };
         let mut outbox = Outbox::default();
         let mut want = start;
         let mut halted = None;
@@ -389,10 +390,10 @@ fn dial(host: &str, port: u16) -> Result<TcpStream, String> {
 
 /// What happens to each message that arrives, with whatever state that needs
 /// across messages and reconnects (one per connection thread).
-#[derive(Default)]
 struct Inbox {
-    /// Sparkplug B metric names by alias, from the births seen.
-    sparkplug: crate::sparkplug::Aliases,
+    /// Sparkplug B metric names by alias, from the births seen (the
+    /// connection's table, shared with the store for sessions).
+    sparkplug: Arc<Mutex<crate::sparkplug::Aliases>>,
 }
 
 impl Inbox {
@@ -410,7 +411,8 @@ impl Inbox {
         // Decode binary formats now, while the whole payload is here
         // (and outside the lock). Sparkplug B is told by its topic, and needs
         // the names its births gave the aliases.
-        let decoded = match self.sparkplug.decode(topic, payload) {
+        let sparkplug = self.sparkplug.lock().unwrap().decode(topic, payload);
+        let decoded = match sparkplug {
             Some(v) => Some(v),
             None => crate::pretty::decode_on_arrival(props.content_type.as_deref(), payload),
         };
@@ -1534,7 +1536,9 @@ mod tests {
             |n: &str| std::fs::read(format!("{}/tests/fixtures/sparkplug/{n}", env!("CARGO_MANIFEST_DIR"))).unwrap();
         let store = Mutex::new(Store::new(10, 64));
         let conn = store.lock().unwrap().add_conn("t", "test", None, vec![]);
-        let mut inbox = Inbox::default();
+        let mut inbox = Inbox {
+            sparkplug: store.lock().unwrap().conns[conn].sparkplug.clone(),
+        };
         for (topic, file) in [
             ("spBv1.0/Plant1/NBIRTH/Gateway1", "nbirth.bin"),
             ("spBv1.0/Plant1/NDATA/Gateway1", "ndata.bin"),

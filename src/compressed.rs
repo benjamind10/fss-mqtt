@@ -97,7 +97,7 @@ fn trailing(rest: &[u8], notes: &mut Vec<String>) {
 // ── gzip ───────────────────────────────────────────────────────────────────
 
 /// The length of the RFC 1952 member header at the start of `b`.
-fn gzip_header(b: &[u8]) -> Result<usize, String> {
+pub(crate) fn gzip_header(b: &[u8]) -> Result<usize, String> {
     let bad = || "gzip: bad header".to_string();
     if !b.starts_with(GZIP_MAGIC) || b.len() < 10 {
         return Err(bad());

@@ -88,6 +88,14 @@ fn draw_all(f: &mut Frame, app: &App) {
 }
 
 fn status_dot<'a>(th: &Theme, c: &ConnInfo) -> Span<'a> {
+    if let Some(f) = &c.file {
+        let style = match (&f.err, f.done) {
+            (Some(_), _) => th.red,
+            (None, false) => th.yellow,
+            (None, true) => th.text,
+        };
+        return Span::styled(glyph::FILE, style);
+    }
     match (c.status.state, c.status.err.is_some()) {
         (ConnState::Connected, _) => Span::styled("●", th.green),
         (ConnState::Connecting, false) => Span::styled(glyph::CONNECTING, th.yellow),
@@ -97,6 +105,15 @@ fn status_dot<'a>(th: &Theme, c: &ConnInfo) -> Span<'a> {
 }
 
 fn status_text(c: &ConnInfo) -> String {
+    if let Some(f) = &c.file {
+        return match (&f.err, f.done) {
+            (Some(e), _) => format!("couldn't read · {e}"),
+            (None, false) if f.total > 0 => format!("reading {}%", f.read * 100 / f.total),
+            (None, false) => "reading…".into(),
+            (None, true) if f.skipped > 0 => format!("file · {} lines skipped", fmt::commas(f.skipped as u64)),
+            (None, true) => "file".into(),
+        };
+    }
     match (&c.status.state, &c.status.err) {
         (ConnState::Connected, _) => "connected".into(),
         (ConnState::Connecting, None) => "connecting…".into(),
@@ -155,7 +172,8 @@ fn panel_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
                 if let Some(u) = &ci.username {
                     left.push(Span::styled(format!("  {u}"), th.dim));
                 }
-                let state_style = match (ci.status.state, ci.status.err.is_some()) {
+                let failed = ci.status.err.is_some() || ci.file.as_ref().is_some_and(|f| f.err.is_some());
+                let state_style = match (ci.status.state, failed) {
                     (_, true) => th.red,
                     (ConnState::Connected, _) => th.green,
                     _ => th.dim,
@@ -185,7 +203,13 @@ fn panel_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
         lines.push(line);
     }
     let up = st.live().filter(|c| c.status.state == ConnState::Connected).count();
-    let title = format!("Connections {up}/{}", st.live().count());
+    let brokers = st.live().filter(|c| c.file.is_none()).count();
+    let files = st.live().count() - brokers;
+    let title = match files {
+        0 => format!("Connections {up}/{brokers}"),
+        1 => format!("Connections {up}/{brokers} · 1 file"),
+        n => format!("Connections {up}/{brokers} · {n} files"),
+    };
     draw_box(buf, r, &title, lines, focused, sel_line, th);
     // Where the connections live; edits to the file apply while running.
     border_label(buf, r, &crate::config::tilde(&app.config_path), th.faint);
@@ -330,12 +354,13 @@ fn header<'a>(app: &App, st: &Store) -> Line<'a> {
     let th = &app.th;
     let up = st.live().filter(|c| c.status.state == ConnState::Connected).count();
     let failing = st.live().filter(|c| c.status.err.is_some()).count();
+    let brokers = st.live().filter(|c| c.file.is_none()).count();
     let mut left = vec![
         Span::raw(" "),
         Span::styled(format!("{} fss-mqtt", glyph::LOGO), th.accent_b),
         Span::raw("  "),
         Span::styled(
-            format!("{up}/{} connected", st.live().count()),
+            format!("{up}/{brokers} connected"),
             if up > 0 { th.green } else { th.dim },
         ),
     ];
@@ -685,6 +710,25 @@ fn conn_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> Vec<Line<'a>> {
     ];
     if let Some(u) = &c.username {
         out.push(Line::styled(format!("user {u}"), th.dim));
+    }
+    if let Some(f) = &c.file {
+        out.push(Line::default());
+        out.push(Line::styled("Opened file", th.section));
+        out.push(Line::styled(format!("  {}", f.path.display()), th.text));
+        out.push(Line::styled(
+            format!(
+                "  {} · read once, nothing to connect to · ^e sends one to a broker",
+                msg_count(st.nodes[n].sub_msgs)
+            ),
+            th.dim,
+        ));
+        if let Some(e) = &f.first_skip {
+            out.push(Line::styled(
+                format!("  skipped {} lines; first: {e}", f.skipped),
+                th.yellow,
+            ));
+        }
+        return out;
     }
     out.push(Line::default());
     out.push(Line::styled("Subscriptions", th.section));
@@ -2059,6 +2103,104 @@ mod tests {
         let _ = std::fs::remove_file(&cfg);
         let _ = std::fs::remove_file(&blocker);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_opened_file_is_browsed_and_sent_on_to_a_broker() {
+        let (mut app, rx) = sample(tmp_config("open"));
+        // A capture file, as the capture writer makes it.
+        let path = std::env::temp_dir().join(format!("fss-mqtt-test-{}-open.jsonl", std::process::id()));
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let props = Props {
+            content_type: Some("application/json".into()),
+            ..Props::default()
+        };
+        let text: String = (0..3)
+            .map(|i| {
+                crate::capture::encode(
+                    t,
+                    "plant/line9/temp",
+                    format!("{{\"t\":{i}}}").as_bytes(),
+                    1,
+                    false,
+                    &props,
+                )
+            })
+            .collect();
+        std::fs::write(&path, text).unwrap();
+        let idx = {
+            let mut st = app.store.lock().unwrap();
+            let i = st.add_conn("open.jsonl", "file ~/open.jsonl", None, vec![]);
+            st.conns[i].file = Some(crate::store::FileSource {
+                path: path.clone(),
+                ..Default::default()
+            });
+            i
+        };
+        app.ctls.push(ConnCtl {
+            cfg: ConnCfg {
+                name: "open.jsonl".into(),
+                ..Default::default()
+            },
+            saved: false,
+            tx: mpsc::channel().0,
+            password: None,
+            key_password: None,
+        });
+        app.refresh_panel();
+        crate::session::open(path.clone(), app.store.clone(), idx)
+            .join()
+            .unwrap();
+        app.tick();
+        let v = frame(&app, "opened file");
+        assert!(
+            v.contains(&format!("{} open.jsonl", glyph::FILE)) && v.contains("file ~/open.jsonl"),
+            "{v}"
+        );
+        assert!(
+            v.contains("Connections 1/2 · 1 file") && v.contains("1/2 connected"),
+            "{v}"
+        );
+        assert!(v.contains("opened open.jsonl: 3 messages"), "{v}");
+
+        // Its topic: browsed like any other, an hour old.
+        typ(&mut app, "plant/line9/temp");
+        press(&mut app, &[KeyCode::Down]);
+        let v = frame(&app, "file topic");
+        assert!(v.contains("3 msgs · last 1h ago · qos 1"), "{v}");
+        // Capture doesn't apply; space on it in the panel connects nothing.
+        app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(
+            app.notice
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("is a file: capture works on messages as they arrive")
+        );
+        app.toggle_conn(idx);
+        assert!(app.notice.as_ref().unwrap().0.contains("is a file: it was read once"));
+
+        // ctrl+e sends it on to a broker: the connected one.
+        app.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        let text = app.composer.as_ref().unwrap().ed.text();
+        assert!(
+            text.contains("connection: local\n") && text.contains("topic: plant/line9/temp\n"),
+            "{text}"
+        );
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(matches!(rx[0].try_recv(), Ok(Cmd::Publish(o)) if o.payload == br#"{"t":2}"#));
+        // Naming the file as the connection is refused, with the brokers to pick from.
+        app.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        let c = app.composer.as_mut().unwrap();
+        let doc = c.ed.text().replace("connection: local", "connection: open.jsonl");
+        *c = crate::composer::Composer::restored(&doc, None);
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let err = app.composer.as_ref().unwrap().error.clone().unwrap_or_default();
+        assert!(
+            err.contains("open.jsonl is a file; send to a broker: local, staging"),
+            "{err}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

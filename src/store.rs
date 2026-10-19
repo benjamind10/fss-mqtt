@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use crate::capture::{Capture, Target};
@@ -137,6 +137,25 @@ pub struct ConnInfo {
     pub removed: bool,
     /// What of this connection is written to disk (opt-in, per topic).
     pub capture: Capture,
+    /// Set when this "connection" is a file opened with `--open`.
+    pub file: Option<FileSource>,
+    /// Sparkplug B metric names from the births seen, shared with the
+    /// connection's thread (which decodes) and saved with a session.
+    pub sparkplug: Arc<Mutex<crate::sparkplug::Aliases>>,
+}
+
+/// A capture or session file shown as a connection: read once, never connected.
+#[derive(Default)]
+pub struct FileSource {
+    pub path: std::path::PathBuf,
+    /// Bytes read so far, of `total`.
+    pub read: u64,
+    pub total: u64,
+    pub done: bool,
+    /// Lines that couldn't be read, with the first reason.
+    pub skipped: usize,
+    pub first_skip: Option<String>,
+    pub err: Option<String>,
 }
 
 pub struct Store {
@@ -202,6 +221,8 @@ impl Store {
             subs,
             removed: false,
             capture: Capture::default(),
+            file: None,
+            sparkplug: Default::default(),
         });
         idx
     }
@@ -261,6 +282,7 @@ impl Store {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn add_decoded(
         &mut self,
         conn: usize,
@@ -271,17 +293,62 @@ impl Store {
         props: Props,
         decoded: Option<crate::pretty::Decoded>,
     ) {
+        let now = SystemTime::now();
+        self.insert(conn, topic, now, payload, payload.len(), qos, retain, props, decoded);
+    }
+
+    /// A message from a session or capture file: it keeps the time it
+    /// arrived then, and `size` is its size on the wire (`payload` may be
+    /// what was kept of it).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_restored(
+        &mut self,
+        conn: usize,
+        topic: &str,
+        time: SystemTime,
+        payload: &[u8],
+        size: usize,
+        qos: u8,
+        retain: bool,
+        props: Props,
+        decoded: Option<crate::pretty::Decoded>,
+    ) {
+        self.insert(
+            conn,
+            topic,
+            time,
+            payload,
+            size.max(payload.len()),
+            qos,
+            retain,
+            props,
+            decoded,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert(
+        &mut self,
+        conn: usize,
+        topic: &str,
+        time: SystemTime,
+        payload: &[u8],
+        size: usize,
+        qos: u8,
+        retain: bool,
+        props: Props,
+        decoded: Option<crate::pretty::Decoded>,
+    ) {
         if self.conns[conn].removed {
             return; // its thread is on its way out
         }
         let keep = payload.len().min(self.max_payload);
         self.seq += 1;
-        let now = SystemTime::now();
         let msg = Arc::new(Message {
             seq: self.seq,
-            time: now,
+            time,
             payload: payload[..keep].to_vec(),
-            size: payload.len(),
+            size,
             qos,
             retain,
             props,
@@ -322,12 +389,38 @@ impl Store {
         while let Some(i) = a {
             let node = &mut self.nodes[i];
             node.sub_msgs += 1;
-            node.last_seen = now;
+            // Restored messages come in time order, mostly; never move back.
+            node.last_seen = node.last_seen.max(time);
             if new_topic {
                 node.topics += 1;
             }
             a = node.parent;
         }
+    }
+
+    /// The node for `path` under connection `conn` ("" is the connection).
+    pub fn find(&self, conn: usize, path: &str) -> Option<usize> {
+        let mut n = self.conns.get(conn)?.node;
+        if path.is_empty() {
+            return Some(n);
+        }
+        for seg in path.split('/') {
+            n = *self.nodes[n].children.get(seg)?;
+        }
+        Some(n)
+    }
+
+    /// Every message held, oldest first (by arrival), with its connection
+    /// and topic.
+    pub fn all_messages(&self) -> Vec<(usize, &str, &Arc<Message>)> {
+        let mut all: Vec<_> = self
+            .nodes
+            .iter()
+            .filter(|n| !n.msgs.is_empty() && !self.conns[n.conn].removed)
+            .flat_map(|n| n.msgs.iter().map(move |m| (n.conn, n.path.as_str(), m)))
+            .collect();
+        all.sort_by_key(|(_, _, m)| m.seq);
+        all
     }
 
     /// Re-sorts children that changed since the last call. Call before reading

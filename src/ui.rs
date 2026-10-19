@@ -370,7 +370,7 @@ fn header<'a>(app: &App, st: &Store) -> Line<'a> {
     if st.live().any(|c| c.capture.active()) {
         left.push(Span::styled("  ● capturing", th.red));
     }
-    if let Some(v) = app.upgrade.as_ref().and_then(|w| w.installed()) {
+    if let Some(v) = app.upgrade.as_ref().and_then(|w| w.offering()) {
         let v = if v == env!("CARGO_PKG_VERSION") { "new build" } else { v };
         left.push(Span::styled(format!("  ↑ {v} · ^n restart"), th.accent_b));
     }
@@ -954,7 +954,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
             ("tab", "pane", 2),
         ],
     };
-    if app.upgrade.as_ref().is_some_and(|w| w.installed().is_some()) {
+    if app.upgrade.as_ref().is_some_and(|w| w.offering().is_some()) {
         keys.push(("^n", "restart", 0));
     }
     keys.push(("^c", "quit", 0));

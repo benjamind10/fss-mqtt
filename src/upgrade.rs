@@ -34,6 +34,9 @@ pub struct Watch {
     /// and the file as it was when it said so.
     installed: Option<String>,
     probed: Option<Stamp>,
+    /// Whether, at the last look, the file was still the one that answered
+    /// (what the header offers; ctrl+n looks again with `ready`).
+    offer: bool,
 }
 
 impl Watch {
@@ -51,6 +54,7 @@ impl Watch {
             probing: false,
             installed: None,
             probed: None,
+            offer: false,
         }
     }
 
@@ -60,6 +64,7 @@ impl Watch {
         let mut w = Watch::at(path);
         w.installed = Some(version.into());
         w.probed = w.stamp.clone();
+        w.offer = true;
         w
     }
 
@@ -82,6 +87,7 @@ impl Watch {
             let fresh = self.installed.as_deref() != Some(&v);
             self.installed = Some(v);
             self.probed = self.stamp.clone();
+            self.offer = true;
             return fresh;
         }
         if self.checked.elapsed() < CHECK_EVERY {
@@ -89,6 +95,8 @@ impl Watch {
         }
         self.checked = Instant::now();
         let now = stamp(&self.path);
+        // Not offered while the file isn't the one that said its version.
+        self.offer = self.installed.is_some() && now.is_some() && now == self.probed;
         if now.is_none() || now == self.stamp {
             return false; // gone (mid-upgrade?) or unchanged
         }
@@ -101,6 +109,12 @@ impl Watch {
             *slot.lock().unwrap() = Some(v);
         });
         false
+    }
+
+    /// The version to offer a restart into: installed, and at the last look
+    /// still the file that said so.
+    pub fn offering(&self) -> Option<&str> {
+        self.installed.as_deref().filter(|_| self.offer)
     }
 
     /// Whether the file is still the one that told its version, so it's
@@ -241,6 +255,8 @@ mod tests {
         std::fs::write(&bin, "\x7fELF half a binary").unwrap();
         assert!(!w.ready(), "changed since it said its version");
         due(&mut w);
+        w.check();
+        assert_eq!(w.offering(), None, "not offered while it's broken");
         let start = Instant::now();
         while w.probing || start.elapsed() < Duration::from_millis(50) {
             assert!(!w.check(), "a binary that can't answer isn't news");
@@ -258,6 +274,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(w.installed() == Some("11.0.0") && w.ready());
+        assert_eq!(w.offering(), Some("11.0.0"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

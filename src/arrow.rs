@@ -441,7 +441,9 @@ enum Ty {
     FixedList(usize),
     Struct,
     Map,
-    Union(i16), // 0 sparse, 1 dense
+    /// 0 sparse, 1 dense; the type id of each member, in member order
+    /// (none: the member's index is its type id).
+    Union(i16, Vec<i32>),
     RunEnd,
     View(bool), // Utf8View, BinaryView
     ListView(bool),
@@ -553,7 +555,26 @@ fn parse_type(id: u8, t: Option<Table>) -> R<Ty> {
         },
         12 => Ty::List,
         13 => Ty::Struct,
-        14 => Ty::Union(i16f(0, 0)?),
+        14 => {
+            let mode = i16f(0, 0)?;
+            if mode != 0 && mode != 1 {
+                return Err("bad union mode".into());
+            }
+            // Type codes are i8 (rows hold them as such), each listed once:
+            // checked as read, so a long hostile list stops within 257.
+            let raw = t.as_ref().map_or(Ok(&[][..]), |t| t.vector(1, 4))?;
+            let mut ids = Vec::new();
+            let mut seen = [false; 256];
+            for c in raw.as_chunks::<4>().0 {
+                let id = i32::from_le_bytes(*c);
+                let b = i8::try_from(id).map_err(|_| "union type id out of range")? as u8 as usize;
+                if std::mem::replace(&mut seen[b], true) {
+                    return Err("union type id listed twice".into());
+                }
+                ids.push(id);
+            }
+            Ty::Union(mode, ids)
+        }
         15 => Ty::FixedBinary(width(i32f(0, 0)?)?),
         16 => Ty::FixedList(width(i32f(0, 0)?)?),
         17 => Ty::Map,
@@ -638,7 +659,7 @@ fn base_type_name(f: &Field, depth: usize) -> String {
             };
             format!("MAP<{}, {}>", kv(0), kv(1))
         }
-        Ty::Union(_) => format!("UNION<{}>", members()),
+        Ty::Union(..) => format!("UNION<{}>", members()),
         Ty::RunEnd => format!("RUN_END_ENCODED<{}>", child(1)),
         Ty::View(true) => "STRING_VIEW".into(),
         Ty::View(false) => "BINARY_VIEW".into(),
@@ -710,7 +731,7 @@ impl<'a> Batch<'a> {
             Ty::Null | Ty::RunEnd => 0,
             Ty::Struct | Ty::FixedList(_) => 1,
             Ty::Utf8 | Ty::LargeUtf8 | Ty::Binary | Ty::LargeBinary | Ty::ListView(_) => 3,
-            Ty::Union(mode) => 1 + usize::from(mode == 1) + usize::from(!self.v5),
+            Ty::Union(mode, _) => 1 + usize::from(mode == 1) + usize::from(!self.v5),
             Ty::View(_) => {
                 let extra = usize::try_from(i64_at(self.variadic, p.var * 8)?)
                     .ok()
@@ -767,20 +788,24 @@ impl<'a> Batch<'a> {
         if depth > MAX_DEPTH {
             return Err("nested too deeply".into());
         }
-        if f.dict.is_none() {
-            match f.ty {
-                Ty::Union(_) | Ty::RunEnd | Ty::View(_) | Ty::ListView(_) | Ty::Unknown(_) => {
-                    return Err(format!("{} values not shown", type_name(f, 0)));
-                }
-                _ => {}
-            }
+        if f.dict.is_none()
+            && let Ty::Unknown(_) = f.ty
+        {
+            return Err(format!("{} values not shown", type_name(f, 0)));
         }
         let (len, nulls) = self.node(p.node)?;
         p.node += 1;
         let n = self.buffer_count(f, p)?;
         let first = p.buf;
         p.buf = p.buf.checked_add(n).ok_or("bad buffer count")?;
-        let has_validity = f.dict.is_some() || !matches!(f.ty, Ty::Null);
+        // Run-end encoded arrays have no validity of their own (nulls are in
+        // their values), nor do unions since format V5.
+        let has_validity = f.dict.is_some()
+            || match f.ty {
+                Ty::Null | Ty::RunEnd => false,
+                Ty::Union(..) => !self.v5,
+                _ => true,
+            };
         let valid = if has_validity && nulls != 0 {
             Some(self.buffer(first, inflate)?).filter(|v| !v.is_empty())
         } else {
@@ -929,7 +954,22 @@ impl Arr<'_> {
             let k = int(self.buf(0), *bits, *signed, i)?;
             return dict_cell(dicts, *id, k, depth + 1);
         }
-        Ok(Some(clip(self.value(i, dicts, depth)?)))
+        match &self.f.ty {
+            // The value of the run row `i` falls in.
+            Ty::RunEnd => {
+                let values = self.kids.get(1).ok_or("missing values")?;
+                values.cell(self.run(i)?, dicts, depth + 1)
+            }
+            // The chosen member's value.
+            Ty::Union(..) => {
+                let (k, j) = self.union_slot(i)?;
+                self.kids
+                    .get(k)
+                    .ok_or("missing union member")?
+                    .cell(j, dicts, depth + 1)
+            }
+            _ => Ok(Some(clip(self.value(i, dicts, depth)?))),
+        }
     }
 
     fn value(&self, i: usize, dicts: &Dicts, depth: usize) -> R<String> {
@@ -999,10 +1039,103 @@ impl Arr<'_> {
                     members.map(|(k, c)| Ok(format!("{}: {}", c.name, kid(k, i)?))),
                 )?
             }
-            Ty::Union(_) | Ty::RunEnd | Ty::View(_) | Ty::ListView(_) | Ty::Unknown(_) => {
+            Ty::View(true) => {
+                let s = self.view(i)?;
+                String::from_utf8_lossy(&s[..s.len().min(MAX_CELL * 4)]).into_owned()
+            }
+            Ty::View(false) => bytes(self.view(i)?),
+            Ty::ListView(large) => {
+                let (start, end) = self.list_view(*large, i)?;
+                join("[", "]", (start..end).map(|j| kid(0, j)))?
+            }
+            // Decided in `cell`.
+            Ty::Union(..) | Ty::RunEnd | Ty::Unknown(_) => {
                 return Err(format!("{} values not shown", type_name(self.f, 0)));
             }
         })
+    }
+
+    /// A Utf8View / BinaryView value: a 16-byte view holding its length,
+    /// then the bytes themselves (up to 12) or a prefix, the index of a data
+    /// buffer and the offset in it. Everything is checked: views come from
+    /// the network.
+    fn view(&self, i: usize) -> R<&[u8]> {
+        let v = fixed(self.buf(0), i, 16)?;
+        let len = usize::try_from(i32_at(v, 0)?).map_err(|_| "negative view length")?;
+        if len <= 12 {
+            return Ok(&v[4..4 + len]);
+        }
+        let k = usize::try_from(i32_at(v, 8)?).map_err(|_| "negative view buffer index")?;
+        let data = self.bufs.get(1 + k).ok_or("view points past the data buffers")?;
+        let off = usize::try_from(i32_at(v, 12)?).map_err(|_| "negative view offset")?;
+        slice(data, off, len).ok_or_else(|| "view points past its data buffer".into())
+    }
+
+    /// A ListView / LargeListView row: its offset and size in the child.
+    /// Offsets needn't increase and rows may overlap, so each range is
+    /// checked against the child on its own.
+    fn list_view(&self, large: bool, i: usize) -> R<(usize, usize)> {
+        let at = |b: &[u8]| -> R<i64> {
+            if large {
+                i64_at(b, i.checked_mul(8).ok_or("bad list view")?)
+            } else {
+                Ok(i32_at(b, i.checked_mul(4).ok_or("bad list view")?)? as i64)
+            }
+        };
+        let start = usize::try_from(at(self.buf(0))?).map_err(|_| "negative list view offset")?;
+        let size = usize::try_from(at(self.buf(1))?).map_err(|_| "negative list view size")?;
+        let end = start.checked_add(size).ok_or("bad list view")?;
+        let child = self.kids.first().ok_or("missing child")?;
+        if end > child.len {
+            return Err("list view points past its values".into());
+        }
+        Ok((start, end))
+    }
+
+    /// The run of a run-end encoded array that row `i` falls in: the first
+    /// whose (exclusive) end is past `i`.
+    fn run(&self, i: usize) -> R<usize> {
+        let ends = self.kids.first().ok_or("missing run ends")?;
+        let Ty::Int(bits, true) = ends.f.ty else {
+            return Err("run ends aren't signed integers".into());
+        };
+        let (mut lo, mut hi) = (0, ends.len);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if int(ends.buf(0), bits, true, mid)? > i as i128 {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        if lo >= ends.len {
+            return Err("row past the last run".into());
+        }
+        Ok(lo)
+    }
+
+    /// Which member a union row is (by its type id) and that member's row:
+    /// the same row in a sparse union, the offset in a dense one.
+    fn union_slot(&self, i: usize) -> R<(usize, usize)> {
+        let Ty::Union(mode, ids) = &self.f.ty else {
+            return Err("not a union".into());
+        };
+        let id = *self.buf(0).get(i).ok_or("union type ids end early")? as i8 as i32;
+        let k = if ids.is_empty() {
+            usize::try_from(id).ok()
+        } else {
+            ids.iter().position(|&x| x == id)
+        };
+        let k = k
+            .filter(|&k| k < self.kids.len())
+            .ok_or_else(|| format!("union type id {id} isn't in the schema"))?;
+        let j = if *mode == 1 {
+            let at = i.checked_mul(4).ok_or("bad union offset")?;
+            usize::try_from(i32_at(self.buf(1), at)?).map_err(|_| "negative union offset")?
+        } else {
+            i
+        };
+        Ok((k, j))
     }
 
     /// The bytes of a variable-width value: offsets in buffer 0, data in buffer 1.
@@ -1394,12 +1527,8 @@ mod tests {
     #[test]
     fn rarer_types() {
         let v = decode("types.arrow", MAX_ROWS, ROW_BUDGET);
-        assert_eq!(v.notes, ["either: UNION<n: INT64, s: STRING> values not shown"]);
-        assert_eq!(
-            v.header.len(),
-            v.columns.len() - 1,
-            "the union column isn't in the rows"
-        );
+        assert!(v.notes.is_empty(), "{:?}", v.notes);
+        assert_eq!(v.header.len(), v.columns.len());
         let types: Vec<_> = v.columns.iter().map(|c| c.1.as_str()).collect();
         assert_eq!(
             types,
@@ -1452,6 +1581,7 @@ mod tests {
                 "{x: 1, y: 2}",
                 "{k: 1}",
                 "1mo 2d 3ns",
+                "5",
             ]
         );
         assert_eq!(
@@ -1475,7 +1605,171 @@ mod tests {
                 "null",
                 "{}",
                 "null",
+                "x",
             ]
+        );
+    }
+
+    fn rows(v: &ArrowView) -> Vec<Vec<String>> {
+        v.rows
+            .iter()
+            .map(|r| r.iter().map(|c| c.clone().unwrap_or_else(|| "null".into())).collect())
+            .collect()
+    }
+
+    #[test]
+    fn views_run_ends_and_unions() {
+        for name in ["views.arrow", "views-zstd.arrows"] {
+            let v = decode(name, MAX_ROWS, ROW_BUDGET);
+            assert!(v.notes.is_empty(), "{name}: {:?}", v.notes);
+            let types: Vec<_> = v.columns.iter().map(|c| c.1.as_str()).collect();
+            assert_eq!(
+                types,
+                [
+                    "STRING_VIEW",
+                    "BINARY_VIEW",
+                    "LIST_VIEW<INT32>",
+                    "LARGE_LIST_VIEW<STRING_VIEW>",
+                    "RUN_END_ENCODED<STRING>",
+                    "UNION<i: INT64, s: STRING>",
+                    "UNION<f: DOUBLE, t: STRING>",
+                ],
+                "{name}"
+            );
+            // Two batches: views inline (up to 12 bytes) and in a data buffer
+            // (13), then a batch with no data buffers at all; list views out
+            // of order and overlapping; runs with a null; a dense union with
+            // type codes 5 and 9.
+            let long = "a value longer than twelve bytes";
+            assert_eq!(
+                rows(&v),
+                [
+                    vec!["short", "0001", "[13, 14]", "[a]", "a", "7", "p"],
+                    vec![
+                        "exactly12byt",
+                        "xxxxxxxxxxxx",
+                        "[10, 11, 12]",
+                        &format!("[{long}]"),
+                        "a",
+                        "s1",
+                        "1.5"
+                    ],
+                    vec![
+                        "thirteen byte",
+                        "79797979797979797979797979ff",
+                        "[]",
+                        &format!("[a, {long}]"),
+                        "null",
+                        "-1",
+                        "q",
+                    ],
+                    vec!["null", "null", "[21]", "[]", "b", "s2", "2"],
+                    vec!["", "", "[20, 21]", "[b]", "c", "null", "null"],
+                    vec!["inline only", "deadbeef", "null", "[]", "c", "42", "r"],
+                ],
+                "{name}"
+            );
+        }
+        // As Polars writes them (zstd, views by default).
+        let v = decode("polars.arrow", MAX_ROWS, ROW_BUDGET);
+        assert!(v.notes.is_empty(), "{:?}", v.notes);
+        let types: Vec<_> = v.columns.iter().map(|c| c.1.as_str()).collect();
+        assert_eq!(
+            types,
+            ["STRING_VIEW", "BINARY_VIEW", "LARGE_LIST<STRING_VIEW>", "DOUBLE"]
+        );
+        assert_eq!(
+            rows(&v),
+            [
+                vec!["T01", "00", "[a]", "1.5"],
+                vec!["a value longer than twelve bytes", "zzzzzzzzzzzzzzzzzzzz", "[]", "null"],
+                vec!["null", "null", "[b, another value longer than twelve]", "3.25"],
+            ]
+        );
+    }
+
+    /// `views.arrow` with `patch` applied to the first record batch: given
+    /// the body and where each buffer of a field starts in the file.
+    fn patched_views(patch: impl Fn(&mut [u8], &dyn Fn(usize, usize) -> usize)) -> ArrowView {
+        let mut b = fixture("views.arrow");
+        let (start, schema) = {
+            // The file's messages start after its 8-byte magic.
+            let (m, _) = message(&b, 8).unwrap().unwrap();
+            (8, parse_schema(m.header).unwrap())
+        };
+        let (_, after_schema) = message(&b, start).unwrap().unwrap();
+        let (m, _) = message(&b, after_schema).unwrap().unwrap();
+        assert_eq!(m.kind, 3, "the first record batch");
+        let batch = Batch::new(m.header, m.body, m.version).unwrap();
+        let body_at = m.body.as_ptr() as usize - b.as_ptr() as usize;
+        // Where buffer `k` of field `f` starts in the file.
+        let at = |f: usize, k: usize| {
+            let mut p = Pos::default();
+            for g in &schema.fields[..f] {
+                batch.skip(g, &mut p, 0).unwrap();
+            }
+            body_at + i64_at(batch.buffers, (p.buf + k) * 16).unwrap() as usize
+        };
+        let offsets: Vec<Vec<usize>> = (0..schema.fields.len())
+            .map(|f| (0..3).map(|k| at(f, k)).collect())
+            .collect();
+        patch(&mut b, &|f, k| offsets[f][k]);
+        read("", &b, MAX_ROWS, ROW_BUDGET).unwrap().unwrap()
+    }
+
+    #[test]
+    fn damaged_views_are_reported_not_trusted() {
+        let set = |b: &mut [u8], at: usize, v: i32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        // Row 2 of `sv` ("thirteen byte") is out of line: length, prefix,
+        // buffer index, offset. Buffer 1 of the field is its views.
+        for (field, word, value, why) in [
+            (0, 0, -5, "negative view length"),
+            (0, 8, 3, "view points past the data buffers"),
+            (0, 8, -1, "negative view buffer index"),
+            (0, 12, 1_000_000, "view points past its data buffer"),
+            (0, 12, -2, "negative view offset"),
+        ] {
+            let v = patched_views(|b, at| set(b, at(field, 1) + 2 * 16 + word, value));
+            assert_eq!(v.notes, [format!("sv: {why}")]);
+            assert_eq!(v.header.len(), 6, "the other columns still decode");
+        }
+        // `lv` row 1: buffer 2 is the sizes; past the end of its values.
+        let v = patched_views(|b, at| set(b, at(2, 2) + 4, 1000));
+        assert_eq!(v.notes, ["lv: list view points past its values"]);
+        let v = patched_views(|b, at| set(b, at(2, 1) + 4, -1));
+        assert_eq!(v.notes, ["lv: negative list view offset"]);
+    }
+
+    #[test]
+    fn view_columns_need_their_buffer_counts() {
+        // A batch whose message has no variadicBufferCounts can't say where
+        // a view column's buffers end, so it's malformed rather than guessed.
+        let f = Field {
+            name: "sv".into(),
+            nullable: true,
+            ty: Ty::View(true),
+            dict: None,
+            children: vec![],
+        };
+        let buffers = [0u8; 16 * 4];
+        let mut batch = Batch {
+            len: 1,
+            nodes: &[],
+            buffers: &buffers,
+            variadic: &[],
+            body: &[],
+            codec: None,
+            v5: true,
+        };
+        assert!(batch.buffer_count(&f, &mut Pos::default()).is_err());
+        let one = 1i64.to_le_bytes();
+        batch.variadic = &one;
+        assert_eq!(batch.buffer_count(&f, &mut Pos::default()), Ok(3));
+        let lots = 1000i64.to_le_bytes();
+        batch.variadic = &lots;
+        assert!(
+            batch.buffer_count(&f, &mut Pos::default()).is_err(),
+            "more than the batch has"
         );
     }
 
@@ -1517,6 +1811,7 @@ mod tests {
         I16(i16),
         I32(i32),
         Str(&'static str),
+        I32s(Vec<i32>),
         Table(Vec<(usize, Fb)>),
         Tables(Vec<Vec<(usize, Fb)>>),
     }
@@ -1555,6 +1850,12 @@ mod tests {
                     let p = buf.len();
                     buf.extend((s.len() as u32).to_le_bytes());
                     buf.extend(s.as_bytes());
+                    p
+                }
+                Fb::I32s(v) => {
+                    let p = buf.len();
+                    buf.extend((v.len() as u32).to_le_bytes());
+                    v.iter().for_each(|x| buf.extend(x.to_le_bytes()));
                     p
                 }
                 Fb::Table(t) => put(buf, t),
@@ -1611,6 +1912,42 @@ mod tests {
         let mut bad = int_field();
         bad[3] = (3, Fb::Table(vec![(0, Fb::I32(12))]));
         assert!(sniff("", &schema_stream(vec![(1, Fb::Tables(vec![bad]))])).is_none());
+        // A union whose type ids name a member twice is malformed.
+        let union = |ids: Vec<i32>| {
+            let member = |name| {
+                vec![
+                    (0, Fb::Str(name)),
+                    (2, Fb::U8(2)),
+                    (3, Fb::Table(vec![(0, Fb::I32(32))])),
+                ]
+            };
+            let field = vec![
+                (0, Fb::Str("u")),
+                (2, Fb::U8(14)),
+                (3, Fb::Table(vec![(0, Fb::I16(1)), (1, Fb::I32s(ids))])),
+                (5, Fb::Tables(vec![member("a"), member("b")])),
+            ];
+            schema_stream(vec![(1, Fb::Tables(vec![field]))])
+        };
+        let ct = "application/vnd.apache.arrow.stream";
+        let v = read(ct, &union(vec![5, 9]), MAX_ROWS, ROW_BUDGET).unwrap().unwrap();
+        assert_eq!(v.columns[0].1, "UNION<a: UINT32, b: UINT32>");
+        let refused = |ids: Vec<i32>, why: &str| {
+            let r = read(ct, &union(ids), MAX_ROWS, ROW_BUDGET).unwrap();
+            assert!(
+                r.as_ref().err().is_some_and(|e| e.contains(why)),
+                "{why}: {:?}",
+                r.err()
+            );
+        };
+        refused(vec![5, 5], "listed twice");
+        refused(vec![-128, 127, -128], "listed twice");
+        refused(vec![5, 300], "out of range");
+        // A long hostile list is turned down at once, not compared pairwise.
+        let start = std::time::Instant::now();
+        refused((0..100_000).collect(), "out of range");
+        refused((0..100_000).map(|i| i % 100).collect(), "listed twice");
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
         // No fields: only with a content type.
         let empty = schema_stream(vec![]);
         assert!(sniff("", &empty).is_none());
@@ -1741,7 +2078,10 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        for name in TURBINE.into_iter().chain(["types.arrow"]) {
+        for name in TURBINE
+            .into_iter()
+            .chain(["types.arrow", "views.arrow", "views-zstd.arrows", "polars.arrow"])
+        {
             let good = fixture(name);
             // Cut, flip and scramble bytes all over the payload; any result is fine, a panic is not.
             for _ in 0..300 {

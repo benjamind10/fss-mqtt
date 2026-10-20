@@ -4,3 +4,6 @@
 .DS_Store
 /dist/
 !/tests/fixtures/keys/*.key
+# Capture files fss-mqtt writes when run from the checkout
+/fss-mqtt-*.jsonl
+/fss-mqtt-*.jsonl.gz

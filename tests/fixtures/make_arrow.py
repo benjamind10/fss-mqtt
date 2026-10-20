@@ -1,5 +1,5 @@
 """Writes small Arrow IPC fixtures (file and stream format) for the payload decoder tests.
-Regenerate: docker run --rm -v "$PWD":/w -w /w python:3.12-slim sh -c "pip -q install pyarrow==17.0.0 && python make_arrow.py"
+Regenerate: docker run --rm -v "$PWD":/w -w /w python:3.12-slim sh -c "pip -q install pyarrow==17.0.0 polars==1.9.0 && python make_arrow.py"
 """
 import datetime as dt
 import decimal
@@ -61,3 +61,67 @@ types = pa.table({
 })
 with ipc.new_file("types.arrow", types.schema) as w:
     w.write_table(types)
+
+# View, run-end encoded and union columns, in two batches built separately so
+# their view columns have different numbers of data buffers: the first holds
+# a 13-byte string (out of line), the second only inline ones (none).
+views = pa.schema([
+    ("sv", pa.string_view()),
+    ("bv", pa.binary_view()),
+    ("lv", pa.list_view(pa.int32())),
+    ("llv", pa.large_list_view(pa.string_view())),
+    ("ree", pa.run_end_encoded(pa.int32(), pa.string())),
+    ("su", pa.sparse_union([pa.field("i", pa.int64()), pa.field("s", pa.string())])),
+    ("du", pa.dense_union([pa.field("f", pa.float64()), pa.field("t", pa.string())], type_codes=[5, 9])),
+])
+
+
+def batch(sv, bv, lv, llv, ree, su, du):
+    return pa.record_batch([sv, bv, lv, llv, ree, su, du], schema=views)
+
+
+first = batch(
+    pa.array(["short", "exactly12byt", "thirteen byte"], pa.string_view()),
+    pa.array([b"\x00\x01", b"x" * 12, b"y" * 13 + b"\xff"], pa.binary_view()),
+    # Out of order and overlapping: [13, 14], [10, 11, 12], [].
+    pa.ListViewArray.from_arrays(pa.array([3, 0, 1], pa.int32()), pa.array([2, 3, 0], pa.int32()),
+                                 pa.array([10, 11, 12, 13, 14], pa.int32())),
+    pa.LargeListViewArray.from_arrays(pa.array([0, 1, 0], pa.int64()), pa.array([1, 1, 2], pa.int64()),
+                                      pa.array(["a", "a value longer than twelve bytes"], pa.string_view())),
+    pa.RunEndEncodedArray.from_arrays(pa.array([2, 3], pa.int32()), pa.array(["a", None])),
+    pa.UnionArray.from_sparse(pa.array([0, 1, 0], pa.int8()),
+                              [pa.array([7, 0, -1], pa.int64()), pa.array(["", "s1", ""])], ["i", "s"]),
+    pa.UnionArray.from_dense(pa.array([9, 5, 9], pa.int8()), pa.array([0, 0, 1], pa.int32()),
+                             [pa.array([1.5]), pa.array(["p", "q"])], ["f", "t"], type_codes=[5, 9]),
+)
+second = batch(
+    pa.array([None, "", "inline only"], pa.string_view()),
+    pa.array([None, b"", b"\xde\xad\xbe\xef"], pa.binary_view()),
+    pa.ListViewArray.from_arrays(pa.array([1, 0, 0], pa.int32()), pa.array([1, 2, 0], pa.int32()),
+                                 pa.array([20, 21], pa.int32()), mask=pa.array([False, False, True])),
+    pa.LargeListViewArray.from_arrays(pa.array([0, 0, 0], pa.int64()), pa.array([0, 1, 0], pa.int64()),
+                                      pa.array(["b"], pa.string_view())),
+    pa.RunEndEncodedArray.from_arrays(pa.array([1, 3], pa.int32()), pa.array(["b", "c"])),
+    pa.UnionArray.from_sparse(pa.array([1, 1, 0], pa.int8()),
+                              [pa.array([0, 0, 42], pa.int64()), pa.array(["s2", None, ""])], ["i", "s"]),
+    pa.UnionArray.from_dense(pa.array([5, 5, 9], pa.int8()), pa.array([0, 1, 0], pa.int32()),
+                             [pa.array([2.0, None]), pa.array(["r"])], ["f", "t"], type_codes=[5, 9]),
+)
+for b in (first, second):
+    b.validate(full=True)
+with ipc.new_file("views.arrow", views) as w:
+    w.write_batch(first)
+    w.write_batch(second)
+with ipc.new_stream("views-zstd.arrows", views, options=ipc.IpcWriteOptions(compression="zstd")) as w:
+    w.write_batch(first)
+    w.write_batch(second)
+
+# Polars writes strings and binary as views by default: a real-world check.
+import polars as pl
+
+pl.DataFrame({
+    "name": ["T01", "a value longer than twelve bytes", None],
+    "data": [b"\x00", b"z" * 20, None],
+    "tags": [["a"], [], ["b", "another value longer than twelve"]],
+    "power": [1.5, None, 3.25],
+}).write_ipc("polars.arrow", compression="zstd")

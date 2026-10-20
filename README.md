@@ -256,8 +256,9 @@ like one of these formats but can't be read, the reason is shown above a hex dum
   or Zstandard), nested values shown as compact JSON; Avro without its schema (Confluent
   schema-registry framing, single-object encoding) can't be decoded and says so.
 - **Arrow IPC:** file and stream formats, LZ4 or Zstd compressed buffers, dictionary-encoded
-  columns; nested values are shown inline (`[a, b]`, `{x: 1}`); Union, view types and run-end
-  encoded columns are noted.
+  columns; nested values are shown inline (`[a, b]`, `{x: 1}`). Every column type is decoded,
+  including the string and binary views recent Polars and DataFusion write by default (Utf8View,
+  BinaryView), list views, run-end encoded columns and sparse or dense unions.
 - **SQLite:** read directly from the file format: tables with columns and row counts, indexes,
   views and triggers, and the first rows of each table; WITHOUT ROWID tables, overflow pages and
   UTF-16 databases are read; in WAL mode, changes still in the `-wal` file aren't part of the payload.

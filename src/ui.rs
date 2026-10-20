@@ -2540,6 +2540,50 @@ mod tests {
     }
 
     #[test]
+    fn vim_backspace_and_ctrl_w_edit_only_while_filtering() {
+        let (mut app, _rx) = sample_vim(tmp_config("vim-backspace"));
+        typ(&mut app, "/v1/plant");
+        press(&mut app, &[KeyCode::Enter]);
+        press(&mut app, &[KeyCode::Backspace]);
+        ctrl(&mut app, 'w');
+        assert_eq!(app.filter_text, "v1/plant", "kept while moving");
+        typ(&mut app, "/");
+        press(&mut app, &[KeyCode::Backspace]);
+        assert_eq!(app.filter_text, "v1/plan");
+        ctrl(&mut app, 'w');
+        assert_eq!(app.filter_text, "v1/");
+    }
+
+    #[test]
+    fn vim_tab_ends_filtering() {
+        let (mut app, _rx) = sample_vim(tmp_config("vim-tab"));
+        typ(&mut app, "/line1");
+        press(&mut app, &[KeyCode::Tab]);
+        assert!(app.focus == Focus::Conns && !app.filtering);
+        assert_eq!(app.filter_text, "line1", "tab keeps the filter");
+        // esc in the panel goes back to the tree rather than clearing.
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.focus == Focus::Tree);
+        assert_eq!(app.filter_text, "line1");
+        typ(&mut app, "/");
+        press(&mut app, &[KeyCode::BackTab]);
+        assert!(!app.filtering);
+    }
+
+    #[test]
+    fn vim_ctrl_d_u_page_the_viewer() {
+        let (mut app, _rx) = sample_vim(tmp_config("vim-viewer"));
+        typ(&mut app, "/v1/+/line1/temp");
+        press(&mut app, &[KeyCode::Enter, KeyCode::Enter]);
+        app.resize(app.width, 10); // short enough for the message to need paging
+        assert!(app.viewer.is_some());
+        ctrl(&mut app, 'd');
+        assert!(app.viewer.as_ref().unwrap().scroll > 0, "ctrl+d pages down");
+        ctrl(&mut app, 'u');
+        assert_eq!(app.viewer.as_ref().unwrap().scroll, 0, "ctrl+u pages up");
+    }
+
+    #[test]
     fn vim_q_e_t_y() {
         let (mut app, _rx) = sample_vim(tmp_config("vim-q"));
         typ(&mut app, "q");

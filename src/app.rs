@@ -476,6 +476,7 @@ impl App {
         let i = order.iter().position(|&f| f == self.focus).unwrap_or(1);
         let n = order.len();
         let next = order[if back { (i + n - 1) % n } else { (i + 1) % n }];
+        self.filtering = false; // the filter is typed in the tree
         match next {
             Focus::Msgs => self.enter_msgs(),
             f => {
@@ -659,6 +660,9 @@ impl App {
         let code = match k.code {
             KeyCode::Char('d') if ctrl => KeyCode::PageDown,
             KeyCode::Char('u') if ctrl => KeyCode::PageUp,
+            // They edit the filter only while it's being typed.
+            KeyCode::Char('w') if ctrl => return None,
+            KeyCode::Backspace => return None,
             _ if ctrl => return Some(k),
             KeyCode::Char('j') => KeyCode::Down,
             KeyCode::Char('k') => KeyCode::Up,
@@ -1464,6 +1468,15 @@ impl App {
     }
 
     fn viewer_key(&mut self, k: KeyEvent) {
+        let k = match k.code {
+            KeyCode::Char('d') if self.opts.vim && k.modifiers == KeyModifiers::CONTROL => {
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)
+            }
+            KeyCode::Char('u') if self.opts.vim && k.modifiers == KeyModifiers::CONTROL => {
+                KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)
+            }
+            _ => k,
+        };
         match k.code {
             KeyCode::Char('t') => return self.copy_topic(),
             KeyCode::Char('y') => return self.copy_message(),

@@ -111,8 +111,18 @@ fn could_grow(seq: &str) -> bool {
 /// returns the next event if one arrives within the given time. Returns
 /// the key of a sequence that arrived split, or else the Esc and whatever
 /// followed it, as they came.
-pub fn after_esc(esc: KeyEvent, mut next: impl FnMut(Duration) -> io::Result<Option<Event>>) -> io::Result<Vec<Event>> {
-    let deadline = Instant::now() + ESC_WAIT;
+pub fn after_esc(esc: KeyEvent, next: impl FnMut(Duration) -> io::Result<Option<Event>>) -> io::Result<Vec<Event>> {
+    after_esc_within(esc, ESC_WAIT, next)
+}
+
+/// `after_esc`, waiting at most `wait` for the whole sequence (tests use
+/// a long one, so a slow machine can't change their outcome).
+fn after_esc_within(
+    esc: KeyEvent,
+    wait: Duration,
+    mut next: impl FnMut(Duration) -> io::Result<Option<Event>>,
+) -> io::Result<Vec<Event>> {
+    let deadline = Instant::now() + wait;
     let mut seq = String::new();
     let mut came = vec![Event::Key(esc)];
     while could_grow(&seq) {
@@ -203,10 +213,12 @@ mod tests {
         assert!(!could_grow("x") && !could_grow("OA") && !could_grow("[A"));
     }
 
-    /// Feeds `events` to `after_esc` as if they arrived one after another.
+    /// Feeds `events` to `after_esc` as if they arrived one after another
+    /// (with time to spare, so only the events decide).
     fn run(events: Vec<Event>) -> Vec<Event> {
         let mut q: VecDeque<Event> = events.into();
-        after_esc(key(KeyCode::Esc, KeyModifiers::NONE), |_| Ok(q.pop_front())).unwrap()
+        let esc = key(KeyCode::Esc, KeyModifiers::NONE);
+        after_esc_within(esc, Duration::from_secs(60), |_| Ok(q.pop_front())).unwrap()
     }
 
     fn ch(c: char) -> Event {
@@ -256,20 +268,24 @@ mod tests {
 
     #[test]
     fn one_deadline_for_the_whole_sequence() {
-        // Characters a few ms apart, then nothing: each wait asked for is
-        // what's left of the same deadline, so it shrinks, and none goes
-        // past ESC_WAIT from the Esc.
+        // Characters a millisecond apart, then nothing: each wait asked for
+        // is what's left of the same deadline, so it shrinks and never
+        // exceeds the window. (A window of a second: a slow machine can't
+        // run past it in three asks.)
+        let wait = Duration::from_secs(1);
         let mut q: VecDeque<Event> = vec![ch('['), ch('1')].into();
         let mut asked = Vec::new();
-        let out = after_esc(key(KeyCode::Esc, KeyModifiers::NONE), |d| {
+        let out = after_esc_within(key(KeyCode::Esc, KeyModifiers::NONE), wait, |d| {
             asked.push(d);
-            std::thread::sleep(Duration::from_millis(3).min(d));
+            std::thread::sleep(Duration::from_millis(1));
             Ok(q.pop_front())
         })
         .unwrap();
         assert_eq!(out.len(), 3, "Esc, '[', '1': not a key after all");
         assert_eq!(asked.len(), 3);
-        assert!(asked[0] <= ESC_WAIT);
+        assert!(asked[0] <= wait);
         assert!(asked.windows(2).all(|w| w[1] < w[0]), "{asked:?}");
+        // And the real window is a short one.
+        assert!(ESC_WAIT <= Duration::from_millis(50));
     }
 }

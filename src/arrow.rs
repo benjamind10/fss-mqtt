@@ -560,13 +560,12 @@ fn parse_type(id: u8, t: Option<Table>) -> R<Ty> {
             if mode != 0 && mode != 1 {
                 return Err("bad union mode".into());
             }
-            let ids = t.as_ref().map_or(Ok(&[][..]), |t| t.vector(1, 4))?;
-            Ty::Union(
-                mode,
-                ids.chunks_exact(4)
-                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect(),
-            )
+            let raw = t.as_ref().map_or(Ok(&[][..]), |t| t.vector(1, 4))?;
+            let ids: Vec<i32> = raw.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c)).collect();
+            if ids.iter().enumerate().any(|(k, id)| ids[..k].contains(id)) {
+                return Err("union type id listed twice".into());
+            }
+            Ty::Union(mode, ids)
         }
         15 => Ty::FixedBinary(width(i32f(0, 0)?)?),
         16 => Ty::FixedList(width(i32f(0, 0)?)?),
@@ -1804,6 +1803,7 @@ mod tests {
         I16(i16),
         I32(i32),
         Str(&'static str),
+        I32s(Vec<i32>),
         Table(Vec<(usize, Fb)>),
         Tables(Vec<Vec<(usize, Fb)>>),
     }
@@ -1842,6 +1842,12 @@ mod tests {
                     let p = buf.len();
                     buf.extend((s.len() as u32).to_le_bytes());
                     buf.extend(s.as_bytes());
+                    p
+                }
+                Fb::I32s(v) => {
+                    let p = buf.len();
+                    buf.extend((v.len() as u32).to_le_bytes());
+                    v.iter().for_each(|x| buf.extend(x.to_le_bytes()));
                     p
                 }
                 Fb::Table(t) => put(buf, t),
@@ -1898,6 +1904,32 @@ mod tests {
         let mut bad = int_field();
         bad[3] = (3, Fb::Table(vec![(0, Fb::I32(12))]));
         assert!(sniff("", &schema_stream(vec![(1, Fb::Tables(vec![bad]))])).is_none());
+        // A union whose type ids name a member twice is malformed.
+        let union = |ids: Vec<i32>| {
+            let member = |name| {
+                vec![
+                    (0, Fb::Str(name)),
+                    (2, Fb::U8(2)),
+                    (3, Fb::Table(vec![(0, Fb::I32(32))])),
+                ]
+            };
+            let field = vec![
+                (0, Fb::Str("u")),
+                (2, Fb::U8(14)),
+                (3, Fb::Table(vec![(0, Fb::I16(1)), (1, Fb::I32s(ids))])),
+                (5, Fb::Tables(vec![member("a"), member("b")])),
+            ];
+            schema_stream(vec![(1, Fb::Tables(vec![field]))])
+        };
+        let ct = "application/vnd.apache.arrow.stream";
+        let v = read(ct, &union(vec![5, 9]), MAX_ROWS, ROW_BUDGET).unwrap().unwrap();
+        assert_eq!(v.columns[0].1, "UNION<a: UINT32, b: UINT32>");
+        let twice = read(ct, &union(vec![5, 5]), MAX_ROWS, ROW_BUDGET).unwrap();
+        assert!(
+            twice.as_ref().err().is_some_and(|e| e.contains("listed twice")),
+            "{:?}",
+            twice.err()
+        );
         // No fields: only with a content type.
         let empty = schema_stream(vec![]);
         assert!(sniff("", &empty).is_none());

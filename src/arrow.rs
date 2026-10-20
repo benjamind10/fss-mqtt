@@ -560,10 +560,18 @@ fn parse_type(id: u8, t: Option<Table>) -> R<Ty> {
             if mode != 0 && mode != 1 {
                 return Err("bad union mode".into());
             }
+            // Type codes are i8 (rows hold them as such), each listed once:
+            // checked as read, so a long hostile list stops within 257.
             let raw = t.as_ref().map_or(Ok(&[][..]), |t| t.vector(1, 4))?;
-            let ids: Vec<i32> = raw.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c)).collect();
-            if ids.iter().enumerate().any(|(k, id)| ids[..k].contains(id)) {
-                return Err("union type id listed twice".into());
+            let mut ids = Vec::new();
+            let mut seen = [false; 256];
+            for c in raw.as_chunks::<4>().0 {
+                let id = i32::from_le_bytes(*c);
+                let b = i8::try_from(id).map_err(|_| "union type id out of range")? as u8 as usize;
+                if std::mem::replace(&mut seen[b], true) {
+                    return Err("union type id listed twice".into());
+                }
+                ids.push(id);
             }
             Ty::Union(mode, ids)
         }
@@ -1924,12 +1932,22 @@ mod tests {
         let ct = "application/vnd.apache.arrow.stream";
         let v = read(ct, &union(vec![5, 9]), MAX_ROWS, ROW_BUDGET).unwrap().unwrap();
         assert_eq!(v.columns[0].1, "UNION<a: UINT32, b: UINT32>");
-        let twice = read(ct, &union(vec![5, 5]), MAX_ROWS, ROW_BUDGET).unwrap();
-        assert!(
-            twice.as_ref().err().is_some_and(|e| e.contains("listed twice")),
-            "{:?}",
-            twice.err()
-        );
+        let refused = |ids: Vec<i32>, why: &str| {
+            let r = read(ct, &union(ids), MAX_ROWS, ROW_BUDGET).unwrap();
+            assert!(
+                r.as_ref().err().is_some_and(|e| e.contains(why)),
+                "{why}: {:?}",
+                r.err()
+            );
+        };
+        refused(vec![5, 5], "listed twice");
+        refused(vec![-128, 127, -128], "listed twice");
+        refused(vec![5, 300], "out of range");
+        // A long hostile list is turned down at once, not compared pairwise.
+        let start = std::time::Instant::now();
+        refused((0..100_000).collect(), "out of range");
+        refused((0..100_000).map(|i| i % 100).collect(), "listed twice");
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
         // No fields: only with a content type.
         let empty = schema_stream(vec![]);
         assert!(sniff("", &empty).is_none());

@@ -16,6 +16,7 @@ mod fmt;
 mod glyph;
 mod gzip;
 mod json;
+mod keys;
 mod mqtt;
 mod parquet;
 mod pemkey;
@@ -38,7 +39,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind};
 use ratatui::crossterm::execute;
 
 const FRAME: Duration = Duration::from_millis(66);
@@ -722,14 +723,32 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut app::App) -> st
         if event::poll(FRAME)? {
             // Handle everything already queued, then redraw once.
             loop {
-                match event::read()? {
-                    Event::Key(k) if k.kind != KeyEventKind::Release => app.key(k),
-                    Event::Paste(s) => app.paste(&s),
-                    Event::Resize(w, h) => app.resize(w, h),
-                    _ => {}
-                }
-                if app.quit {
-                    return Ok(());
+                let events = match event::read()? {
+                    // Maybe the start of a key whose sequence arrived in two
+                    // reads (an arrow: Esc, then "[B"); see keys.rs.
+                    Event::Key(k)
+                        if k.kind != KeyEventKind::Release && k.code == KeyCode::Esc && k.modifiers.is_empty() =>
+                    {
+                        keys::after_esc(k, |wait| {
+                            if event::poll(wait)? {
+                                event::read().map(Some)
+                            } else {
+                                Ok(None)
+                            }
+                        })?
+                    }
+                    e => vec![e],
+                };
+                for e in events {
+                    match e {
+                        Event::Key(k) if k.kind != KeyEventKind::Release => app.key(k),
+                        Event::Paste(s) => app.paste(&s),
+                        Event::Resize(w, h) => app.resize(w, h),
+                        _ => {}
+                    }
+                    if app.quit {
+                        return Ok(());
+                    }
                 }
                 if !event::poll(Duration::ZERO)? {
                     break;

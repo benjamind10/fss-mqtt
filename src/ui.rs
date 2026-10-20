@@ -833,7 +833,16 @@ fn input_box(buf: &mut Buffer, r: Rect, app: &App) {
         FilterMode::None => vec![],
     };
     let mut left = vec![Span::styled("> ", th.accent_b)];
-    if app.filter_text.is_empty() {
+    // Vim mode shows an edit cursor only while `/` is filtering.
+    let navigating = app.opts.vim && !app.filtering;
+    if navigating && app.filter_text.is_empty() {
+        left.push(Span::styled(
+            "/ to filter  ·  v1/#   sensor/+/temp   or any text",
+            th.faint,
+        ));
+    } else if navigating {
+        left.push(Span::styled(app.filter_text.clone(), th.text));
+    } else if app.filter_text.is_empty() {
         left.push(Span::styled("T", th.cursor));
         left.push(Span::styled(
             "ype to filter  ·  v1/#   sensor/+/temp   or any text",
@@ -927,14 +936,41 @@ fn hints<'a>(app: &App) -> Line<'a> {
     // main screen's version sits on the input box, not on this line.)
     let room = (app.width as usize).saturating_sub(1);
     let space = format!("space {}", glyph::ENTER);
-    let mut keys: Vec<(&str, &str, u8)> = match app.focus {
-        Focus::Conns => vec![
+    let mut keys: Vec<(&str, &str, u8)> = match (app.opts.vim, app.filtering, app.focus) {
+        (true, true, _) => vec![(glyph::ENTER, "keep", 0), ("esc", "clear", 0), ("^w", "level", 2)],
+        (true, false, Focus::Conns) => vec![
+            ("j k", "move", 3),
+            (&space, "connect / on-off", 1),
+            ("tab", "pane", 2),
+            ("/", "filter", 1),
+        ],
+        (true, false, Focus::Msgs) => vec![
+            ("j k", "messages", 3),
+            (glyph::ENTER, "open", 2),
+            ("e", "publish", 1),
+            ("t y", "copy", 1),
+            ("^r", "capture", 1),
+            ("h esc", "back", 2),
+            ("tab", "pane", 2),
+        ],
+        (true, false, Focus::Tree) => vec![
+            ("j k", "move", 3),
+            ("h l", "collapse/expand", 3),
+            (glyph::ENTER, "open", 2),
+            ("/", "filter", 1),
+            ("e", "publish", 1),
+            ("t y", "copy", 1),
+            ("^r", "capture", 1),
+            ("esc", "clear filter", 2),
+            ("tab", "pane", 2),
+        ],
+        (false, _, Focus::Conns) => vec![
             ("↑↓", "move", 3),
             (&space, "connect / on-off", 1),
             ("tab", "pane", 2),
             ("type", "filter", 2),
         ],
-        Focus::Msgs => vec![
+        (false, _, Focus::Msgs) => vec![
             ("↑↓", "messages", 3),
             (glyph::ENTER, "open", 2),
             ("^e", "publish", 1),
@@ -943,7 +979,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
             ("← esc", "back", 2),
             ("tab", "pane", 2),
         ],
-        Focus::Tree => vec![
+        (false, _, Focus::Tree) => vec![
             ("↑↓", "move", 3),
             ("←→", "collapse/expand", 3),
             (glyph::ENTER, "open", 2),
@@ -957,7 +993,11 @@ fn hints<'a>(app: &App) -> Line<'a> {
     if app.upgrade.as_ref().is_some_and(|w| w.offering().is_some()) {
         keys.push(("^n", "restart", 0));
     }
-    keys.push(("^c", "quit", 0));
+    if !app.opts.vim {
+        keys.push(("^c", "quit", 0));
+    } else if !app.filtering {
+        keys.push(("q", "quit", 0));
+    }
     hint(&app.th, &keys, room)
 }
 
@@ -1238,7 +1278,10 @@ mod tests {
                 key_password: None,
             });
         }
-        let opts = Options { inline_bytes: 64 };
+        let opts = Options {
+            inline_bytes: 64,
+            vim: false,
+        };
         let mut app = App::new(
             Arc::new(Mutex::new(st)),
             opts,
@@ -2395,5 +2438,169 @@ mod tests {
         typ(&mut app, "tr");
         assert!(app.focus == Focus::Tree && app.filter_text == "tr");
         let _ = std::fs::remove_file(&cfg);
+    }
+
+    /// `sample` with --vim.
+    fn sample_vim(config_path: PathBuf) -> (App, Vec<Receiver<Cmd>>) {
+        let (mut app, rx) = sample(config_path);
+        app.opts.vim = true;
+        (app, rx)
+    }
+
+    fn sel_path(a: &App) -> String {
+        a.store.lock().unwrap().nodes[a.selected.unwrap()].path.clone()
+    }
+
+    #[test]
+    fn letters_filter_without_vim() {
+        let (mut app, _rx) = sample(tmp_config("novim"));
+        typ(&mut app, "j");
+        assert_eq!(app.filter_text, "j");
+    }
+
+    #[test]
+    fn vim_letters_navigate_the_tree() {
+        let (mut app, _rx) = sample_vim(tmp_config("vim-tree"));
+        let start = sel_path(&app);
+        typ(&mut app, "j");
+        assert_eq!(app.filter_text, "");
+        assert_ne!(sel_path(&app), start);
+
+        typ(&mut app, "G");
+        assert_eq!(app.cursor, app.rows.len() - 1);
+        typ(&mut app, "g");
+        assert_eq!(app.cursor, 0);
+
+        // The first topic under local: l opens it, h closes it.
+        typ(&mut app, "j");
+        assert!(!app.rows[app.cursor].expanded);
+        typ(&mut app, "l");
+        assert!(app.rows[app.cursor].expanded);
+        typ(&mut app, "h");
+        assert!(!app.rows[app.cursor].expanded);
+        assert_eq!(app.filter_text, "");
+    }
+
+    #[test]
+    fn vim_letters_move_the_connections_panel() {
+        let (mut app, _rx) = sample_vim(tmp_config("vim-panel"));
+        press(&mut app, &[KeyCode::Tab]);
+        assert!(app.focus == Focus::Conns);
+        let sel = app.selected;
+        typ(&mut app, "j");
+        assert_eq!(app.panel_cursor, 1);
+        assert_eq!(app.selected, sel);
+        assert!(app.focus == Focus::Conns);
+    }
+
+    #[test]
+    fn vim_slash_filters() {
+        let (mut app, _rx) = sample_vim(tmp_config("vim-filter"));
+        typ(&mut app, "/");
+        assert!(app.filtering);
+        typ(&mut app, "v1/+/line1");
+        assert_eq!(app.filter_text, "v1/+/line1");
+        let v = frame(&app, "vim filter v1/+/line1");
+        assert!(v.contains("line1") && !v.contains("line2"));
+
+        // ⏎ keeps the filter and goes back to moving.
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(!app.filtering);
+        assert_eq!(app.filter_text, "v1/+/line1");
+        let before = sel_path(&app);
+        typ(&mut app, "j");
+        assert_eq!(app.filter_text, "v1/+/line1");
+        assert_ne!(sel_path(&app), before);
+
+        // esc while filtering clears it.
+        typ(&mut app, "/");
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(!app.filtering);
+        assert_eq!(app.filter_text, "");
+
+        // A paste goes to the filter, and letters after it too.
+        app.paste("v2");
+        assert!(app.filtering);
+        typ(&mut app, "/fleet");
+        assert_eq!(app.filter_text, "v2/fleet");
+    }
+
+    #[test]
+    fn vim_ctrl_u_pages_unless_filtering() {
+        let (mut app, _rx) = sample_vim(tmp_config("vim-ctrl-u"));
+        typ(&mut app, "/line1");
+        press(&mut app, &[KeyCode::Enter]);
+        ctrl(&mut app, 'u');
+        assert_eq!(app.filter_text, "line1", "ctrl+u pages up while moving");
+        ctrl(&mut app, 'd');
+        assert_eq!(app.filter_text, "line1");
+        typ(&mut app, "/");
+        ctrl(&mut app, 'u');
+        assert_eq!(app.filter_text, "", "ctrl+u clears while filtering");
+    }
+
+    #[test]
+    fn vim_q_e_t_y() {
+        let (mut app, _rx) = sample_vim(tmp_config("vim-q"));
+        typ(&mut app, "q");
+        assert!(app.quit);
+
+        let (mut app, _rx) = sample_vim(tmp_config("vim-e"));
+        typ(&mut app, "e");
+        assert!(app.composer.is_some());
+
+        let (mut app, _rx) = sample_vim(tmp_config("vim-copy"));
+        let last = |a: &App| {
+            a.clipboard
+                .recorded
+                .clone()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap_or_default()
+        };
+        let notice = |a: &App| a.notice.clone().map(|(t, err, _)| (t, err)).unwrap();
+        typ(&mut app, "/v1/+/line1/temp");
+        press(&mut app, &[KeyCode::Enter]);
+        typ(&mut app, "t");
+        assert_eq!(last(&app), "v1/plant/line1/temp");
+        assert!(notice(&app).0.starts_with("copied topic v1/plant/line1/temp · "));
+        typ(&mut app, "y");
+        let payload = r#"{"t":22.5,"ok":true,"tags":["a","b"],"note":null}"#;
+        assert_eq!(last(&app), payload);
+        let (t, err) = notice(&app);
+        assert!(
+            !err && t.starts_with(&format!("copied payload, {} B · ", payload.len())),
+            "{t}"
+        );
+        assert_eq!(app.filter_text, "v1/+/line1/temp");
+    }
+
+    #[test]
+    fn vim_hints_and_placeholder() {
+        let (app, _rx) = sample(tmp_config("hints-default"));
+        let v = frame(&app, "default hints");
+        assert!(v.contains("ype to filter") && !v.contains("/ to filter"), "{v}");
+        assert!(v.contains("^c quit") && !v.contains("q quit · "), "{v}");
+
+        let (mut app, _rx) = sample_vim(tmp_config("hints-vim"));
+        let v = frame(&app, "vim tree hints");
+        for want in ["j k move", "/ filter", "q quit", "/ to filter"] {
+            assert!(v.contains(want), "{want}: {v}");
+        }
+        assert!(!v.contains("^c quit") && !v.contains("ype to filter"), "{v}");
+
+        typ(&mut app, "/");
+        let v = frame(&app, "vim filtering hints");
+        assert!(v.contains(&format!("{} keep · esc clear", glyph::ENTER)), "{v}");
+        assert!(!v.contains("j k move") && !v.contains("q quit"), "{v}");
+        assert!(v.contains("ype to filter"), "{v}");
+
+        typ(&mut app, "line1");
+        press(&mut app, &[KeyCode::Enter, KeyCode::Down]);
+        assert!(frame(&app, "vim tree after filter").contains("j k move"));
+        press(&mut app, &[KeyCode::Right]);
+        let v = frame(&app, "vim msgs hints");
+        assert!(v.contains("j k messages") && v.contains("h esc back"), "{v}");
     }
 }

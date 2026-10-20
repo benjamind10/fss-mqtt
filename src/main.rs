@@ -70,6 +70,7 @@ Connection flags:
   -i, --client-id string     client id (default fss-mqtt-<random>)
       --history int          messages kept per topic (default 10)
       --inline int           payloads up to this many bytes are shown inline in the tree (default 64)
+      --vim                  vim keys: j k h l g G ctrl+d ctrl+u move, / filters, q quits
       --insecure             skip TLS certificate verification
       --key string           client private key PEM for mutual TLS (may be encrypted)
       --max-payload string   payload bytes kept per message; the rest is discarded on arrival (default \"4KiB\")
@@ -92,7 +93,8 @@ written anywhere else only when you ask: --capture or ctrl+r appends the
 messages on those topics, whole, to fss-mqtt-<connection>-<time>.jsonl.
 
 Environment: FSS_MQTT_BROKER, FSS_MQTT_USERNAME, FSS_MQTT_PASSWORD, FSS_MQTT_CAFILE,
-FSS_MQTT_KEY_PASSWORD (the --key passphrase), FSS_MQTT_CAPTURE_DIR, FSS_MQTT_SESSION";
+FSS_MQTT_KEY_PASSWORD (the --key passphrase), FSS_MQTT_CAPTURE_DIR, FSS_MQTT_SESSION,
+FSS_MQTT_KEYS (vim: as --vim)";
 
 struct Args {
     broker: Option<String>,
@@ -110,6 +112,8 @@ struct Args {
     history: usize,
     max_payload: usize,
     inline: usize,
+    /// Vim keys (--vim, FSS_MQTT_KEYS=vim).
+    vim: bool,
     insecure: bool,
     ca_file: Option<String>,
     cert: Option<String>,
@@ -147,6 +151,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         history: 10,
         max_payload: 4 * 1024,
         inline: 64,
+        vim: env("FSS_MQTT_KEYS").is_some_and(|v| v.eq_ignore_ascii_case("vim")),
         insecure: false,
         ca_file: env("FSS_MQTT_CAFILE"),
         cert: None,
@@ -204,6 +209,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--max-payload" => a.max_payload = parse_size(&val()?).map_err(|e| format!("--max-payload: {e}"))?,
             "--inline" => a.inline = num(&name, val()?)?,
             "--insecure" => a.insecure = true,
+            "--vim" => a.vim = true,
             "--cafile" => a.ca_file = Some(val()?),
             "--cert" => a.cert = Some(val()?),
             "--key" => a.key = Some(val()?),
@@ -597,7 +603,10 @@ fn run() -> Result<(), String> {
         restored = Some(l.header.view);
     }
 
-    let opts = app::Options { inline_bytes: a.inline };
+    let opts = app::Options {
+        inline_bytes: a.inline,
+        vim: a.vim,
+    };
     let mut app = app::App::new(store, opts, theme::Theme::detect(), ctls, path, ask);
     if let Some(view) = &restored {
         app.restore_view(view);
@@ -698,6 +707,9 @@ fn resume_command(a: &Args) -> String {
     let mut cmd = format!("{prog} --resume");
     if let Some(c) = &a.config {
         cmd += &format!(" --config {}", shell_quote(&c.to_string_lossy()));
+    }
+    if a.vim {
+        cmd += " --vim";
     }
     cmd
 }

@@ -74,15 +74,19 @@ pub fn escape_key(seq: &str) -> Option<KeyEvent> {
                 ('~', Some(n @ 23..=24)) => F((n - 12) as u8),
                 _ => return None,
             };
-            // xterm's modifier parameter: 1 + shift 1 + alt 2 + ctrl 4 +
-            // meta 8; anything past that isn't xterm's.
+            // The modifier parameter, read as crossterm reads it when the
+            // sequence arrives whole (so a split key comes out the same):
+            // 1 + shift 1, alt 2, ctrl 4, super 8, hyper 16, meta 32; the
+            // lock bits (64, 128) aren't modifiers.
             let mut mods = KeyModifiers::NONE;
             if let Some(m) = modifier {
-                let bits = m.checked_sub(1).filter(|b| *b < 16)?;
+                let bits = m.checked_sub(1)?;
                 mods.set(KeyModifiers::SHIFT, bits & 1 != 0);
                 mods.set(KeyModifiers::ALT, bits & 2 != 0);
                 mods.set(KeyModifiers::CONTROL, bits & 4 != 0);
-                mods.set(KeyModifiers::META, bits & 8 != 0);
+                mods.set(KeyModifiers::SUPER, bits & 8 != 0);
+                mods.set(KeyModifiers::HYPER, bits & 16 != 0);
+                mods.set(KeyModifiers::META, bits & 32 != 0);
             }
             if code == BackTab {
                 mods |= KeyModifiers::SHIFT;
@@ -172,12 +176,15 @@ mod tests {
             ("[1;5A", key(Up, KeyModifiers::CONTROL)),
             ("[1;3B", key(Down, KeyModifiers::ALT)),
             ("[5;5~", key(PageUp, KeyModifiers::CONTROL)),
-            ("[1;9A", key(Up, KeyModifiers::META)),
+            ("[1;9A", key(Up, KeyModifiers::SUPER)),
+            ("[1;17A", key(Up, KeyModifiers::HYPER)),
+            ("[1;33A", key(Up, KeyModifiers::META)),
+            ("[1;65A", key(Up, KeyModifiers::NONE)),
             (
                 "[1;16B",
                 key(
                     Down,
-                    KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::META,
+                    KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SUPER,
                 ),
             ),
             ("[15~", key(F(5), none)),
@@ -191,7 +198,7 @@ mod tests {
         ] {
             assert_eq!(escape_key(seq), None, "{seq:?}");
         }
-        assert_eq!(escape_key("[1;17A"), None, "past xterm's modifiers");
+        assert_eq!(escape_key("[1;256A"), None, "not a modifier value");
         assert!(could_grow("") && could_grow("[") && could_grow("[1;2") && could_grow("O"));
         assert!(!could_grow("x") && !could_grow("OA") && !could_grow("[A"));
     }
@@ -248,20 +255,21 @@ mod tests {
     }
 
     #[test]
-    fn it_waits_only_a_moment() {
-        // Nothing arrives: back after ESC_WAIT with the Esc alone.
-        let start = Instant::now();
+    fn one_deadline_for_the_whole_sequence() {
+        // Characters a few ms apart, then nothing: each wait asked for is
+        // what's left of the same deadline, so it shrinks, and none goes
+        // past ESC_WAIT from the Esc.
+        let mut q: VecDeque<Event> = vec![ch('['), ch('1')].into();
         let mut asked = Vec::new();
         let out = after_esc(key(KeyCode::Esc, KeyModifiers::NONE), |d| {
             asked.push(d);
-            std::thread::sleep(d);
-            Ok(None)
+            std::thread::sleep(Duration::from_millis(3).min(d));
+            Ok(q.pop_front())
         })
         .unwrap();
-        assert_eq!(out.len(), 1);
-        // What it asks for never adds up to more than ESC_WAIT (the time
-        // bound is loose: CI runners can be slow).
-        assert!(asked.iter().sum::<Duration>() <= ESC_WAIT);
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(out.len(), 3, "Esc, '[', '1': not a key after all");
+        assert_eq!(asked.len(), 3);
+        assert!(asked[0] <= ESC_WAIT);
+        assert!(asked.windows(2).all(|w| w[1] < w[0]), "{asked:?}");
     }
 }

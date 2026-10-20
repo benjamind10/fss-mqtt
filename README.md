@@ -113,6 +113,7 @@ connection, or turns a subscription (subscribed and unsubscribed live) or a capt
 | `--insecure` | | skip TLS certificate verification |
 | `--capture` | | topic filter to capture to disk (repeatable; see [Capture to disk](#capture-to-disk)) |
 | `--capture-dir` | current directory | where capture files go (also `FSS_MQTT_CAPTURE_DIR`) |
+| `--vim` | | vim keys for moving around (also `FSS_MQTT_KEYS=vim`; see [Vim keys](#vim-keys---vim)) |
 
 ## Filtering
 
@@ -153,6 +154,25 @@ clears. Clearing keeps the tree open at the topic you were on.
 | tree, messages | `ctrl+r` | capture this topic and everything below it to disk; again to stop |
 | anywhere | `ctrl+n` | when a newer fss-mqtt was installed meanwhile: restart into it, continuing the session |
 | anywhere | `ctrl+c` | quit (saving the session for `--resume`) |
+
+### Vim keys (`--vim`)
+
+With `--vim` (or `FSS_MQTT_KEYS=vim`), letters move around instead of filtering, as in Ranger;
+`/` starts the filter. The keys above keep working, apart from `ctrl+u`, which pages up.
+
+| Where | Key | |
+|---|---|---|
+| connections, tree, messages | `j k` | down / up (like `↓ ↑`) |
+| tree | `h l` | collapse / expand (like `← →`) |
+| messages | `h` | back to the tree |
+| connections, tree, messages | `g` / `G` | first / last (like `home` / `end`) |
+| tree, messages | `ctrl+d` / `ctrl+u` | page down / up |
+| anywhere | `/` | filter: type it, then `⏎` keeps it and goes back to moving, `esc` clears it |
+| tree, messages | `e` | publish (like `ctrl+e`) |
+| tree, messages | `t` / `y` | copy the topic / the message (like `ctrl+t` / `ctrl+y`) |
+| anywhere | `q` | quit (like `ctrl+c`) |
+
+While filtering, letters go to the filter, and `backspace`, `ctrl+w` and `ctrl+u` edit it as above.
 
 A green `•`/`▸` means the topic (or something under it) received a message in the last 1.5 s.
 
@@ -362,6 +382,9 @@ lines with the connection added, under one header line; `--open` reads it too. A
 newer fss-mqtt, in a newer format, is refused with a message rather than misread; a damaged one is
 continued as far as it can be read, and the status line says so. `--no-session`
 (or `FSS_MQTT_SESSION=off`) never writes one, for machines where payloads must not touch the disk.
+
+`FSS_MQTT_KEYS=vim` turns on vim keys like `--vim`, the way `FSS_MQTT_SESSION=off` stands in for
+`--no-session`.
 
 ## Performance notes
 

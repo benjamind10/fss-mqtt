@@ -833,7 +833,16 @@ fn input_box(buf: &mut Buffer, r: Rect, app: &App) {
         FilterMode::None => vec![],
     };
     let mut left = vec![Span::styled("> ", th.accent_b)];
-    if app.filter_text.is_empty() {
+    // Vim mode shows an edit cursor only while `/` is filtering.
+    let navigating = app.opts.vim && !app.filtering;
+    if navigating && app.filter_text.is_empty() {
+        left.push(Span::styled(
+            "/ to filter  ·  v1/#   sensor/+/temp   or any text",
+            th.faint,
+        ));
+    } else if navigating {
+        left.push(Span::styled(app.filter_text.clone(), th.text));
+    } else if app.filter_text.is_empty() {
         left.push(Span::styled("T", th.cursor));
         left.push(Span::styled(
             "ype to filter  ·  v1/#   sensor/+/temp   or any text",
@@ -927,14 +936,41 @@ fn hints<'a>(app: &App) -> Line<'a> {
     // main screen's version sits on the input box, not on this line.)
     let room = (app.width as usize).saturating_sub(1);
     let space = format!("space {}", glyph::ENTER);
-    let mut keys: Vec<(&str, &str, u8)> = match app.focus {
-        Focus::Conns => vec![
+    let mut keys: Vec<(&str, &str, u8)> = match (app.opts.vim, app.filtering, app.focus) {
+        (true, true, _) => vec![(glyph::ENTER, "keep", 0), ("esc", "clear", 0), ("^w", "level", 2)],
+        (true, false, Focus::Conns) => vec![
+            ("j k", "move", 3),
+            (&space, "connect / on-off", 1),
+            ("tab", "pane", 2),
+            ("/", "filter", 1),
+        ],
+        (true, false, Focus::Msgs) => vec![
+            ("j k", "messages", 3),
+            (glyph::ENTER, "open", 2),
+            ("e", "publish", 1),
+            ("t y", "copy", 1),
+            ("^r", "capture", 1),
+            ("h esc", "back", 2),
+            ("tab", "pane", 2),
+        ],
+        (true, false, Focus::Tree) => vec![
+            ("j k", "move", 3),
+            ("h l", "collapse/expand", 3),
+            (glyph::ENTER, "open", 2),
+            ("/", "filter", 1),
+            ("e", "publish", 1),
+            ("t y", "copy", 1),
+            ("^r", "capture", 1),
+            ("esc", "clear filter", 2),
+            ("tab", "pane", 2),
+        ],
+        (false, _, Focus::Conns) => vec![
             ("↑↓", "move", 3),
             (&space, "connect / on-off", 1),
             ("tab", "pane", 2),
             ("type", "filter", 2),
         ],
-        Focus::Msgs => vec![
+        (false, _, Focus::Msgs) => vec![
             ("↑↓", "messages", 3),
             (glyph::ENTER, "open", 2),
             ("^e", "publish", 1),
@@ -943,7 +979,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
             ("← esc", "back", 2),
             ("tab", "pane", 2),
         ],
-        Focus::Tree => vec![
+        (false, _, Focus::Tree) => vec![
             ("↑↓", "move", 3),
             ("←→", "collapse/expand", 3),
             (glyph::ENTER, "open", 2),
@@ -957,7 +993,11 @@ fn hints<'a>(app: &App) -> Line<'a> {
     if app.upgrade.as_ref().is_some_and(|w| w.offering().is_some()) {
         keys.push(("^n", "restart", 0));
     }
-    keys.push(("^c", "quit", 0));
+    if !app.opts.vim {
+        keys.push(("^c", "quit", 0));
+    } else if !app.filtering {
+        keys.push(("q", "quit", 0));
+    }
     hint(&app.th, &keys, room)
 }
 
@@ -2534,5 +2574,33 @@ mod tests {
             "{t}"
         );
         assert_eq!(app.filter_text, "v1/+/line1/temp");
+    }
+
+    #[test]
+    fn vim_hints_and_placeholder() {
+        let (app, _rx) = sample(tmp_config("hints-default"));
+        let v = frame(&app, "default hints");
+        assert!(v.contains("ype to filter") && !v.contains("/ to filter"), "{v}");
+        assert!(v.contains("^c quit") && !v.contains("q quit · "), "{v}");
+
+        let (mut app, _rx) = sample_vim(tmp_config("hints-vim"));
+        let v = frame(&app, "vim tree hints");
+        for want in ["j k move", "/ filter", "q quit", "/ to filter"] {
+            assert!(v.contains(want), "{want}: {v}");
+        }
+        assert!(!v.contains("^c quit") && !v.contains("ype to filter"), "{v}");
+
+        typ(&mut app, "/");
+        let v = frame(&app, "vim filtering hints");
+        assert!(v.contains(&format!("{} keep · esc clear", glyph::ENTER)), "{v}");
+        assert!(!v.contains("j k move") && !v.contains("q quit"), "{v}");
+        assert!(v.contains("ype to filter"), "{v}");
+
+        typ(&mut app, "line1");
+        press(&mut app, &[KeyCode::Enter, KeyCode::Down]);
+        assert!(frame(&app, "vim tree after filter").contains("j k move"));
+        press(&mut app, &[KeyCode::Right]);
+        let v = frame(&app, "vim msgs hints");
+        assert!(v.contains("j k messages") && v.contains("h esc back"), "{v}");
     }
 }

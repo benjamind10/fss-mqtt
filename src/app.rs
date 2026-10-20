@@ -67,6 +67,7 @@ fn same_link(a: &ConnCfg, b: &ConnCfg) -> bool {
 
 pub struct Options {
     pub inline_bytes: usize, // payloads up to this size are shown inline in the tree
+    pub vim: bool,           // --vim / FSS_MQTT_KEYS=vim: letters navigate, `/` filters
 }
 
 /// The UI's handle on one connection (same index as `Store::conns`).
@@ -150,6 +151,7 @@ pub struct App {
 
     pub filter_text: String,
     pub filter: Filter,
+    pub filtering: bool, // vim mode: `/` was pressed, letters go to the filter
     pub marks: Option<Vec<u8>>,
     pub matched: u32,
 
@@ -212,6 +214,7 @@ impl App {
             notice: None,
             filter_text: String::new(),
             filter: Filter::compile(""),
+            filtering: false,
             marks: None,
             matched: 0,
             rows: Vec::new(),
@@ -454,6 +457,7 @@ impl App {
             c.paste(s);
             c.fit(self.width, self.height);
         } else if self.viewer.is_none() {
+            self.filtering = self.opts.vim;
             let t = format!("{}{}", self.filter_text, s.trim());
             self.set_filter(t);
         }
@@ -521,6 +525,16 @@ impl App {
             KeyCode::BackTab => return self.next_focus(true),
             _ => {}
         }
+        // Before the panel, so it gets the translated keys too.
+        let k = if self.opts.vim {
+            match self.vim_key(k) {
+                Some(k) => k,
+                None => return,
+            }
+        } else {
+            k
+        };
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if self.focus == Focus::Conns && self.panel_key(k) {
             return;
         }
@@ -532,7 +546,9 @@ impl App {
             }
         }
         match k.code {
-            KeyCode::Char(c) if !ctrl && !k.modifiers.contains(KeyModifiers::ALT) => {
+            KeyCode::Char(c)
+                if !ctrl && !k.modifiers.contains(KeyModifiers::ALT) && (!self.opts.vim || self.filtering) =>
+            {
                 let t = format!("{}{c}", self.filter_text);
                 self.set_filter(t);
                 return;
@@ -619,6 +635,62 @@ impl App {
         }
         self.clamp_cursor();
         self.rebuild(false);
+    }
+
+    /// Vim mode only: rewrites a vim key into the KeyCode the panes already
+    /// handle, or acts and returns None (`/` `q` `e` `t` `y`, and ⏎/esc
+    /// while filtering).
+    fn vim_key(&mut self, k: KeyEvent) -> Option<KeyEvent> {
+        if self.filtering {
+            match k.code {
+                KeyCode::Enter => self.filtering = false,
+                KeyCode::Esc => {
+                    self.filtering = false;
+                    self.set_filter(String::new());
+                }
+                _ => return Some(k),
+            }
+            return None;
+        }
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if k.modifiers.contains(KeyModifiers::ALT) {
+            return Some(k);
+        }
+        let code = match k.code {
+            KeyCode::Char('d') if ctrl => KeyCode::PageDown,
+            KeyCode::Char('u') if ctrl => KeyCode::PageUp,
+            _ if ctrl => return Some(k),
+            KeyCode::Char('j') => KeyCode::Down,
+            KeyCode::Char('k') => KeyCode::Up,
+            KeyCode::Char('h') => KeyCode::Left,
+            KeyCode::Char('l') => KeyCode::Right,
+            KeyCode::Char('g') => KeyCode::Home,
+            KeyCode::Char('G') => KeyCode::End,
+            KeyCode::Char('/') => {
+                self.filtering = true;
+                self.focus = Focus::Tree;
+                self.msg_sel = None;
+                return None;
+            }
+            KeyCode::Char('q') => {
+                self.quit = true;
+                return None;
+            }
+            KeyCode::Char('e') => {
+                self.open_composer();
+                return None;
+            }
+            KeyCode::Char('t') if self.focus != Focus::Conns => {
+                self.copy_topic();
+                return None;
+            }
+            KeyCode::Char('y') if self.focus != Focus::Conns => {
+                self.copy_message();
+                return None;
+            }
+            _ => return Some(k),
+        };
+        Some(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
     // ── Connections panel ──────────────────────────────────────────────────

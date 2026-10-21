@@ -8,6 +8,23 @@ use ratatui::text::{Line, Span};
 use crate::fmt;
 use crate::theme::Theme;
 
+/// How much of a table a decoder keeps: on arrival a screenful (the first
+/// rows, about 4 KB of text); for a chart, the rows it can scroll through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    pub rows: usize,
+    /// Text the kept rows may take, cells as shown.
+    pub bytes: usize,
+}
+
+impl Limits {
+    pub const SCREEN: Limits = Limits { rows: 200, bytes: 4096 };
+    pub const CHART: Limits = Limits {
+        rows: 100_000,
+        bytes: 64 << 20,
+    };
+}
+
 pub struct DocView {
     /// Shown in the payload header, e.g. "Parquet".
     pub format: &'static str,

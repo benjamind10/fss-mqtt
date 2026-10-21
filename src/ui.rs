@@ -750,29 +750,6 @@ fn chart_box(buf: &mut Buffer, r: Rect, app: &App) {
     if inner.width < 16 || inner.height < 4 {
         return;
     }
-    let (lo, hi) = s.points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
-        (lo.min(p.1), hi.max(p.1))
-    });
-    // The latest value first (when it's a live one), where the numbers
-    // come from last: a narrow pane cuts that first.
-    let num = |v: f64| Span::styled(short(v), th.number);
-    let dim = |t: String| Span::styled(t, th.dim);
-    let mut head = vec![
-        Span::styled(s.name.clone(), th.accent_b),
-        dim(format!("  {}/{}", ch.sel + 1, ch.series.len())),
-    ];
-    if let (true, Some(last)) = (s.over_time, s.points.last()) {
-        head.extend([dim(" · last ".into()), num(last.1)]);
-    }
-    head.extend([
-        dim(" · min ".into()),
-        num(lo),
-        dim(" · max ".into()),
-        num(hi),
-        dim(format!(" · {}", s.source)),
-    ]);
-    put(buf, inner.x, inner.y, Line::from(head), inner.width);
-
     let body = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
     // With a choice and room for it, the list to pick from on the left.
     let mut plot = body;
@@ -799,12 +776,60 @@ fn chart_box(buf: &mut Buffer, r: Rect, app: &App) {
             ..body
         };
     }
+    // A point to a dot column (two to a cell, less the y labels'); more
+    // than that scroll.
+    ch.room.set((plot.width as usize).saturating_sub(8).max(1) * 2);
+    let Some((start, shown)) = ch.in_view() else { return };
 
-    let (x0, x1) = (s.points[0].0, s.points[s.points.len() - 1].0);
+    // The latest value first (when it's a live one), where the numbers
+    // come from last: a narrow pane cuts that first.
+    let (lo, hi) = range(&s.points);
+    let num = |v: f64| Span::styled(short(v), th.number);
+    let dim = |t: String| Span::styled(t, th.dim);
+    let mut head = vec![
+        Span::styled(s.name.clone(), th.accent_b),
+        dim(format!("  {}/{}", ch.sel + 1, ch.series.len())),
+    ];
+    if let (true, Some(last)) = (s.over_time, s.points.last()) {
+        head.extend([dim(" · last ".into()), num(last.1)]);
+    }
+    head.extend([
+        dim(" · min ".into()),
+        num(lo),
+        dim(" · max ".into()),
+        num(hi),
+        dim(format!(" · {}", s.source())),
+    ]);
+    put(buf, inner.x, inner.y, Line::from(head), inner.width);
+    // In the bottom border: which of them are in view (by message, or by
+    // row number), and what would keep all of a table cut on arrival.
+    let mut foot = Vec::new();
+    if shown.len() < s.points.len() {
+        let (a, b) = if s.over_time {
+            (start + 1, start + shown.len())
+        } else {
+            (shown[0].0 as usize + 1, shown[shown.len() - 1].0 as usize + 1)
+        };
+        foot.push(format!("{} {}–{}", s.unit, commas(a as u64), commas(b as u64)));
+    }
+    if ch.reading() {
+        foot.push("reading all rows…".into());
+    }
+    if let Some(size) = s.whole {
+        foot.push(format!("--max-payload {} keeps all", max_payload_for(size)));
+    }
+    if !foot.is_empty() {
+        border_label(buf, r, &foot.join(" · "), 0, th.dim);
+    }
+
+    // The y axis fits what's in view.
+    let (x0, x1) = (shown[0].0, shown[shown.len() - 1].0);
+    let (vlo, vhi) = range(shown);
     let xb = if x1 > x0 { [x0, x1] } else { [x0 - 1.0, x0 + 1.0] };
-    let yb = if hi > lo { [lo, hi] } else { [lo - 1.0, hi + 1.0] };
+    let yb = if vhi > vlo { [vlo, vhi] } else { [vlo - 1.0, vhi + 1.0] };
     let ylabels = [yb[0], (yb[0] + yb[1]) / 2.0, yb[1]].map(|v| Span::styled(short(v), th.dim));
-    let xlabels = [&s.ends.0, &s.ends.1].map(|e| Span::styled(e.clone(), th.dim));
+    let (e0, e1) = s.axis.ends(x0, x1);
+    let xlabels = [e0, e1].map(|e| Span::styled(e, th.dim));
     // Braille dots: 2×4 to a cell. The Windows console fonts don't have
     // them; half blocks are the finest they draw.
     let marker = if cfg!(windows) {
@@ -817,16 +842,16 @@ fn chart_box(buf: &mut Buffer, r: Rect, app: &App) {
             .marker(marker)
             .graph_type(GraphType::Line)
             .style(th.accent_b)
-            .data(&s.points),
+            .data(shown),
     ];
     // Few enough to tell apart: each one marked.
-    if s.points.len() <= plot.width as usize / 3 {
+    if shown.len() <= plot.width as usize / 3 {
         sets.push(
             Dataset::default()
                 .marker(Marker::Dot)
                 .graph_type(GraphType::Scatter)
                 .style(th.accent_b)
-                .data(&s.points),
+                .data(shown),
         );
     }
     Chart::new(sets)
@@ -847,6 +872,23 @@ fn chart_box(buf: &mut Buffer, r: Rect, app: &App) {
         )
         .legend_position(None)
         .render(plot, buf);
+}
+
+/// The lowest and highest value.
+fn range(points: &[(f64, f64)]) -> (f64, f64) {
+    points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+        (lo.min(p.1), hi.max(p.1))
+    })
+}
+
+/// The `--max-payload` that keeps `size` bytes: "512KiB", "2MiB".
+fn max_payload_for(size: usize) -> String {
+    let p = size.max(1).next_power_of_two();
+    if p >= 1 << 20 {
+        format!("{}MiB", p >> 20)
+    } else {
+        format!("{}KiB", (p >> 10).max(1))
+    }
 }
 
 /// A number for an axis or a heading: short, but as precise as it is.
@@ -1154,10 +1196,11 @@ fn hints<'a>(app: &App) -> Line<'a> {
         ],
         (true, false, Focus::Chart) => vec![
             ("j k", "column / field", 3),
+            ("h l", "scroll", 2),
             (glyph::ENTER, "open", 2),
             ("e", "publish", 1),
             ("t y", "copy", 1),
-            ("h esc", "back", 2),
+            ("esc", "back", 2),
             ("tab", "pane", 2),
         ],
         (true, false, Focus::Tree) => vec![
@@ -1188,10 +1231,11 @@ fn hints<'a>(app: &App) -> Line<'a> {
         ],
         (false, _, Focus::Chart) => vec![
             ("↑↓", "column / field", 3),
+            ("←→", "scroll", 2),
             (glyph::ENTER, "open", 2),
             ("^e", "publish", 1),
             ("^t ^y", "copy", 1),
-            ("← esc", "back", 2),
+            ("esc", "back", 2),
             ("tab", "pane", 2),
         ],
         (false, _, Focus::Tree) => vec![
@@ -3058,6 +3102,69 @@ mod tests {
             .unwrap_or_default();
         assert!(picked.ends_with("20 │") || picked.contains(" 20 "), "{v}");
         assert!(v.contains("Messages  10/10"), "{v}");
+    }
+
+    #[test]
+    fn chart_rows_scroll_with_left_and_right() {
+        // The sample keeps payloads whole (64 KiB): the Parquet table, cut
+        // to its first rows on arrival, is read again with all 500.
+        let (mut app, _rx) = sample(tmp_config("chart-scroll"));
+        typ(&mut app, "fastlog");
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+        assert!(app.focus == Focus::Chart);
+        // Read on a thread of its own: the first rows meanwhile.
+        if app.chart.reading() {
+            assert!(frame(&app, "reading").contains("reading all rows…"));
+        }
+        let start = std::time::Instant::now();
+        while app.chart.reading() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(10), "never read");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            app.tick();
+        }
+        let v = frame(&app, "500 rows, the first in view");
+        assert!(v.contains("· 500 rows") && v.contains(" rows 1–"), "{v}");
+        assert!(v.contains("←→ scroll") && v.contains("esc back"), "{v}");
+        assert_eq!(app.chart.in_view().unwrap().0, 0);
+
+        // → a quarter of the view on, shift+→ a whole one, ← back.
+        press(&mut app, &[KeyCode::Right]);
+        let quarter = app.chart.in_view().unwrap().0;
+        assert!(quarter > 0);
+        assert!(frame(&app, "scrolled").contains(&format!(" rows {}–", quarter + 1)));
+        app.key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        assert_eq!(app.chart.in_view().unwrap().0, quarter + app.chart.room.get());
+        app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        press(&mut app, &[KeyCode::Left, KeyCode::Left]);
+        assert_eq!(app.chart.in_view().unwrap().0, 0, "no further back than the first");
+        // Another column of the same table keeps the place.
+        press(&mut app, &[KeyCode::Right, KeyCode::Down]);
+        assert_eq!(app.chart.in_view().unwrap().0, quarter);
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.focus == Focus::Tree);
+
+        // Kept to 4 KiB, the table has its first rows, and the heading
+        // says what would keep them all.
+        let mut st = Store::new(10, 4096);
+        let c = st.add_conn("local", "mqtt://x", None, vec![sub("#")]);
+        let pq = std::fs::read(format!(
+            "{}/tests/fixtures/turbine-snappy.parquet",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let decoded = crate::pretty::decode_on_arrival(Some("application/parquet"), &pq);
+        let props = Props {
+            content_type: Some("application/parquet".into()),
+            ..Default::default()
+        };
+        st.add_decoded(c, "turbine/fastlog", &pq, 0, false, props, decoded);
+        let (mut app, _rx) = app_with(st, tmp_config("chart-cut"));
+        typ(&mut app, "fastlog");
+        let v = frame(&app, "cut on arrival");
+        assert!(
+            v.contains("· first ") && v.contains(" --max-payload 32KiB keeps all "),
+            "{v}"
+        );
     }
 
     #[test]

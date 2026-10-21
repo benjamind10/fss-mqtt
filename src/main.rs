@@ -625,6 +625,14 @@ fn run() -> Result<(), String> {
     }
 
     let mut terminal = ratatui::init();
+    // A panic on a thread that catches it (a table read in the background,
+    // chart.rs) leaves the terminal as it is.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if !chart::quiet_panics() {
+            hook(info);
+        }
+    }));
     let _ = execute!(stdout(), EnableBracketedPaste);
     let res = event_loop(&mut terminal, &mut app);
     let _ = execute!(stdout(), DisableBracketedPaste);

@@ -1447,14 +1447,25 @@ impl App {
         self.msg_sel = Some(msgs[i].seq);
     }
 
-    /// Keys in the chart: through its columns and fields.
+    /// Keys in the chart: through its columns and fields, and along the
+    /// rows (or messages) when there are more than fit.
     fn chart_key(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Up => self.chart.step(-1),
             KeyCode::Down => self.chart.step(1),
             KeyCode::Home | KeyCode::PageUp => self.chart.pick(0),
             KeyCode::End | KeyCode::PageDown => self.chart.pick(usize::MAX),
-            KeyCode::Left | KeyCode::Esc => {
+            KeyCode::Left | KeyCode::Right => {
+                // A quarter of what's in view, or (with shift) all of it.
+                let room = self.chart.room.get().max(2) as isize;
+                let by = if k.modifiers.contains(KeyModifiers::SHIFT) {
+                    room
+                } else {
+                    (room / 4).max(1)
+                };
+                self.chart.scroll(if k.code == KeyCode::Left { -by } else { by });
+            }
+            KeyCode::Esc => {
                 self.focus = Focus::Tree;
                 self.msg_sel = None;
             }
@@ -1470,6 +1481,8 @@ impl App {
     /// Keeps the chart in step with the topic in view and the message
     /// picked in the list (the one whose own rows are charted).
     pub fn update_chart(&mut self) {
+        // All of a big table's rows, read meanwhile.
+        self.chart.poll();
         let picked = matches!(self.focus, Focus::Msgs | Focus::Chart)
             .then_some(self.msg_sel)
             .flatten();

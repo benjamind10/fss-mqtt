@@ -13,11 +13,8 @@ use std::io::Read;
 use crate::fmt::commas;
 use crate::json::Json;
 use crate::values::{be_i128, clip, date, decimal, hex, time_of_day, timestamp, uuid};
-use crate::view::{Body, DocView, Fact};
+use crate::view::{Body, DocView, Fact, Limits};
 
-/// Records are decoded until the rendered cells reach about this many bytes.
-const ROW_BUDGET: usize = 4096;
-const MAX_ROWS: usize = 200;
 /// Bytes of text collected per cell before it's clipped for display.
 const CELL_BYTES: usize = 264;
 /// Refuse to inflate blocks larger than this.
@@ -72,7 +69,17 @@ struct Block<'a> {
     data: &'a [u8],
 }
 
+/// A container file's records, as many as `limits` allow (the forms
+/// without a schema have no rows to give).
+pub fn rows(_ct: &str, b: &[u8], limits: Limits) -> Option<Result<DocView, String>> {
+    b.starts_with(MAGIC).then(|| decode_with(b, limits))
+}
+
 pub fn decode(file: &[u8]) -> Result<DocView, String> {
+    decode_with(file, Limits::SCREEN)
+}
+
+pub fn decode_with(file: &[u8], limits: Limits) -> Result<DocView, String> {
     let mut r = Reader::new(file.get(MAGIC.len()..).ok_or("not an Avro file")?);
     let meta = read_meta(&mut r)?;
     let sync = r.take(16).map_err(|_| "file ends in the header")?;
@@ -163,12 +170,12 @@ pub fn decode(file: &[u8]) -> Result<DocView, String> {
                 }
             };
             let len: usize = row.iter().map(|c| c.as_ref().map_or(4, |s| s.len()) + 1).sum();
-            if !rows.is_empty() && used + len > ROW_BUDGET {
+            if !rows.is_empty() && used + len > limits.bytes {
                 break 'blocks;
             }
             used += len;
             rows.push(row);
-            if rows.len() >= MAX_ROWS {
+            if rows.len() >= limits.rows {
                 break 'blocks;
             }
         }
@@ -901,7 +908,7 @@ mod tests {
                 .flatten()
                 .map(|c| c.as_ref().map_or(4, |s| s.len()) + 1)
                 .sum();
-            assert!(rendered <= ROW_BUDGET, "{name}: rows use {rendered} bytes");
+            assert!(rendered <= Limits::SCREEN.bytes, "{name}: rows use {rendered} bytes");
             let detail = &d.sections.iter().find(|s| s.title == "Rows").unwrap().detail;
             assert_eq!(*detail, format!("· first {} of 300", rows.len()), "{name}");
         }

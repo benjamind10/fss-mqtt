@@ -819,7 +819,7 @@ fn chart_box(buf: &mut Buffer, r: Rect, app: &App) {
         foot.push(format!("--max-payload {} keeps all", max_payload_for(size)));
     }
     if !foot.is_empty() {
-        border_label(buf, r, &foot.join(" · "), th.dim);
+        border_label(buf, r, &foot.join(" · "), 0, th.dim);
     }
 
     // The y axis fits what's in view.

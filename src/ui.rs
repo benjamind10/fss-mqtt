@@ -141,8 +141,13 @@ fn panel_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
             th.dim,
         ));
     }
-    // Keep the cursor in view.
-    let offset = app.panel_cursor.saturating_sub(ih.saturating_sub(1));
+    // Where the panel was scrolled to, unless the frame is another size
+    // than the app has heard of yet: then wherever shows the cursor.
+    let offset = if (app.panel_offset..app.panel_offset + ih).contains(&app.panel_cursor) {
+        app.panel_offset
+    } else {
+        app.panel_cursor.saturating_sub(ih.saturating_sub(1))
+    };
     let name_w = st
         .conns
         .iter()
@@ -215,8 +220,23 @@ fn panel_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
         n => format!("Connections {up}/{brokers} · {n} files"),
     };
     draw_box(buf, r, &title, lines, focused, sel_line, th);
-    // Where the connections live; edits to the file apply while running.
-    border_label(buf, r, &crate::config::tilde(&app.config_path), th.faint);
+    // Rows scrolled out of view, on the left of the bottom border.
+    let (above, below) = (offset, app.panel.len().saturating_sub(offset + ih));
+    let more = match (above, below) {
+        (0, 0) => String::new(),
+        (0, b) => format!(" ↓ {b} more "),
+        (a, 0) => format!(" ↑ {a} more "),
+        (a, b) => format!(" ↑ {a} · ↓ {b} more "),
+    };
+    let mut used = fmt::str_width(&more);
+    if used > 0 && r.height > 2 && r.intersection(buf.area) == r && r.width as usize > used + 4 {
+        buf.set_string(r.x + 2, r.bottom() - 1, &more, th.dim);
+    } else {
+        used = 0; // not drawn: the path may have the room
+    }
+    // Where the connections live (edits to the file apply while running),
+    // on the right, in what room that leaves.
+    border_label(buf, r, &crate::config::tilde(&app.config_path), used, th.faint);
 }
 
 /// A capture rule after `lead`: `● capture site/# → file.jsonl · 12 msgs`.
@@ -250,9 +270,10 @@ fn capture_row<'a>(th: &Theme, cap: &crate::capture::Capture, j: usize, lead: Ve
 }
 
 /// Writes `label` into the bottom border of `r`, right-aligned, keeping its
-/// end (the file name) when it has to be cut.
-fn border_label(buf: &mut Buffer, r: Rect, label: &str, style: ratatui::style::Style) {
-    let room = (r.width as usize).saturating_sub(8);
+/// end (the file name) when it has to be cut; `taken` cells on the left of
+/// the border are kept clear.
+fn border_label(buf: &mut Buffer, r: Rect, label: &str, taken: usize, style: ratatui::style::Style) {
+    let room = (r.width as usize).saturating_sub(8 + taken);
     if room < 12 || r.height < 2 {
         return;
     }
@@ -1259,7 +1280,7 @@ fn composer_view(buf: &mut Buffer, area: Rect, app: &App) {
         }
     }
 
-    border_label(buf, r, &format!("ln {}, col {}", ed.row + 1, ed.col + 1), th.faint);
+    border_label(buf, r, &format!("ln {}, col {}", ed.row + 1, ed.col + 1), 0, th.faint);
     let keys = [
         ("^s", "send", 0),
         ("esc", "cancel", 0),
@@ -2987,5 +3008,77 @@ mod tests {
         assert_eq!(super::short(28450.5), "28450.5");
         assert_eq!(super::short(1.5e9), "1.50e9");
         assert_eq!(super::short(0.0004), "4.00e-4");
+    }
+
+    #[test]
+    fn many_connections_scroll_in_a_panel_of_five() {
+        let mut st = Store::new(10, 64 * 1024);
+        let mut ctls = Vec::new();
+        for i in 0..8 {
+            let name = format!("site{i}");
+            st.add_conn(&name, "mqtt://x:1883", None, vec![sub("#")]);
+            ctls.push(ConnCtl {
+                cfg: ConnCfg {
+                    name,
+                    url: "mqtt://x:1883".into(),
+                    topics: vec!["#".into()],
+                    ..Default::default()
+                },
+                saved: true,
+                tx: mpsc::channel().0,
+                password: None,
+                key_password: None,
+            });
+        }
+        let opts = Options {
+            inline_bytes: 64,
+            vim: false,
+        };
+        let mut app = App::new(
+            Arc::new(Mutex::new(st)),
+            opts,
+            Theme::new(false),
+            ctls,
+            tmp_config("many"),
+            vec![],
+        );
+        // However tall the window, five connections' rows; the rest scroll.
+        app.resize(110, 60);
+        app.tick();
+        assert_eq!(app.layout().panel_h, crate::app::PANEL_ROWS + 2);
+        let panel = |app: &App, label: &str| {
+            let v = frame(app, label);
+            let rows = crate::app::PANEL_ROWS as usize + 2;
+            v.lines().skip(1).take(rows).collect::<Vec<_>>().join("\n")
+        };
+        let p = panel(&app, "eight connections");
+        assert!(
+            p.contains("site0") && p.contains("site4") && !p.contains("site5"),
+            "{p}"
+        );
+        assert!(p.contains("↓ 6 more"), "{p}");
+
+        // In the panel, the end scrolls into view; moving up within the
+        // view doesn't scroll it.
+        press(&mut app, &[KeyCode::BackTab, KeyCode::End]);
+        assert!(app.focus == Focus::Conns);
+        let p = panel(&app, "scrolled to the end");
+        assert!(
+            p.contains("site7") && p.contains("site3") && !p.contains("site2"),
+            "{p}"
+        );
+        assert!(p.contains("↑ 6 more"), "{p}");
+        press(&mut app, &[KeyCode::Up, KeyCode::Up, KeyCode::Up]);
+        assert_eq!(app.panel_offset, 6, "still in view");
+        press(&mut app, &[KeyCode::PageUp]);
+        assert!(panel(&app, "a page up").contains("↑ 3 · ↓ 3 more"));
+        press(&mut app, &[KeyCode::Home]);
+        assert_eq!((app.panel_cursor, app.panel_offset), (0, 0));
+
+        // A short window has fewer rows, and still scrolls.
+        app.resize(110, 24);
+        press(&mut app, &[KeyCode::End]);
+        let p = frame(&app, "short window");
+        assert!(p.contains("site7") && p.contains("more"), "{p}");
     }
 }

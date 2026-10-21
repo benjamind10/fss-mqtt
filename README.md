@@ -305,6 +305,8 @@ like one of these formats but can't be read, the reason is shown above a hex dum
 A topic with numbers gets a chart in the lower half of its details, when the window has room for
 both. `tab` goes to it from the message list, and `↑ ↓` pick what it shows:
 
+![fss-mqtt charts: a turbine's telemetry fields over the messages kept, live, and on the next turbine the same field; the columns of a Parquet fast log and of a CSV report; the keys pressed show below](docs/chart.gif)
+
 - **The columns of a table in the message** (Parquet, Arrow, Avro, SQLite, CSV, Sparkplug
   DataSets), row by row. The x axis goes by the first column when that's text (a time, a name),
   otherwise by row number. A decoded table keeps its first rows (up to 200, about 4 KB of text),

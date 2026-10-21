@@ -43,6 +43,10 @@ impl Message {
 
 pub const ROOT: usize = 0;
 
+/// What the newest table messages (`Node::whole`) may take, all topics
+/// together; the ones kept longest make room.
+pub const WHOLE_BUDGET: usize = 64 << 20;
+
 pub struct Node {
     pub name: String,
     pub path: String,
@@ -55,6 +59,9 @@ pub struct Node {
     sorted: Vec<usize>,
     sorted_dirty: bool,
     msgs: VecDeque<Arc<Message>>, // oldest first
+    /// The newest message's whole payload, with its seq, when that's a
+    /// table cut on arrival: its chart can show every row.
+    pub whole: Option<(u64, Arc<Vec<u8>>)>,
     pub msg_count: u64,
     pub sub_msgs: u64,
     pub topics: u32,
@@ -75,6 +82,7 @@ impl Node {
             sorted: Vec::new(),
             sorted_dirty: false,
             msgs: VecDeque::new(),
+            whole: None,
             msg_count: 0,
             sub_msgs: 0,
             topics: 0,
@@ -173,6 +181,12 @@ pub struct Store {
     notices: Vec<(String, bool)>,
     /// Where capture files go (`--capture-dir`, the current directory by default).
     pub capture_dir: PathBuf,
+    /// The bytes all `Node::whole` take, what they may take, and the order
+    /// they were kept in (with entries since replaced, skipped).
+    whole_bytes: usize,
+    whole_budget: usize,
+    whole_order: VecDeque<(u64, usize)>,
+    whole_live: usize,
 }
 
 impl Store {
@@ -187,7 +201,48 @@ impl Store {
             received: 0,
             notices: Vec::new(),
             capture_dir: PathBuf::from("."),
+            whole_bytes: 0,
+            whole_budget: WHOLE_BUDGET,
+            whole_order: VecDeque::new(),
+            whole_live: 0,
         }
+    }
+
+    /// Keeps `whole` as node `n`'s newest whole payload (or none), within
+    /// the budget: the ones kept longest go first.
+    fn set_whole(&mut self, n: usize, whole: Option<(u64, Arc<Vec<u8>>)>) {
+        if let Some((_, old)) = self.nodes[n].whole.take() {
+            self.whole_bytes -= old.len();
+            self.whole_live -= 1;
+        }
+        if let Some((seq, p)) = whole.filter(|(_, p)| p.len() <= self.whole_budget) {
+            self.whole_bytes += p.len();
+            self.whole_live += 1;
+            self.whole_order.push_back((seq, n));
+            self.nodes[n].whole = Some((seq, p));
+        }
+        let nodes = &mut self.nodes;
+        while self.whole_bytes > self.whole_budget {
+            let Some((seq, i)) = self.whole_order.pop_front() else {
+                break;
+            };
+            if nodes[i].whole.as_ref().is_some_and(|(s, _)| *s == seq) {
+                let (_, p) = nodes[i].whole.take().unwrap();
+                self.whole_bytes -= p.len();
+                self.whole_live -= 1;
+            }
+        }
+        // Entries of payloads replaced since go now and then.
+        if self.whole_order.len() > 2 * self.whole_live + 64 {
+            self.whole_order
+                .retain(|(seq, i)| nodes[*i].whole.as_ref().is_some_and(|(s, _)| s == seq));
+        }
+    }
+
+    /// The budget for whole payloads (tests use a small one).
+    #[cfg(test)]
+    pub fn set_whole_budget(&mut self, bytes: usize) {
+        self.whole_budget = bytes;
     }
 
     /// Queues a status-line message (`error` shows it in red).
@@ -269,6 +324,13 @@ impl Store {
         root.sub_msgs -= msgs;
         root.topics -= topics;
         self.struct_ver += 1;
+        // Its whole payloads make room for others'.
+        let held: Vec<usize> = (0..self.nodes.len())
+            .filter(|&n| self.nodes[n].conn == i && self.nodes[n].whole.is_some())
+            .collect();
+        for n in held {
+            self.set_whole(n, None);
+        }
     }
 
     pub fn total(&self) -> u64 {
@@ -381,6 +443,13 @@ impl Store {
         }
 
         let new_topic = self.nodes[n].msg_count == 0;
+        // The newest message of a table topic, whole too when it was cut,
+        // so its chart can show every row.
+        let whole =
+            (payload.len() > keep && crate::pretty::rows_to_read(&msg)).then(|| (msg.seq, Arc::new(payload.to_vec())));
+        if whole.is_some() || self.nodes[n].whole.is_some() {
+            self.set_whole(n, whole);
+        }
         let history = self.history;
         let node = &mut self.nodes[n];
         node.msg_count += 1;
@@ -768,6 +837,56 @@ mod tests {
         assert!(!rows.iter().any(|r| s.nodes[r.node].path == "other/x"));
         // Search doesn't match connection names themselves.
         assert_eq!(Filter::compile("staging").visibility(&s).1, 0);
+    }
+
+    #[test]
+    fn the_newest_table_is_kept_whole() {
+        let pq = std::fs::read(format!(
+            "{}/tests/fixtures/turbine-snappy.parquet",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let mut st = Store::new(10, 4096);
+        let c = st.add_conn("c", "mqtt://x", None, vec![]);
+        let table = |st: &mut Store, topic: &str| {
+            let decoded = crate::pretty::decode_on_arrival(Some("application/parquet"), &pq);
+            let props = Props {
+                content_type: Some("application/parquet".into()),
+                ..Default::default()
+            };
+            st.add_decoded(c, topic, &pq, 0, false, props, decoded);
+        };
+        let has = |st: &Store, t: &str| st.nodes[st.find(c, t).unwrap()].whole.is_some();
+
+        // Cut to 4 KiB as a message, kept whole beside it.
+        table(&mut st, "a");
+        let a = st.find(c, "a").unwrap();
+        let newest = st.nodes[a].latest().unwrap().clone();
+        let (seq, p) = st.nodes[a].whole.clone().unwrap();
+        assert!(newest.truncated() && seq == newest.seq && p.len() == pq.len());
+        // A newer one takes its place; one that isn't a table lets it go.
+        table(&mut st, "a");
+        assert_eq!(st.nodes[a].whole.as_ref().unwrap().0, st.nodes[a].latest().unwrap().seq);
+        assert_eq!(st.whole_bytes, pq.len());
+        st.add(c, "a", b"just text", 0, false, Props::default());
+        assert!(!has(&st, "a") && st.whole_bytes == 0);
+        // CSV too, when it's cut; not when it all fits.
+        let csv: String = (0..1000).map(|i| format!("{i},{}\n", i * 2)).collect();
+        st.add(c, "csv", format!("t,v\n{csv}").as_bytes(), 0, false, Props::default());
+        st.add(c, "small", b"t,v\n1,2\n3,4\n", 0, false, Props::default());
+        assert!(has(&st, "csv") && !has(&st, "small"));
+
+        // Over the budget, the one kept longest goes first.
+        st.set_whole_budget(pq.len() * 2 + csv.len() + 10);
+        st.add(c, "csv", b"x", 0, false, Props::default());
+        table(&mut st, "a");
+        table(&mut st, "b");
+        table(&mut st, "c");
+        assert!(!has(&st, "a") && has(&st, "b") && has(&st, "c"));
+        assert_eq!(st.whole_bytes, 2 * pq.len());
+        // A connection removed lets its whole payloads go.
+        st.remove_conn(c);
+        assert_eq!((st.whole_bytes, st.whole_live), (0, 0));
     }
 
     #[test]

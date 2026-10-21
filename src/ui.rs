@@ -816,7 +816,10 @@ fn chart_box(buf: &mut Buffer, r: Rect, app: &App) {
         foot.push("reading all rows…".into());
     }
     if let Some(size) = s.whole {
-        foot.push(format!("--max-payload {} keeps all", max_payload_for(size)));
+        foot.push(format!(
+            "--max-payload {} keeps all",
+            crate::chart::max_payload_for(size)
+        ));
     }
     if !foot.is_empty() {
         border_label(buf, r, &foot.join(" · "), 0, th.dim);
@@ -879,16 +882,6 @@ fn range(points: &[(f64, f64)]) -> (f64, f64) {
     points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
         (lo.min(p.1), hi.max(p.1))
     })
-}
-
-/// The `--max-payload` that keeps `size` bytes: "512KiB", "2MiB".
-fn max_payload_for(size: usize) -> String {
-    let p = size.max(1).next_power_of_two();
-    if p >= 1 << 20 {
-        format!("{}MiB", p >> 20)
-    } else {
-        format!("{}KiB", (p >> 10).max(1))
-    }
 }
 
 /// A number for an axis or a heading: short, but as precise as it is.
@@ -1249,6 +1242,10 @@ fn hints<'a>(app: &App) -> Line<'a> {
             ("tab", "pane", 2),
         ],
     };
+    // Scrolling the chart, when there's more than fits.
+    if app.focus == Focus::Chart && !app.chart.scrollable() {
+        keys.retain(|(k, _, _)| !matches!(*k, "←→" | "h l"));
+    }
     if app.upgrade.as_ref().is_some_and(|w| w.offering().is_some()) {
         keys.push(("^n", "restart", 0));
     } else if app.updating.is_none() && app.update_offer().is_some() {
@@ -3143,28 +3140,66 @@ mod tests {
         press(&mut app, &[KeyCode::Esc]);
         assert!(app.focus == Focus::Tree);
 
-        // Kept to 4 KiB, the table has its first rows, and the heading
-        // says what would keep them all.
-        let mut st = Store::new(10, 4096);
-        let c = st.add_conn("local", "mqtt://x", None, vec![sub("#")]);
+        // Messages kept to 4 KiB: the newest table is kept whole all the
+        // same, so its chart has every row.
         let pq = std::fs::read(format!(
             "{}/tests/fixtures/turbine-snappy.parquet",
             env!("CARGO_MANIFEST_DIR")
         ))
         .unwrap();
-        let decoded = crate::pretty::decode_on_arrival(Some("application/parquet"), &pq);
-        let props = Props {
-            content_type: Some("application/parquet".into()),
-            ..Default::default()
+        let table_topic = |budget: usize| {
+            let mut st = Store::new(10, 4096);
+            st.set_whole_budget(budget);
+            let c = st.add_conn("local", "mqtt://x", None, vec![sub("#")]);
+            let decoded = crate::pretty::decode_on_arrival(Some("application/parquet"), &pq);
+            let props = Props {
+                content_type: Some("application/parquet".into()),
+                ..Default::default()
+            };
+            st.add_decoded(c, "turbine/fastlog", &pq, 0, false, props, decoded);
+            st
         };
-        st.add_decoded(c, "turbine/fastlog", &pq, 0, false, props, decoded);
-        let (mut app, _rx) = app_with(st, tmp_config("chart-cut"));
+        let (mut app, _rx) = app_with(table_topic(crate::store::WHOLE_BUDGET), tmp_config("chart-kept"));
         typ(&mut app, "fastlog");
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+        let start = std::time::Instant::now();
+        while app.chart.reading() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(10), "never read");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            app.tick();
+        }
+        let v = frame(&app, "the newest kept whole");
+        assert!(v.contains("· 500 rows") && !v.contains("--max-payload"), "{v}");
+        press(&mut app, &[KeyCode::Right]);
+        assert!(app.chart.in_view().unwrap().0 > 0, "scrolls without --max-payload");
+
+        // Past the budget for whole payloads: the first rows, what would
+        // keep them all, and ← → say so rather than nothing.
+        let (mut app, _rx) = app_with(table_topic(1024), tmp_config("chart-cut"));
+        typ(&mut app, "fastlog");
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
         let v = frame(&app, "cut on arrival");
         assert!(
             v.contains("· first ") && v.contains(" --max-payload 32KiB keeps all "),
             "{v}"
         );
+        assert!(!v.contains("←→ scroll"), "nothing to scroll: no such hint\n{v}");
+        app.notice = None;
+        press(&mut app, &[KeyCode::Right]);
+        let n = app.notice.as_ref().map(|n| n.0.clone()).unwrap_or_default();
+        assert!(
+            n.starts_with("only the first ") && n.ends_with("--max-payload 32KiB keeps them all"),
+            "{n}"
+        );
+
+        // A chart that's all in view says so.
+        let (mut app, _rx) = sample(tmp_config("chart-all-in-view"));
+        typ(&mut app, "v1/plant/line1/temp");
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+        frame(&app, "all in view");
+        press(&mut app, &[KeyCode::Left]);
+        let n = app.notice.as_ref().map(|n| n.0.clone()).unwrap_or_default();
+        assert_eq!(n, "all 3 messages are in view: nothing to scroll to");
     }
 
     #[test]

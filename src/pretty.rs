@@ -61,6 +61,19 @@ pub fn decode_rows(format: &str, content_type: Option<&str>, payload: &[u8]) -> 
     rows(&ct, payload, Limits::CHART)?.ok()
 }
 
+/// Whether all of a message's rows can be read again from its whole
+/// payload, for a chart: a Parquet, Arrow or Avro table decoded on arrival
+/// (`decode_rows`), or CSV.
+pub fn rows_to_read(m: &Message) -> bool {
+    match m.decoded.as_deref() {
+        Some(v) => v.has_table() && matches!(v.format, "Parquet" | "Arrow" | "Avro"),
+        None => matches!(
+            detect_payload(&m.payload, m.size, m.props.content_type.as_deref().unwrap_or("")),
+            Format::Csv(_)
+        ),
+    }
+}
+
 /// Decodes what a compressed payload unpacked to: every decoder but
 /// `compressed` itself, so nesting stops after one level.
 pub fn decode_unpacked(ct: &str, payload: &[u8]) -> Option<Decoded> {

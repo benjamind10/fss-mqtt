@@ -248,27 +248,34 @@ impl App {
     }
 
     pub fn layout(&self) -> Layout {
+        self.layout_for(self.width, self.height)
+    }
+
+    /// The panes for a `width` × `height` screen. Drawing passes the size
+    /// of the frame it draws, which can be newer than the last resize the
+    /// app has seen (the window shrank just before the frame).
+    pub fn layout_for(&self, width: u16, height: u16) -> Layout {
         // The connections panel takes what it needs, up to a third of the screen.
-        let max_panel = (self.height / 3).max(3);
+        let max_panel = (height / 3).max(3);
         let panel_h = (self.panel.len() as u16 + 2).clamp(3, max_panel);
-        let body_h = self.height.saturating_sub(5 + panel_h).max(4); // header + input box (3) + hints
-        if self.width < 80 {
+        let body_h = height.saturating_sub(5 + panel_h).max(4); // header + input box (3) + hints
+        if width < 80 {
             let th = body_h * 55 / 100;
             return Layout {
                 panel_h,
-                tree_w: self.width,
+                tree_w: width,
                 tree_h: th,
-                det_w: self.width,
+                det_w: width,
                 det_h: body_h - th,
                 stacked: true,
             };
         }
-        let tw = (self.width as u32 * 45 / 100) as u16;
+        let tw = (width as u32 * 45 / 100) as u16;
         Layout {
             panel_h,
             tree_w: tw,
             tree_h: body_h,
-            det_w: self.width - tw,
+            det_w: width - tw,
             det_h: body_h,
             stacked: false,
         }
@@ -279,6 +286,9 @@ impl App {
     }
 
     pub fn resize(&mut self, w: u16, h: u16) {
+        if (w, h) == (self.width, self.height) {
+            return; // a queued resize the per-frame sync already applied
+        }
         self.width = w;
         self.height = h;
         if let Some(v) = &mut self.viewer {

@@ -390,7 +390,7 @@ fn header<'a>(app: &App, st: &Store) -> Line<'a> {
             _ => "installing".into(),
         };
         left.push(Span::styled(format!("  ↑ {} · {what}…", j.version), th.accent_b));
-    } else if let Some(v) = app.release.as_ref().and_then(|c| c.available()) {
+    } else if let Some(v) = app.update_offer() {
         left.push(Span::styled(format!("  ↑ {v} available · ^n update"), th.accent_b));
     }
     let right = vec![
@@ -1186,7 +1186,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
     };
     if app.upgrade.as_ref().is_some_and(|w| w.offering().is_some()) {
         keys.push(("^n", "restart", 0));
-    } else if app.updating.is_none() && app.release.as_ref().is_some_and(|c| c.available().is_some()) {
+    } else if app.updating.is_none() && app.update_offer().is_some() {
         keys.push(("^n", "update", 0));
     }
     if !app.opts.vim {
@@ -2598,10 +2598,15 @@ mod tests {
         app.tick();
         assert!(app.updating.is_none() && notice(&app) == "couldn't update: no network");
 
-        // Installed, but nothing watches where this one was started from.
+        // Installed, but nothing watches where this one was started from;
+        // not offered again.
         app.updating = Some(Job::ended("99.0.0", Step::Done));
         app.tick();
         assert!(!app.quit && notice(&app).contains("start it again"), "{}", notice(&app));
+        app.notice = None;
+        assert!(!frame(&app, "installed").contains("^n update"));
+        app.key(ctrl_n);
+        assert!(app.updating.is_none() && notice(&app).contains("99.0.0 is installed: start it again"));
 
         // Installed in our place: the restart, continuing the session.
         let bin = std::env::temp_dir().join(format!("fss-mqtt-test-{}-update", std::process::id()));

@@ -114,7 +114,8 @@ impl Watch {
     /// Looks at the next `check` rather than when it's time: something was
     /// just installed.
     pub fn look_now(&mut self) {
-        self.checked = Instant::now() - CHECK_EVERY;
+        // (Not before the clock has run that long: then at the usual time.)
+        self.checked = Instant::now().checked_sub(CHECK_EVERY).unwrap_or(self.checked);
     }
 
     /// The version to offer a restart into: installed, and at the last look

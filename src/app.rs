@@ -192,6 +192,8 @@ pub struct App {
     /// The version an update installed, to restart into once it's noticed
     /// in our place, and since when.
     restart_into: Option<(String, Instant)>,
+    /// The version an update installed this run: not offered again.
+    installed: Option<String>,
     /// Quit to restart into it (ctrl+n), continuing the session.
     pub restart: bool,
 }
@@ -253,6 +255,7 @@ impl App {
             release: None,
             updating: None,
             restart_into: None,
+            installed: None,
             restart: false,
         };
         app.refresh_panel();
@@ -373,11 +376,12 @@ impl App {
             let note = format!("already updating to fss-mqtt {}", j.version);
             return self.notify(note, false);
         }
-        let Some(v) = self.release.as_ref().and_then(|c| c.available()).map(str::to_string) else {
-            let note = match &self.release {
-                Some(c) if c.known() => format!("fss-mqtt {} is the newest", env!("CARGO_PKG_VERSION")),
-                Some(_) => "no newer fss-mqtt found (yet)".into(),
-                None => "no newer fss-mqtt is installed".into(),
+        let Some(v) = self.update_offer().map(str::to_string) else {
+            let note = match (&self.release, &self.installed) {
+                (_, Some(v)) => format!("fss-mqtt {v} is installed: start it again to use it"),
+                (Some(c), _) if c.known() => format!("fss-mqtt {} is the newest", env!("CARGO_PKG_VERSION")),
+                (Some(_), _) => "no newer fss-mqtt found (yet)".into(),
+                (None, _) => "no newer fss-mqtt is installed".into(),
             };
             return self.notify(note, false);
         };
@@ -404,6 +408,7 @@ impl App {
                 Step::Done => {
                     let v = job.version.clone();
                     self.updating = None;
+                    self.installed = Some(v.clone());
                     if let Some(w) = &mut self.upgrade {
                         w.look_now();
                         self.restart_into = Some((v.clone(), Instant::now()));
@@ -434,6 +439,12 @@ impl App {
                 self.notify(note, true);
             }
         }
+    }
+
+    /// A newer release to offer: not one an update already installed.
+    pub fn update_offer(&self) -> Option<&str> {
+        let v = self.release.as_ref()?.available()?;
+        (self.installed.as_deref() != Some(v)).then_some(v)
     }
 
     /// The version an update just installed, while the restart into it waits.

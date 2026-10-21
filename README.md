@@ -440,7 +440,9 @@ fss-mqtt was installed, then restarts into it, continuing the session:
   release page.
 
 On Windows the restart is yours to do: fss-mqtt quits and prints the command to continue. Downloads
-go straight to GitHub over HTTPS, not through a proxy. `FSS_MQTT_UPDATE=off` turns looking for
+go straight to GitHub over HTTPS, not through a proxy. The `SHA256SUMS` check catches a broken
+download, not a tampered release: it comes from the same release, so trusting it means trusting
+GitHub and the TLS to it, as when you download a release by hand. `FSS_MQTT_UPDATE=off` turns looking for
 releases off, and then no request is made.
 
 ## Performance notes

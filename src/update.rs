@@ -177,7 +177,7 @@ pub enum How {
     Brew(PathBuf),
     /// By Scoop, which doesn't update a program while it runs.
     Scoop,
-    /// As a system package (.deb, .rpm), which takes sudo.
+    /// By a package manager (.deb, .rpm, Nix, snap), where it's updated.
     Package,
     /// Built from the source.
     Source,
@@ -204,7 +204,7 @@ pub fn how(exe: &Path) -> How {
     if lower.contains("/target/release/") || lower.contains("/target/debug/") {
         return How::Source;
     }
-    if ["/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/"]
+    if ["/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/", "/nix/store/", "/snap/"]
         .iter()
         .any(|d| s.starts_with(d))
     {
@@ -269,7 +269,7 @@ pub fn start(how: &How, version: &str) -> Result<Job, String> {
         }
         How::Package => {
             return Err(format!(
-                "this fss-mqtt is a system package: install the new one from {}",
+                "this fss-mqtt came with a package manager: update it there, or get {version} from {}",
                 release_url(version)
             ));
         }
@@ -463,7 +463,15 @@ fn install(exe: &Path, program: &[u8], version: &str) -> Result<(), String> {
     } else {
         ".fss-mqtt.new"
     });
-    std::fs::write(&new, program).map_err(|e| format!("can't write in {}: {e}", dir.display()))?;
+    std::fs::write(&new, program).map_err(|e| match e.kind() {
+        // Another user's, or a package manager's.
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem => format!(
+            "can't write in {}: install {version} the way you installed this one, or from {}",
+            dir.display(),
+            release_url(version)
+        ),
+        _ => format!("can't write in {}: {e}", dir.display()),
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -554,12 +562,16 @@ mod tests {
         assert_eq!(h(r"\\?\C:\Users\me\scoop\apps\fss-mqtt\0.8.0\fss-mqtt.exe"), How::Scoop);
         assert_eq!(h("/home/me/code/fss-mqtt/target/release/fss-mqtt"), How::Source);
         assert_eq!(h("/usr/bin/fss-mqtt"), How::Package);
+        assert_eq!(h("/nix/store/abc-fss-mqtt-0.8.0/bin/fss-mqtt"), How::Package);
+        assert_eq!(h("/snap/fss-mqtt/12/bin/fss-mqtt"), How::Package);
         assert_eq!(
             h("/home/me/.cargo/bin/fss-mqtt"),
             How::Replace("/home/me/.cargo/bin/fss-mqtt".into())
         );
         assert!(matches!(start(&How::Scoop, "9.9.9"), Err(e) if e.contains("scoop update fss-mqtt")));
-        assert!(matches!(start(&How::Package, "9.9.9"), Err(e) if e.contains("/releases/tag/v9.9.9")));
+        assert!(
+            matches!(start(&How::Package, "9.9.9"), Err(e) if e.contains("update it there") && e.contains("/releases/tag/v9.9.9"))
+        );
         assert!(matches!(start(&How::Source, "9.9.9"), Err(e) if e.contains("built from source")));
     }
 
@@ -697,6 +709,14 @@ mod tests {
         assert_eq!(std::fs::read(&exe).unwrap(), program("9.9.9"));
         let mode = std::fs::metadata(&exe).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o750, "as it was");
+
+        // A folder this user can't write in: says how else.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let e = install(&exe, &program("9.9.10"), "9.9.10");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if let Err(e) = e {
+            assert!(e.contains("the way you installed this one"), "{e}");
+        } // (root may write anyway)
         let _ = std::fs::remove_dir_all(&dir);
     }
 

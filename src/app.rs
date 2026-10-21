@@ -25,6 +25,9 @@ const NOTICE_FOR: Duration = Duration::from_secs(6);
 const CONFIG_EVERY: Duration = Duration::from_secs(1);
 /// Hex dumps copied outside the full screen view: 16 bytes a line.
 const CLIP_HEX_WIDTH: usize = 80;
+/// The most rows the connections panel shows: five connections with a
+/// subscription each. More scroll.
+pub const PANEL_ROWS: u16 = 10;
 /// How long the new version may take to be noticed after an update.
 const RESTART_WAIT: Duration = Duration::from_secs(30);
 
@@ -148,6 +151,8 @@ pub struct App {
     config_checked: Instant,
     pub panel: Vec<PanelRow>,
     pub panel_cursor: usize,
+    /// The first panel row in view (it scrolls when its rows don't fit).
+    pub panel_offset: usize,
     pub prompt: Option<Prompt>,
     prompt_queue: Vec<usize>,
     pub notice: Option<(String, bool, Instant)>, // text, is_error, when
@@ -224,6 +229,7 @@ impl App {
             config_path,
             panel: Vec::new(),
             panel_cursor: 0,
+            panel_offset: 0,
             prompt: None,
             prompt_queue: ask,
             notice: None,
@@ -275,8 +281,9 @@ impl App {
     /// of the frame it draws, which can be newer than the last resize the
     /// app has seen (the window shrank just before the frame).
     pub fn layout_for(&self, width: u16, height: u16) -> Layout {
-        // The connections panel takes what it needs, up to a third of the screen.
-        let max_panel = (height / 3).max(3);
+        // The connections panel takes what it needs, up to a third of the
+        // screen and `PANEL_ROWS` rows; more scroll.
+        let max_panel = (height / 3).clamp(3, PANEL_ROWS + 2);
         let panel_h = (self.panel.len() as u16 + 2).clamp(3, max_panel);
         let body_h = height.saturating_sub(5 + panel_h).max(4); // header + input box (3) + hints
         if width < 80 {
@@ -318,6 +325,7 @@ impl App {
             c.fit(w, h);
         }
         self.clamp_cursor();
+        self.clamp_panel();
     }
 
     pub fn tick(&mut self) {
@@ -463,6 +471,7 @@ impl App {
         }
         drop(st);
         self.panel_cursor = self.panel_cursor.min(self.panel.len().saturating_sub(1));
+        self.clamp_panel();
     }
 
     /// Recomputes visible rows if the tree, filter or expansion changed.
@@ -837,12 +846,27 @@ impl App {
 
     // ── Connections panel ──────────────────────────────────────────────────
 
+    /// Scrolls the panel just enough to show its cursor.
+    fn clamp_panel(&mut self) {
+        let rows = (self.layout().panel_h.saturating_sub(2) as usize).max(1);
+        if self.panel_cursor < self.panel_offset {
+            self.panel_offset = self.panel_cursor;
+        }
+        if self.panel_cursor >= self.panel_offset + rows {
+            self.panel_offset = self.panel_cursor + 1 - rows;
+        }
+        self.panel_offset = self.panel_offset.min(self.panel.len().saturating_sub(rows));
+    }
+
     /// Handles a key in the panel; false lets it fall through (e.g. typing).
     fn panel_key(&mut self, k: KeyEvent) -> bool {
         let last = self.panel.len().saturating_sub(1);
+        let page = (self.layout().panel_h.saturating_sub(3) as usize).max(1);
         match k.code {
             KeyCode::Up => self.panel_cursor = self.panel_cursor.saturating_sub(1),
             KeyCode::Down => self.panel_cursor = (self.panel_cursor + 1).min(last),
+            KeyCode::PageUp => self.panel_cursor = self.panel_cursor.saturating_sub(page),
+            KeyCode::PageDown => self.panel_cursor = (self.panel_cursor + page).min(last),
             KeyCode::Home => self.panel_cursor = 0,
             KeyCode::End => self.panel_cursor = last,
             KeyCode::Char(' ') | KeyCode::Enter => match self.panel.get(self.panel_cursor).copied() {
@@ -854,6 +878,7 @@ impl App {
             KeyCode::Esc => self.focus = Focus::Tree,
             _ => return false,
         }
+        self.clamp_panel();
         true
     }
 

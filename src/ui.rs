@@ -826,6 +826,9 @@ fn branch_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> Vec<Line<'a>>
 }
 
 fn input_box(buf: &mut Buffer, r: Rect, app: &App) {
+    if r.intersection(buf.area) != r || r.height < 3 || r.width < 4 {
+        return; // doesn't fit (the screen is about to be laid out again)
+    }
     let th = &app.th;
     let inner = r.width.saturating_sub(4) as usize;
     let info = match app.filter.mode {
@@ -851,9 +854,6 @@ fn input_box(buf: &mut Buffer, r: Rect, app: &App) {
         left.push(Span::styled(" ", th.cursor));
     }
     let line = join_lr(left, info, inner);
-    if r.intersection(buf.area) != r || r.height < 3 || r.width < 4 {
-        return; // doesn't fit (the screen is about to be laid out again)
-    }
     let bs = th.border;
     let bar = "─".repeat(r.width.saturating_sub(2) as usize);
     buf.set_string(r.x, r.y, format!("╭{bar}╮"), bs);

@@ -283,6 +283,9 @@ impl App {
     }
 
     pub fn resize(&mut self, w: u16, h: u16) {
+        if (w, h) == (self.width, self.height) {
+            return; // a queued resize the per-frame sync already applied
+        }
         self.width = w;
         self.height = h;
         if let Some(v) = &mut self.viewer {

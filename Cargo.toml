@@ -1,6 +1,6 @@
 [package]
 name = "fss-mqtt"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Fast, keyboard-driven MQTT v5 explorer for the terminal"

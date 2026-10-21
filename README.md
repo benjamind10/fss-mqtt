@@ -5,6 +5,8 @@ live topic tree you narrow down just by typing; edit any message and publish it 
 
 ![fss-mqtt: browsing two brokers, filtering, opening messages; Parquet, Avro, Arrow, SQLite, SQLite changeset, Protobuf, MessagePack, CBOR, CSV and gzip payloads decoded; pausing a subscription](docs/demo.gif)
 
+Vim user? See [`--vim`](#vim-keys---vim).
+
 ## Install
 
 Pre-built binaries for Linux, macOS and Windows are on the GitHub releases page.
@@ -132,7 +134,7 @@ clears. Clearing keeps the tree open at the topic you were on.
 
 | Where | Key | |
 |---|---|---|
-| anywhere | `tab` / `shift+tab` | next / previous pane: connections, topics, messages |
+| anywhere | `tab` / `shift+tab` | next / previous pane: connections, topics, messages, chart |
 | connections | `↑ ↓` | move |
 | connections | `space` `⏎` | connect / disconnect, or subscription / capture rule on / off |
 | tree | `↑ ↓ pgup pgdn home end` | move |
@@ -142,6 +144,9 @@ clears. Clearing keeps the tree open at the topic you were on.
 | messages | `↑ ↓` | pick one of the last 10 messages (properties and payload follow) |
 | messages | `⏎` | open it full screen |
 | messages | `← esc` | back to the tree |
+| chart | `↑ ↓ home end pgup pgdn` | pick the column or field to chart (see [Charts](#charts)) |
+| chart | `⏎` | open the message full screen |
+| chart | `← esc` | back to the tree |
 | full screen | `↑ ↓ pgup pgdn` | scroll |
 | full screen | `← →` | older / newer message |
 | full screen | `shift ←→` `<` `>` | pan wide tables (CSV, Parquet) |
@@ -154,25 +159,6 @@ clears. Clearing keeps the tree open at the topic you were on.
 | tree, messages | `ctrl+r` | capture this topic and everything below it to disk; again to stop |
 | anywhere | `ctrl+n` | when a newer fss-mqtt was installed meanwhile: restart into it, continuing the session |
 | anywhere | `ctrl+c` | quit (saving the session for `--resume`) |
-
-### Vim keys (`--vim`)
-
-With `--vim` (or `FSS_MQTT_KEYS=vim`), letters move around instead of filtering, as in Ranger;
-`/` starts the filter. The keys above keep working, apart from `ctrl+u`, which pages up.
-
-| Where | Key | |
-|---|---|---|
-| connections, tree, messages | `j k` | down / up (like `↓ ↑`) |
-| tree | `h l` | collapse / expand (like `← →`) |
-| messages | `h` | back to the tree |
-| connections, tree, messages | `g` / `G` | first / last (like `home` / `end`) |
-| tree, messages | `ctrl+d` / `ctrl+u` | page down / up |
-| anywhere | `/` | filter: type it, then `⏎` keeps it and goes back to moving, `esc` clears it |
-| tree, messages | `e` | publish (like `ctrl+e`) |
-| tree, messages | `t` / `y` | copy the topic / the message (like `ctrl+t` / `ctrl+y`) |
-| anywhere | `q` | quit (like `ctrl+c`) |
-
-While filtering, letters go to the filter, and `backspace`, `ctrl+w` and `ctrl+u` edit it as above.
 
 A green `•`/`▸` means the topic (or something under it) received a message in the last 1.5 s.
 
@@ -194,6 +180,34 @@ the terminal instead (an OSC 52 escape sequence, up to 768 KB of text), which la
 clipboard of the machine you're sitting at. Most terminals support it (iTerm2, kitty, WezTerm,
 Alacritty, Windows Terminal, foot; Apple Terminal doesn't). In tmux, enable it with
 `set -g set-clipboard on`. `FSS_MQTT_CLIPBOARD=osc52`, `=native` or `=off` overrides the choice.
+
+## Vim keys (`--vim`)
+
+With `--vim` (or `FSS_MQTT_KEYS=vim`), letters move around instead of filtering, as in Ranger;
+`/` starts the filter. The other [keys](#keys) keep working, apart from `ctrl+u`, which pages up
+(in messages, to the first one).
+
+![fss-mqtt --vim: j and l through the tree, / to filter, j and k to pick a message, h and l to older and newer ones full screen, y to copy, e to publish a copy, ctrl+d, ctrl+u, G and g through a Parquet table, q to quit; the keys pressed show below](docs/vim.gif)
+
+| Where | Key | |
+|---|---|---|
+| connections, tree, messages, chart | `j k` | down / up (like `↓ ↑`) |
+| tree | `h l` | collapse / expand (like `← →`) |
+| messages, chart | `h` | back to the tree |
+| connections, tree, messages, chart | `g` / `G` | first / last (like `home` / `end`) |
+| tree, full screen | `ctrl+d` / `ctrl+u` | page down / up |
+| messages, chart | `ctrl+d` / `ctrl+u` | last / first (like `pgdn` / `pgup`) |
+| connections, tree, messages | `/` | filter: type it, then `⏎` keeps it and goes back to moving, `esc` clears it |
+| anywhere | `e` | publish (like `ctrl+e`) |
+| tree, messages | `t` / `y` | copy the topic / the message (like `ctrl+t` / `ctrl+y`) |
+| connections, tree, messages | `q` | quit (like `ctrl+c`) |
+
+Full screen, `j k` scroll, `g G` go to the top and the end, `h l` step to older and newer messages
+and `q` closes the view, with or without `--vim`.
+
+While filtering, letters go to the filter, and `backspace`, `ctrl+w` and `ctrl+u` edit it as in
+[Filtering](#filtering); while moving they leave it alone. `tab` keeps the filter and goes back to
+moving.
 
 ## Publishing
 
@@ -285,6 +299,28 @@ like one of these formats but can't be read, the reason is shown above a hex dum
 - **SQLite changesets / patchsets** (from the session extension): recognised by a `content-type`
   containing `changeset` or `patchset`, or without one when the whole payload reads as one; the
   format doesn't carry column names, so columns are numbered (`pk c0`, `c1`, …).
+
+## Charts
+
+A topic with numbers gets a chart in the lower half of its details, when the window has room for
+both. `tab` goes to it from the message list, and `↑ ↓` pick what it shows:
+
+![fss-mqtt charts: a turbine's telemetry fields over the messages kept, live, and on the next turbine the same field; the columns of a Parquet fast log and of a CSV report; the keys pressed show below](docs/chart.gif)
+
+- **The columns of a table in the message** (Parquet, Arrow, Avro, SQLite, CSV, Sparkplug
+  DataSets), row by row. The x axis goes by the first column when that's text (a time, a name),
+  otherwise by row number. A decoded table keeps its first rows (up to 200, about 4 KB of text),
+  and the chart says so: `first 52 of 500 rows`.
+- **JSON arrays** of numbers, or of records (`[{"ts": "…", "kw": 1.5}, …]`): each array, or each
+  number field of the records, item by item. MessagePack and CBOR count as JSON.
+- **The numbers each message carries:** a payload that's a number, a JSON document's number fields
+  (`power_kw`, `pos.x`), Sparkplug metrics. Each one over the messages kept (`--history`, 10 by
+  default), by arrival time. Raise `--history` for a longer chart; `fss-mqtt --open capture.jsonl
+  --history 100000` charts a whole capture.
+
+The chart is of the message picked in the message list (the latest one otherwise). Its heading
+says where the numbers come from and their range, and a column or field you pick stays picked on
+other topics that have one by that name.
 
 ## Capture to disk
 

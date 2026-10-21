@@ -99,6 +99,7 @@ pub enum Focus {
     Conns,
     Tree,
     Msgs,
+    Chart,
 }
 
 /// A row in the connections panel.
@@ -167,6 +168,8 @@ pub struct App {
 
     pub focus: Focus,
     pub msg_sel: Option<u64>, // seq of the selected message in the list
+    /// The numbers to chart for the selected topic.
+    pub chart: crate::chart::State,
 
     pub viewer: Option<Viewer>,
     pub clipboard: clipboard::Sink,
@@ -227,6 +230,7 @@ impl App {
             need_rebuild: true,
             focus: Focus::Tree,
             msg_sel: None,
+            chart: Default::default(),
             viewer: None,
             clipboard: clipboard::Sink::default(),
             composer: None,
@@ -248,27 +252,34 @@ impl App {
     }
 
     pub fn layout(&self) -> Layout {
+        self.layout_for(self.width, self.height)
+    }
+
+    /// The panes for a `width` × `height` screen. Drawing passes the size
+    /// of the frame it draws, which can be newer than the last resize the
+    /// app has seen (the window shrank just before the frame).
+    pub fn layout_for(&self, width: u16, height: u16) -> Layout {
         // The connections panel takes what it needs, up to a third of the screen.
-        let max_panel = (self.height / 3).max(3);
+        let max_panel = (height / 3).max(3);
         let panel_h = (self.panel.len() as u16 + 2).clamp(3, max_panel);
-        let body_h = self.height.saturating_sub(5 + panel_h).max(4); // header + input box (3) + hints
-        if self.width < 80 {
+        let body_h = height.saturating_sub(5 + panel_h).max(4); // header + input box (3) + hints
+        if width < 80 {
             let th = body_h * 55 / 100;
             return Layout {
                 panel_h,
-                tree_w: self.width,
+                tree_w: width,
                 tree_h: th,
-                det_w: self.width,
+                det_w: width,
                 det_h: body_h - th,
                 stacked: true,
             };
         }
-        let tw = (self.width as u32 * 45 / 100) as u16;
+        let tw = (width as u32 * 45 / 100) as u16;
         Layout {
             panel_h,
             tree_w: tw,
             tree_h: body_h,
-            det_w: self.width - tw,
+            det_w: width - tw,
             det_h: body_h,
             stacked: false,
         }
@@ -279,6 +290,9 @@ impl App {
     }
 
     pub fn resize(&mut self, w: u16, h: u16) {
+        if (w, h) == (self.width, self.height) {
+            return; // a queued resize the per-frame sync already applied
+        }
         self.width = w;
         self.height = h;
         if let Some(v) = &mut self.viewer {
@@ -329,6 +343,7 @@ impl App {
             self.check_config();
         }
         self.rebuild(false);
+        self.update_chart();
     }
 
     pub(crate) fn refresh_panel(&mut self) {
@@ -407,7 +422,7 @@ impl App {
         self.selected = self.rows.get(self.cursor).map(|r| r.node);
         if self.selected != prev {
             self.msg_sel = None;
-            if self.focus == Focus::Msgs {
+            if matches!(self.focus, Focus::Msgs | Focus::Chart) {
                 self.focus = Focus::Tree;
             }
         }
@@ -461,23 +476,32 @@ impl App {
             let t = format!("{}{}", self.filter_text, s.trim());
             self.set_filter(t);
         }
+        self.update_chart();
     }
 
-    /// `tab` cycles connections → tree → messages (when the topic has any).
+    /// `tab` cycles connections → tree → messages → chart (as the topic
+    /// has them).
     fn next_focus(&mut self, back: bool) {
         let has_msgs = self
             .selected
             .is_some_and(|n| self.store.lock().unwrap().nodes[n].has_messages());
-        let order: &[Focus] = if has_msgs {
-            &[Focus::Conns, Focus::Tree, Focus::Msgs]
-        } else {
-            &[Focus::Conns, Focus::Tree]
-        };
+        let mut order = vec![Focus::Conns, Focus::Tree];
+        if has_msgs {
+            order.push(Focus::Msgs);
+            if !self.chart.series.is_empty() {
+                order.push(Focus::Chart);
+            }
+        }
         let i = order.iter().position(|&f| f == self.focus).unwrap_or(1);
         let n = order.len();
         let next = order[if back { (i + n - 1) % n } else { (i + 1) % n }];
+        self.filtering = false; // the filter is typed in the tree
         match next {
+            // The chart is of the message picked in the list; back from it,
+            // that one stays picked.
+            Focus::Msgs if self.focus == Focus::Chart && self.msg_sel.is_some() => self.focus = Focus::Msgs,
             Focus::Msgs => self.enter_msgs(),
+            Focus::Chart => self.focus = Focus::Chart,
             f => {
                 self.focus = f;
                 self.msg_sel = None;
@@ -486,6 +510,11 @@ impl App {
     }
 
     pub fn key(&mut self, k: KeyEvent) {
+        self.on_key(k);
+        self.update_chart();
+    }
+
+    fn on_key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && k.code == KeyCode::Char('c') {
             self.quit = true;
@@ -584,6 +613,10 @@ impl App {
             self.msg_key(k);
             return;
         }
+        if self.focus == Focus::Chart {
+            self.chart_key(k);
+            return;
+        }
 
         let Some(n) = self.selected else {
             if k.code == KeyCode::Esc {
@@ -659,6 +692,9 @@ impl App {
         let code = match k.code {
             KeyCode::Char('d') if ctrl => KeyCode::PageDown,
             KeyCode::Char('u') if ctrl => KeyCode::PageUp,
+            // They edit the filter only while it's being typed.
+            KeyCode::Char('w') if ctrl => return None,
+            KeyCode::Backspace => return None,
             _ if ctrl => return Some(k),
             KeyCode::Char('j') => KeyCode::Down,
             KeyCode::Char('k') => KeyCode::Up,
@@ -922,6 +958,7 @@ impl App {
                 Focus::Conns => "connections",
                 Focus::Tree => "tree",
                 Focus::Msgs => "messages",
+                Focus::Chart => "chart",
             }
             .into(),
             draft: self.composer.as_ref().map(Composer::save_state),
@@ -972,6 +1009,8 @@ impl App {
         }
         self.focus = match v.focus.as_str() {
             "messages" if has_msgs && self.selected == selected => Focus::Msgs,
+            // Back to the tree if there's nothing to chart (`update_chart`).
+            "chart" if has_msgs && self.selected == selected => Focus::Chart,
             "connections" => Focus::Conns,
             _ => Focus::Tree,
         };
@@ -1163,7 +1202,7 @@ impl App {
         if self.selected.is_some_and(|n| st.nodes[n].conn == i) {
             self.selected = None;
             self.msg_sel = None;
-            if self.focus == Focus::Msgs {
+            if matches!(self.focus, Focus::Msgs | Focus::Chart) {
                 self.focus = Focus::Tree;
             }
         }
@@ -1277,6 +1316,54 @@ impl App {
         self.msg_sel = Some(msgs[i].seq);
     }
 
+    /// Keys in the chart: through its columns and fields.
+    fn chart_key(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Up => self.chart.step(-1),
+            KeyCode::Down => self.chart.step(1),
+            KeyCode::Home | KeyCode::PageUp => self.chart.pick(0),
+            KeyCode::End | KeyCode::PageDown => self.chart.pick(usize::MAX),
+            KeyCode::Left | KeyCode::Esc => {
+                self.focus = Focus::Tree;
+                self.msg_sel = None;
+            }
+            KeyCode::Enter => {
+                if let Some(n) = self.selected {
+                    self.open_viewer(n, self.msg_sel);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Keeps the chart in step with the topic in view and the message
+    /// picked in the list (the one whose own rows are charted).
+    pub fn update_chart(&mut self) {
+        let picked = matches!(self.focus, Focus::Msgs | Focus::Chart)
+            .then_some(self.msg_sel)
+            .flatten();
+        let found = self.selected.and_then(|n| {
+            let st = self.store.lock().unwrap();
+            let node = &st.nodes[n];
+            let newest = node.latest()?.seq;
+            let key = (n, newest, picked, node.msg_count);
+            // Nothing new: no need to look at the messages again.
+            Some((key, (!self.chart.is_for(key)).then(|| node.messages())))
+        });
+        match found {
+            Some((_, None)) => {}
+            Some((key, Some(msgs))) => {
+                let i = msg_index(&msgs, picked);
+                self.chart.update(key, &msgs, i);
+            }
+            None => self.chart.clear(),
+        }
+        if self.focus == Focus::Chart && self.chart.series.is_empty() {
+            self.focus = Focus::Tree;
+            self.msg_sel = None;
+        }
+    }
+
     fn open_viewer(&mut self, n: usize, sel: Option<u64>) {
         let (msgs, title) = {
             let st = self.store.lock().unwrap();
@@ -1309,7 +1396,7 @@ impl App {
         }
         let n = self.selected?;
         let st = self.store.lock().unwrap();
-        let m = if self.focus == Focus::Msgs {
+        let m = if matches!(self.focus, Focus::Msgs | Focus::Chart) {
             let msgs = st.nodes[n].messages(); // newest first
             msgs.get(msg_index(&msgs, self.msg_sel)).cloned()
         } else {
@@ -1464,6 +1551,15 @@ impl App {
     }
 
     fn viewer_key(&mut self, k: KeyEvent) {
+        let k = match k.code {
+            KeyCode::Char('d') if self.opts.vim && k.modifiers == KeyModifiers::CONTROL => {
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)
+            }
+            KeyCode::Char('u') if self.opts.vim && k.modifiers == KeyModifiers::CONTROL => {
+                KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)
+            }
+            _ => k,
+        };
         match k.code {
             KeyCode::Char('t') => return self.copy_topic(),
             KeyCode::Char('y') => return self.copy_message(),

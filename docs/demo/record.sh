@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Records docs/demo.gif with VHS against two throwaway mosquitto brokers fed by
-# publish.sh. Needs Docker. Usage (from the repo root): docs/demo/record.sh <fss-mqtt linux binary>
+# Records a tape's GIF (docs/demo.gif by default) with VHS against two throwaway
+# mosquitto brokers fed by publish.sh. Needs Docker. Usage (from the repo root):
+#   docs/demo/record.sh <fss-mqtt linux binary> [tape]   (default docs/demo/demo.tape)
 set -euo pipefail
 bin=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+tape=${2:-docs/demo/demo.tape}
 root=$(cd "$(dirname "$0")/../.." && pwd)
 net=fss-demo
 cleanup() {
@@ -22,8 +24,15 @@ docker run -d --name fss-demo-pub-bergen --network $net -v "$root/docs/demo:/dem
     eclipse-mosquitto:2 sh /demo/publish.sh fss-demo-bergen bergen 5 >/dev/null
 sleep 12 # let a few large payloads and alarms arrive first
 docker run --rm --network $net -v "$root:/vhs" -v "$bin:/usr/local/bin/fss-mqtt:ro" \
-    ghcr.io/charmbracelet/vhs docs/demo/demo.tape
+    ghcr.io/charmbracelet/vhs "$tape"
+# The tape's Output line: its GIF, as a path from the repo root without quotes.
+gif=$(sed -n 's/^Output //p' "$root/$tape")
+# A tape with a "# keys.py" line gets the keys it presses shown below the terminal.
+if grep -q '^# keys.py' "$root/$tape"; then
+    docker run --rm -v "$root:/vhs" --entrypoint python3 ghcr.io/charmbracelet/vhs \
+        docs/demo/keys.py "$tape" "$gif"
+fi
 # The theme needs few colours; fewer in the palette roughly halves the file.
-docker run --rm -v "$root/docs:/docs" alpine:3 \
-    sh -c 'apk add -q gifsicle && gifsicle -b -O3 --colors 32 /docs/demo.gif'
-ls -lh "$root/docs/demo.gif"
+docker run --rm -v "$root:/vhs" alpine:3 \
+    sh -c "apk add -q gifsicle && gifsicle -b -O3 --colors 32 '/vhs/$gif'"
+ls -lh "$root/$gif"

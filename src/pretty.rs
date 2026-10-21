@@ -560,7 +560,7 @@ fn csv_delimiter(t: &str) -> Option<u8> {
     best.map(|(d, _)| d)
 }
 
-fn split_row(line: &str, d: u8) -> Vec<String> {
+pub(crate) fn split_row(line: &str, d: u8) -> Vec<String> {
     let mut out = vec![String::new()];
     let mut quoted = false;
     let mut chars = line.chars().peekable();

@@ -4,9 +4,11 @@ use std::time::Duration;
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::Modifier;
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Axis, Chart, Dataset, GraphType, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Ask, Focus, PanelRow, msg_index, node_title};
@@ -67,7 +69,9 @@ fn draw_all(f: &mut Frame, app: &App) {
         return;
     }
 
-    let l = app.layout();
+    // The frame's own size: the window may have changed since the app last
+    // heard (laying out for the old size would draw past the edge).
+    let l = app.layout_for(area.width, area.height);
     put(buf, 0, 0, header(app, &st), area.width);
     panel_box(buf, Rect::new(0, 1, area.width, l.panel_h), app, &st);
     let top = 1 + l.panel_h;
@@ -252,6 +256,9 @@ fn border_label(buf: &mut Buffer, r: Rect, label: &str, style: ratatui::style::S
     if room < 12 || r.height < 2 {
         return;
     }
+    if r.intersection(buf.area) != r {
+        return;
+    }
     let text = format!(" {} ", fmt::trunc_left(label, room));
     let x = r.right() - 2 - fmt::str_width(&text) as u16;
     buf.set_string(x, r.bottom() - 1, text, style);
@@ -261,7 +268,7 @@ fn prompt_box(buf: &mut Buffer, area: Rect, app: &App, st: &Store) {
     let th = &app.th;
     let p = app.prompt.as_ref().unwrap();
     let c = &st.conns[p.conn];
-    let w = area.width.clamp(20, 64);
+    let w = area.width.clamp(20, 64).min(area.width); // never wider than the screen
     let r = Rect::new((area.width - w) / 2, area.height / 3, w, 7);
     for y in r.y..r.bottom().min(area.height) {
         for x in r.x..r.right() {
@@ -308,6 +315,8 @@ fn put(buf: &mut Buffer, x: u16, y: u16, line: Line, w: u16) {
 /// Rounded box with a title in the top edge.
 /// `sel` is the index of the selected line, drawn as a full-width bar.
 fn draw_box(buf: &mut Buffer, r: Rect, title: &str, lines: Vec<Line>, focused: bool, sel: Option<usize>, th: &Theme) {
+    // Never past the edge of the screen, whatever the layout says.
+    let r = r.intersection(buf.area);
     if r.width < 4 || r.height < 2 {
         return;
     }
@@ -540,12 +549,35 @@ fn node_name<'a>(app: &App, name: &str, mark: u8, sel: bool) -> Vec<Span<'a>> {
     out
 }
 
+/// Rows a chart needs to be worth drawing: its box, a heading, the plot.
+const CHART_MIN_H: u16 = 8;
+
 fn detail_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
     let Some(n) = app.selected else {
         draw_box(buf, r, "", vec![], false, None, &app.th);
         return;
     };
     let node = &st.nodes[n];
+    // A topic with numbers gives the lower half to their chart.
+    let (r, chart) = if app.chart.topic() == Some(n) && app.chart.current().is_some() && r.height >= 2 * CHART_MIN_H {
+        let h = r.height / 2;
+        (
+            Rect {
+                height: r.height - h,
+                ..r
+            },
+            Some(Rect {
+                y: r.y + r.height - h,
+                height: h,
+                ..r
+            }),
+        )
+    } else {
+        (r, None)
+    };
+    if let Some(c) = chart {
+        chart_box(buf, c, app);
+    }
     let (iw, ih) = (r.width.saturating_sub(4) as usize, r.height.saturating_sub(2) as usize);
     let (mut lines, sel) = if node.is_conn() {
         (conn_detail(app, st, n, iw), None)
@@ -564,7 +596,7 @@ fn topic_detail<'a>(app: &App, st: &Store, n: usize, w: usize, h: usize) -> (Vec
     let th = &app.th;
     let node = &st.nodes[n];
     let msgs = node.messages();
-    let idx = if app.focus == Focus::Msgs {
+    let idx = if matches!(app.focus, Focus::Msgs | Focus::Chart) {
         msg_index(&msgs, app.msg_sel)
     } else {
         0
@@ -600,8 +632,12 @@ fn topic_detail<'a>(app: &App, st: &Store, n: usize, w: usize, h: usize) -> (Vec
         hdr.push(Span::styled(format!("  {}/{}", idx + 1, msgs.len()), th.dim));
     }
     out.push(Line::from(hdr));
-    let sel_line = out.len() + idx;
-    for (i, m) in msgs.iter().enumerate() {
+    // As many as fit (under the chart, say), the picked one among them.
+    let room = h.saturating_sub(out.len() + 1).max(1);
+    let shown = msgs.len().min(room);
+    let first = idx.saturating_sub(shown / 2).min(msgs.len() - shown);
+    let sel_line = out.len() + idx - first;
+    for (i, m) in msgs.iter().enumerate().skip(first).take(shown) {
         let (mark, ts) = match (i == idx, app.focus) {
             (true, Focus::Msgs) => (Span::styled(glyph::CURSOR, th.accent_b), th.text),
             (true, _) => (Span::styled("› ", th.faint), th.dim),
@@ -668,6 +704,135 @@ fn topic_detail<'a>(app: &App, st: &Store, n: usize, w: usize, h: usize) -> (Vec
         ));
     }
     (out, Some(sel_line))
+}
+
+/// The selected topic's numbers: the one picked (`↑↓` with the chart in
+/// focus), where it comes from and its range, the list to pick from, and
+/// the plot.
+fn chart_box(buf: &mut Buffer, r: Rect, app: &App) {
+    let th = &app.th;
+    let ch = &app.chart;
+    let Some(s) = ch.current() else { return };
+    draw_box(buf, r, "Chart", vec![], app.focus == Focus::Chart, None, th);
+    let inner =
+        Rect::new(r.x + 2, r.y + 1, r.width.saturating_sub(4), r.height.saturating_sub(2)).intersection(buf.area);
+    if inner.width < 16 || inner.height < 4 {
+        return;
+    }
+    let (lo, hi) = s.points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+        (lo.min(p.1), hi.max(p.1))
+    });
+    // The latest value first (when it's a live one), where the numbers
+    // come from last: a narrow pane cuts that first.
+    let num = |v: f64| Span::styled(short(v), th.number);
+    let dim = |t: String| Span::styled(t, th.dim);
+    let mut head = vec![
+        Span::styled(s.name.clone(), th.accent_b),
+        dim(format!("  {}/{}", ch.sel + 1, ch.series.len())),
+    ];
+    if let (true, Some(last)) = (s.over_time, s.points.last()) {
+        head.extend([dim(" · last ".into()), num(last.1)]);
+    }
+    head.extend([
+        dim(" · min ".into()),
+        num(lo),
+        dim(" · max ".into()),
+        num(hi),
+        dim(format!(" · {}", s.source)),
+    ]);
+    put(buf, inner.x, inner.y, Line::from(head), inner.width);
+
+    let body = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
+    // With a choice and room for it, the list to pick from on the left.
+    let mut plot = body;
+    if ch.series.len() > 1 && body.width >= 50 {
+        let longest = ch.series.iter().map(|s| fmt::str_width(&s.name)).max().unwrap_or(0);
+        let lw = (longest + 2).clamp(8, body.width as usize / 3) as u16;
+        let rows = body.height as usize;
+        let first = ch.sel.saturating_sub(rows.saturating_sub(1));
+        for (i, x) in ch.series.iter().enumerate().skip(first).take(rows) {
+            let (mark, style) = match (i == ch.sel, app.focus == Focus::Chart) {
+                (true, true) => (Span::styled(glyph::CURSOR, th.accent_b), th.text),
+                (true, false) => (Span::styled("› ", th.faint), th.text),
+                _ => (Span::raw("  "), th.dim),
+            };
+            let line = Line::from(vec![mark, Span::styled(x.name.clone(), style)]);
+            put(buf, body.x, body.y + (i - first) as u16, line, lw);
+        }
+        for y in body.y..body.bottom() {
+            buf.set_string(body.x + lw, y, "│", th.border);
+        }
+        plot = Rect {
+            x: body.x + lw + 2,
+            width: body.width - lw - 2,
+            ..body
+        };
+    }
+
+    let (x0, x1) = (s.points[0].0, s.points[s.points.len() - 1].0);
+    let xb = if x1 > x0 { [x0, x1] } else { [x0 - 1.0, x0 + 1.0] };
+    let yb = if hi > lo { [lo, hi] } else { [lo - 1.0, hi + 1.0] };
+    let ylabels = [yb[0], (yb[0] + yb[1]) / 2.0, yb[1]].map(|v| Span::styled(short(v), th.dim));
+    let xlabels = [&s.ends.0, &s.ends.1].map(|e| Span::styled(e.clone(), th.dim));
+    // Braille dots: 2×4 to a cell. The Windows console fonts don't have
+    // them; half blocks are the finest they draw.
+    let marker = if cfg!(windows) {
+        Marker::HalfBlock
+    } else {
+        Marker::Braille
+    };
+    let mut sets = vec![
+        Dataset::default()
+            .marker(marker)
+            .graph_type(GraphType::Line)
+            .style(th.accent_b)
+            .data(&s.points),
+    ];
+    // Few enough to tell apart: each one marked.
+    if s.points.len() <= plot.width as usize / 3 {
+        sets.push(
+            Dataset::default()
+                .marker(Marker::Dot)
+                .graph_type(GraphType::Scatter)
+                .style(th.accent_b)
+                .data(&s.points),
+        );
+    }
+    Chart::new(sets)
+        // The first label starts at the y axis rather than ending there.
+        .x_axis(
+            Axis::default()
+                .bounds(xb)
+                .labels(xlabels)
+                .labels_alignment(Alignment::Right)
+                .style(th.faint),
+        )
+        .y_axis(
+            Axis::default()
+                .bounds(yb)
+                .labels(ylabels)
+                .labels_alignment(Alignment::Right)
+                .style(th.faint),
+        )
+        .legend_position(None)
+        .render(plot, buf);
+}
+
+/// A number for an axis or a heading: short, but as precise as it is.
+fn short(v: f64) -> String {
+    let a = v.abs();
+    if a == 0.0 {
+        return "0".into();
+    }
+    if !(1e-3..1e7).contains(&a) {
+        return format!("{v:.2e}");
+    }
+    let s = match a {
+        a if a >= 100.0 => format!("{v:.1}"),
+        a if a >= 1.0 => format!("{v:.2}"),
+        _ => format!("{v:.3}"),
+    };
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// The MQTT v5 properties worth showing, user properties last.
@@ -819,6 +984,9 @@ fn branch_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> Vec<Line<'a>>
 }
 
 fn input_box(buf: &mut Buffer, r: Rect, app: &App) {
+    if r.intersection(buf.area) != r || r.height < 3 || r.width < 4 {
+        return; // doesn't fit (the screen is about to be laid out again)
+    }
     let th = &app.th;
     let inner = r.width.saturating_sub(4) as usize;
     let info = match app.filter.mode {
@@ -953,6 +1121,14 @@ fn hints<'a>(app: &App) -> Line<'a> {
             ("h esc", "back", 2),
             ("tab", "pane", 2),
         ],
+        (true, false, Focus::Chart) => vec![
+            ("j k", "column / field", 3),
+            (glyph::ENTER, "open", 2),
+            ("e", "publish", 1),
+            ("t y", "copy", 1),
+            ("h esc", "back", 2),
+            ("tab", "pane", 2),
+        ],
         (true, false, Focus::Tree) => vec![
             ("j k", "move", 3),
             ("h l", "collapse/expand", 3),
@@ -976,6 +1152,14 @@ fn hints<'a>(app: &App) -> Line<'a> {
             ("^e", "publish", 1),
             ("^t ^y", "copy", 1),
             ("^r", "capture", 1),
+            ("← esc", "back", 2),
+            ("tab", "pane", 2),
+        ],
+        (false, _, Focus::Chart) => vec![
+            ("↑↓", "column / field", 3),
+            (glyph::ENTER, "open", 2),
+            ("^e", "publish", 1),
+            ("^t ^y", "copy", 1),
             ("← esc", "back", 2),
             ("tab", "pane", 2),
         ],
@@ -2371,6 +2555,49 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_of_another_size_than_the_last_resize_still_fits() {
+        // The window can change size between the app hearing of it and the
+        // next frame (Terminal.app's tab bar appearing takes two rows):
+        // every screen must draw inside whatever frame it gets.
+        let cfg = tmp_config("sizes");
+        let (mut app, _rx) = sample(cfg.clone());
+        let draw_at = |app: &App, w: u16, h: u16| {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| super::draw(f, app)).unwrap();
+        };
+        let sizes = [(184, 55), (184, 57), (110, 36), (79, 40), (60, 20), (20, 9), (10, 8)];
+        let check = |app: &mut App, what: &str| {
+            for &(aw, ah) in &sizes {
+                app.resize(aw, ah);
+                for &(w, h) in &sizes {
+                    // A panic here names the screen and both sizes.
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| draw_at(app, w, h)));
+                    assert!(r.is_ok(), "{what}: laid out for {aw}x{ah}, drawn at {w}x{h}");
+                }
+            }
+            app.resize(110, 36);
+        };
+        check(&mut app, "tree");
+        press(&mut app, &[KeyCode::Tab]);
+        check(&mut app, "connections");
+        // A password prompt over it (staging needs one).
+        press(&mut app, &[KeyCode::End, KeyCode::Up, KeyCode::Char(' ')]);
+        assert!(app.prompt.is_some());
+        check(&mut app, "prompt");
+        press(&mut app, &[KeyCode::Esc, KeyCode::Esc, KeyCode::Esc, KeyCode::Tab]);
+        app.prompt = None;
+        // Full screen, and the publish editor.
+        typ(&mut app, "v1/plant/line1/temp");
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(app.viewer.is_some());
+        check(&mut app, "viewer");
+        app.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(app.composer.is_some());
+        check(&mut app, "composer");
+        let _ = std::fs::remove_file(&cfg);
+    }
+
+    #[test]
     fn connections_panel() {
         let cfg = tmp_config("panel");
         let (mut app, rx) = sample(cfg.clone());
@@ -2540,6 +2767,50 @@ mod tests {
     }
 
     #[test]
+    fn vim_backspace_and_ctrl_w_edit_only_while_filtering() {
+        let (mut app, _rx) = sample_vim(tmp_config("vim-backspace"));
+        typ(&mut app, "/v1/plant");
+        press(&mut app, &[KeyCode::Enter]);
+        press(&mut app, &[KeyCode::Backspace]);
+        ctrl(&mut app, 'w');
+        assert_eq!(app.filter_text, "v1/plant", "kept while moving");
+        typ(&mut app, "/");
+        press(&mut app, &[KeyCode::Backspace]);
+        assert_eq!(app.filter_text, "v1/plan");
+        ctrl(&mut app, 'w');
+        assert_eq!(app.filter_text, "v1/");
+    }
+
+    #[test]
+    fn vim_tab_ends_filtering() {
+        let (mut app, _rx) = sample_vim(tmp_config("vim-tab"));
+        typ(&mut app, "/line1");
+        press(&mut app, &[KeyCode::Tab]);
+        assert!(app.focus == Focus::Conns && !app.filtering);
+        assert_eq!(app.filter_text, "line1", "tab keeps the filter");
+        // esc in the panel goes back to the tree rather than clearing.
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.focus == Focus::Tree);
+        assert_eq!(app.filter_text, "line1");
+        typ(&mut app, "/");
+        press(&mut app, &[KeyCode::BackTab]);
+        assert!(!app.filtering);
+    }
+
+    #[test]
+    fn vim_ctrl_d_u_page_the_viewer() {
+        let (mut app, _rx) = sample_vim(tmp_config("vim-viewer"));
+        typ(&mut app, "/v1/+/line1/temp");
+        press(&mut app, &[KeyCode::Enter, KeyCode::Enter]);
+        app.resize(app.width, 10); // short enough for the message to need paging
+        assert!(app.viewer.is_some());
+        ctrl(&mut app, 'd');
+        assert!(app.viewer.as_ref().unwrap().scroll > 0, "ctrl+d pages down");
+        ctrl(&mut app, 'u');
+        assert_eq!(app.viewer.as_ref().unwrap().scroll, 0, "ctrl+u pages up");
+    }
+
+    #[test]
     fn vim_q_e_t_y() {
         let (mut app, _rx) = sample_vim(tmp_config("vim-q"));
         typ(&mut app, "q");
@@ -2602,5 +2873,119 @@ mod tests {
         press(&mut app, &[KeyCode::Right]);
         let v = frame(&app, "vim msgs hints");
         assert!(v.contains("j k messages") && v.contains("h esc back"), "{v}");
+    }
+
+    #[test]
+    fn chart_of_the_selected_topic() {
+        let (mut app, _rx) = sample(tmp_config("chart"));
+        let selected = |app: &App| {
+            let st = app.store.lock().unwrap();
+            st.nodes[app.selected.unwrap()].path.clone()
+        };
+
+        // A JSON field, over the messages kept.
+        typ(&mut app, "v1/plant/line1/temp");
+        assert_eq!(selected(&app), "v1/plant/line1/temp");
+        let v = frame(&app, "chart of t");
+        assert!(v.contains("╭─ Chart ─"), "{v}");
+        assert!(
+            v.contains("t  1/1 · last 22.5 · min 20.5 · max 22.5 · 3 messages"),
+            "{v}"
+        );
+        assert!(
+            v.contains("Messages") && v.contains("Properties"),
+            "the details keep the upper half:\n{v}"
+        );
+
+        // tab: the messages, then the chart; its keys in the hints.
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+        assert!(app.focus == Focus::Chart);
+        assert!(frame(&app, "chart in focus").contains("↑↓ column / field"));
+        assert_eq!(app.session_view().focus, "chart");
+        // Back: shift+tab to the messages, esc from the chart to the tree.
+        press(&mut app, &[KeyCode::BackTab]);
+        assert!(app.focus == Focus::Msgs);
+        press(&mut app, &[KeyCode::Tab, KeyCode::Esc]);
+        assert!(app.focus == Focus::Tree);
+
+        // Nothing to chart: no chart, and tab goes past where it would be.
+        press(&mut app, &[KeyCode::Esc]);
+        typ(&mut app, "v1/plant/line1/status");
+        assert!(!frame(&app, "no numbers").contains("Chart"));
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+        assert!(app.focus == Focus::Conns);
+
+        // A Parquet table: a series per number column, picked with ↑↓.
+        press(&mut app, &[KeyCode::Tab, KeyCode::Esc]);
+        typ(&mut app, "fastlog");
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+        assert!(app.focus == Focus::Chart);
+        let first = app.chart.current().unwrap().name.clone();
+        press(&mut app, &[KeyCode::Down]);
+        let second = app.chart.current().unwrap().name.clone();
+        assert_ne!(first, second);
+        let v = frame(&app, "parquet columns");
+        assert!(v.contains(&format!("{second}  2/{}", app.chart.series.len())), "{v}");
+        assert!(
+            v.contains(&format!("{}{second}", glyph::CURSOR)),
+            "picked in the list:\n{v}"
+        );
+        press(&mut app, &[KeyCode::End]);
+        assert_eq!(app.chart.sel, app.chart.series.len() - 1);
+        press(&mut app, &[KeyCode::Home]);
+        assert_eq!(app.chart.sel, 0);
+
+        // CSV: the number columns, with the first column along the x axis.
+        press(&mut app, &[KeyCode::Esc, KeyCode::Esc]);
+        typ(&mut app, "v2/report/daily");
+        let v = frame(&app, "csv columns");
+        assert!(v.contains("energy_kwh  1/2 · min 0 · max 28450.5 · 3 rows"), "{v}");
+        assert!(v.contains("T01") && v.contains("T03"), "{v}");
+
+        // Too little room for both halves: the details only.
+        app.resize(110, 24);
+        assert!(!frame(&app, "short window").contains("Chart"));
+    }
+
+    #[test]
+    fn the_picked_message_stays_in_view_above_a_chart() {
+        let mut st = Store::new(10, 64 * 1024);
+        let c = st.add_conn("local", "mqtt://x", None, vec![sub("#")]);
+        for i in 0..10 {
+            st.add(
+                c,
+                "plant/temp",
+                format!("{}", 20 + i).as_bytes(),
+                0,
+                false,
+                Props::default(),
+            );
+        }
+        let (mut app, _rx) = app_with(st, tmp_config("chart-list"));
+        typ(&mut app, "temp");
+        assert!(frame(&app, "chart").contains("╭─ Chart ─"));
+        // The oldest message: last in the list, still shown and marked.
+        press(&mut app, &[KeyCode::Right, KeyCode::End]);
+        let v = frame(&app, "oldest picked");
+        let picked = v
+            .lines()
+            .find(|l| l.contains(glyph::CURSOR) && l.contains(" B "))
+            .unwrap_or_default();
+        assert!(picked.ends_with("20 │") || picked.contains(" 20 "), "{v}");
+        assert!(v.contains("Messages  10/10"), "{v}");
+    }
+
+    #[test]
+    fn chart_numbers_read_short() {
+        assert_eq!(super::short(0.0), "0");
+        assert_eq!(super::short(-0.0), "0");
+        assert_eq!(super::short(2130.25), "2130.2");
+        assert_eq!(super::short(20.5), "20.5");
+        assert_eq!(super::short(12.0), "12");
+        assert_eq!(super::short(0.125), "0.125");
+        assert_eq!(super::short(-3.5), "-3.5");
+        assert_eq!(super::short(28450.5), "28450.5");
+        assert_eq!(super::short(1.5e9), "1.50e9");
+        assert_eq!(super::short(0.0004), "4.00e-4");
     }
 }

@@ -157,7 +157,7 @@ clears. Clearing keeps the tree open at the topic you were on.
 | tree, messages | `ctrl+t` / `ctrl+y` | copy the topic / the message (see [Clipboard](#clipboard)) |
 | full screen | `t` / `y` | copy the topic / what the view shows |
 | tree, messages | `ctrl+r` | capture this topic and everything below it to disk; again to stop |
-| anywhere | `ctrl+n` | when a newer fss-mqtt was installed meanwhile: restart into it, continuing the session |
+| anywhere | `ctrl+n` | with a newer release out: install it (see [Updating](#updating)); when a newer fss-mqtt was installed meanwhile: restart into it, continuing the session |
 | anywhere | `ctrl+c` | quit (saving the session for `--resume`) |
 
 A green `•`/`▸` means the topic (or something under it) received a message in the last 1.5 s.
@@ -421,6 +421,27 @@ continued as far as it can be read, and the status line says so. `--no-session`
 
 `FSS_MQTT_KEYS=vim` turns on vim keys like `--vim`, the way `FSS_MQTT_SESSION=off` stands in for
 `--no-session`.
+
+## Updating
+
+fss-mqtt looks for a newer release when it starts, at most once a day, and daily while it runs: it
+asks where `github.com/mbilling/fss-mqtt/releases/latest` leads, and sends nothing else. When there's
+one, the header says so (`↑ 0.9.0 available · ^n update`), and `ctrl+n` installs it the way this
+fss-mqtt was installed, then restarts into it, continuing the session:
+
+- **Homebrew:** `brew update`, then `brew upgrade mbilling/tap/fss-mqtt`, in the background.
+- **A release archive or `cargo install`:** the release's archive for this platform is downloaded,
+  checked against the release's `SHA256SUMS`, run once (`--version`) to be sure it works here, and
+  put in place of the running program. On Windows the running one is moved aside, and removed the
+  next time fss-mqtt starts.
+- **Scoop** doesn't update a program while it runs: quit, `scoop update fss-mqtt`, then
+  `fss-mqtt --resume`.
+- **A `.deb` or `.rpm`** needs your package manager and sudo: install the new package from the
+  release page.
+
+On Windows the restart is yours to do: fss-mqtt quits and prints the command to continue. Downloads
+go straight to GitHub over HTTPS, not through a proxy. `FSS_MQTT_UPDATE=off` turns looking for
+releases off, and then no request is made.
 
 ## Performance notes
 

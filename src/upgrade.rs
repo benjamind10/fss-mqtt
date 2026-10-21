@@ -111,6 +111,12 @@ impl Watch {
         false
     }
 
+    /// Looks at the next `check` rather than when it's time: something was
+    /// just installed.
+    pub fn look_now(&mut self) {
+        self.checked = Instant::now() - CHECK_EVERY;
+    }
+
     /// The version to offer a restart into: installed, and at the last look
     /// still the file that said so.
     pub fn offering(&self) -> Option<&str> {
@@ -125,7 +131,7 @@ impl Watch {
 }
 
 /// `fss-mqtt --version` of the binary at `path`: "0.7.0".
-fn probe(path: &Path) -> Option<String> {
+pub(crate) fn probe(path: &Path) -> Option<String> {
     let mut child = Command::new(path)
         .arg("--version")
         .stdin(Stdio::null())

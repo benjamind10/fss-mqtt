@@ -382,6 +382,16 @@ fn header<'a>(app: &App, st: &Store) -> Line<'a> {
     if let Some(v) = app.upgrade.as_ref().and_then(|w| w.offering()) {
         let v = if v == env!("CARGO_PKG_VERSION") { "new build" } else { v };
         left.push(Span::styled(format!("  ↑ {v} · ^n restart"), th.accent_b));
+    } else if let Some(v) = app.restarting_into() {
+        left.push(Span::styled(format!("  ↑ {v} · restarting…"), th.accent_b));
+    } else if let Some(j) = &app.updating {
+        let what = match j.step() {
+            crate::update::Step::Working(s) => s,
+            _ => "installing".into(),
+        };
+        left.push(Span::styled(format!("  ↑ {} · {what}…", j.version), th.accent_b));
+    } else if let Some(v) = app.release.as_ref().and_then(|c| c.available()) {
+        left.push(Span::styled(format!("  ↑ {v} available · ^n update"), th.accent_b));
     }
     let right = vec![
         Span::styled(commas(st.topic_count() as u64), th.text),
@@ -1176,6 +1186,8 @@ fn hints<'a>(app: &App) -> Line<'a> {
     };
     if app.upgrade.as_ref().is_some_and(|w| w.offering().is_some()) {
         keys.push(("^n", "restart", 0));
+    } else if app.updating.is_none() && app.release.as_ref().is_some_and(|c| c.available().is_some()) {
+        keys.push(("^n", "update", 0));
     }
     if !app.opts.vim {
         keys.push(("^c", "quit", 0));
@@ -2551,6 +2563,53 @@ mod tests {
         app.upgrade = Some(crate::upgrade::Watch::found(bin.clone(), env!("CARGO_PKG_VERSION")));
         assert_eq!(app.upgrade_note().as_deref(), Some("fss-mqtt was rebuilt"));
         assert!(frame(&app, "rebuilt").contains("↑ new build · ^n restart"));
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    #[test]
+    fn ctrl_n_updates_to_a_newer_release() {
+        use crate::update::{Checker, Job, Step};
+        let (mut app, _rx) = sample(tmp_config("update"));
+        let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        let notice = |app: &App| app.notice.as_ref().map(|n| n.0.clone()).unwrap_or_default();
+
+        // Looked, and this is the newest: nothing offered.
+        app.release = Some(Checker::found(env!("CARGO_PKG_VERSION")));
+        app.key(ctrl_n);
+        assert!(notice(&app).ends_with("is the newest"), "{}", notice(&app));
+        app.notice = None;
+        assert!(!frame(&app, "the newest").contains("^n"));
+
+        // A newer release: offered; ctrl+n installs it the way this copy
+        // was installed (a test binary is built from source: it says so).
+        app.release = Some(Checker::found("99.0.0"));
+        let v = frame(&app, "a release out");
+        assert!(
+            v.contains("↑ 99.0.0 available · ^n update") && v.contains("^n update · ^c quit"),
+            "{v}"
+        );
+        app.key(ctrl_n);
+        assert!(app.updating.is_none() && notice(&app).contains("built from source"));
+
+        // While it installs, the header says so; a failure says why.
+        app.updating = Some(Job::ended("99.0.0", Step::Working("downloading 40%".into())));
+        assert!(frame(&app, "installing").contains("↑ 99.0.0 · downloading 40%…"));
+        app.updating = Some(Job::ended("99.0.0", Step::Failed("no network".into())));
+        app.tick();
+        assert!(app.updating.is_none() && notice(&app) == "couldn't update: no network");
+
+        // Installed, but nothing watches where this one was started from.
+        app.updating = Some(Job::ended("99.0.0", Step::Done));
+        app.tick();
+        assert!(!app.quit && notice(&app).contains("start it again"), "{}", notice(&app));
+
+        // Installed in our place: the restart, continuing the session.
+        let bin = std::env::temp_dir().join(format!("fss-mqtt-test-{}-update", std::process::id()));
+        std::fs::write(&bin, "v99").unwrap();
+        app.upgrade = Some(crate::upgrade::Watch::found(bin.clone(), "99.0.0"));
+        app.updating = Some(Job::ended("99.0.0", Step::Done));
+        app.tick();
+        assert!(app.restart && app.quit);
         let _ = std::fs::remove_file(&bin);
     }
 

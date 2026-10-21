@@ -67,7 +67,9 @@ fn draw_all(f: &mut Frame, app: &App) {
         return;
     }
 
-    let l = app.layout();
+    // The frame's own size: the window may have changed since the app last
+    // heard (laying out for the old size would draw past the edge).
+    let l = app.layout_for(area.width, area.height);
     put(buf, 0, 0, header(app, &st), area.width);
     panel_box(buf, Rect::new(0, 1, area.width, l.panel_h), app, &st);
     let top = 1 + l.panel_h;
@@ -252,6 +254,9 @@ fn border_label(buf: &mut Buffer, r: Rect, label: &str, style: ratatui::style::S
     if room < 12 || r.height < 2 {
         return;
     }
+    if r.intersection(buf.area) != r {
+        return;
+    }
     let text = format!(" {} ", fmt::trunc_left(label, room));
     let x = r.right() - 2 - fmt::str_width(&text) as u16;
     buf.set_string(x, r.bottom() - 1, text, style);
@@ -261,7 +266,7 @@ fn prompt_box(buf: &mut Buffer, area: Rect, app: &App, st: &Store) {
     let th = &app.th;
     let p = app.prompt.as_ref().unwrap();
     let c = &st.conns[p.conn];
-    let w = area.width.clamp(20, 64);
+    let w = area.width.clamp(20, 64).min(area.width); // never wider than the screen
     let r = Rect::new((area.width - w) / 2, area.height / 3, w, 7);
     for y in r.y..r.bottom().min(area.height) {
         for x in r.x..r.right() {
@@ -308,6 +313,8 @@ fn put(buf: &mut Buffer, x: u16, y: u16, line: Line, w: u16) {
 /// Rounded box with a title in the top edge.
 /// `sel` is the index of the selected line, drawn as a full-width bar.
 fn draw_box(buf: &mut Buffer, r: Rect, title: &str, lines: Vec<Line>, focused: bool, sel: Option<usize>, th: &Theme) {
+    // Never past the edge of the screen, whatever the layout says.
+    let r = r.intersection(buf.area);
     if r.width < 4 || r.height < 2 {
         return;
     }
@@ -844,6 +851,9 @@ fn input_box(buf: &mut Buffer, r: Rect, app: &App) {
         left.push(Span::styled(" ", th.cursor));
     }
     let line = join_lr(left, info, inner);
+    if r.intersection(buf.area) != r || r.height < 3 || r.width < 4 {
+        return; // doesn't fit (the screen is about to be laid out again)
+    }
     let bs = th.border;
     let bar = "─".repeat(r.width.saturating_sub(2) as usize);
     buf.set_string(r.x, r.y, format!("╭{bar}╮"), bs);
@@ -2325,6 +2335,49 @@ mod tests {
         assert_eq!(app.upgrade_note().as_deref(), Some("fss-mqtt was rebuilt"));
         assert!(frame(&app, "rebuilt").contains("↑ new build · ^n restart"));
         let _ = std::fs::remove_file(&bin);
+    }
+
+    #[test]
+    fn a_frame_of_another_size_than_the_last_resize_still_fits() {
+        // The window can change size between the app hearing of it and the
+        // next frame (Terminal.app's tab bar appearing takes two rows):
+        // every screen must draw inside whatever frame it gets.
+        let cfg = tmp_config("sizes");
+        let (mut app, _rx) = sample(cfg.clone());
+        let draw_at = |app: &App, w: u16, h: u16| {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| super::draw(f, app)).unwrap();
+        };
+        let sizes = [(184, 55), (184, 57), (110, 36), (79, 40), (60, 20), (20, 9), (10, 8)];
+        let check = |app: &mut App, what: &str| {
+            for &(aw, ah) in &sizes {
+                app.resize(aw, ah);
+                for &(w, h) in &sizes {
+                    // A panic here names the screen and both sizes.
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| draw_at(app, w, h)));
+                    assert!(r.is_ok(), "{what}: laid out for {aw}x{ah}, drawn at {w}x{h}");
+                }
+            }
+            app.resize(110, 36);
+        };
+        check(&mut app, "tree");
+        press(&mut app, &[KeyCode::Tab]);
+        check(&mut app, "connections");
+        // A password prompt over it (staging needs one).
+        press(&mut app, &[KeyCode::End, KeyCode::Up, KeyCode::Char(' ')]);
+        assert!(app.prompt.is_some());
+        check(&mut app, "prompt");
+        press(&mut app, &[KeyCode::Esc, KeyCode::Esc, KeyCode::Esc, KeyCode::Tab]);
+        app.prompt = None;
+        // Full screen, and the publish editor.
+        typ(&mut app, "v1/plant/line1/temp");
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(app.viewer.is_some());
+        check(&mut app, "viewer");
+        app.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(app.composer.is_some());
+        check(&mut app, "composer");
+        let _ = std::fs::remove_file(&cfg);
     }
 
     #[test]

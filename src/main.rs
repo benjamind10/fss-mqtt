@@ -719,6 +719,12 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut app::App) -> st
     app.resize(size.width, size.height);
     app.tick();
     loop {
+        // In step with the terminal's size before each frame: a resize event
+        // can still be on its way when the window has already changed.
+        let size = terminal.size()?;
+        if (size.width, size.height) != (app.width, app.height) {
+            app.resize(size.width, size.height);
+        }
         terminal.draw(|f| ui::draw(f, app))?;
         if event::poll(FRAME)? {
             // Handle everything already queued, then redraw once.

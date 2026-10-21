@@ -97,8 +97,12 @@ pub struct State {
     /// The picked message's own rows, and its seq: a big table is decoded
     /// once, not again for every message that arrives meanwhile.
     rows_of: Option<(u64, Vec<Series>)>,
-    /// All the rows of that message's table, being read (by seq).
+    /// All the rows of a message's table, being read (by seq): one at a
+    /// time, the newest wanted one waiting meanwhile.
     reading: Option<(u64, Reading)>,
+    next_read: Option<Arc<Message>>,
+    /// What reads them: `rows_whole` (tests stand in for it).
+    reader: Option<Reader>,
     /// The numbers its messages carry, one series each.
     over: Vec<Series>,
     /// Where the stretch in view starts (a point), once scrolled; at first,
@@ -113,6 +117,31 @@ pub type Key = (usize, u64, Option<u64>, u64);
 
 /// Where a thread puts the rows it read.
 type Reading = Arc<Mutex<Option<Vec<Series>>>>;
+type Reader = fn(&Message) -> Option<Vec<Series>>;
+
+thread_local! {
+    /// On a thread that reads a table in the background, where a panic is
+    /// caught: the panic hook leaves the terminal be (see `main`).
+    static QUIET: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether a panic on this thread is caught where it happens.
+pub fn quiet_panics() -> bool {
+    QUIET.with(Cell::get)
+}
+
+/// Reads all of a message's rows on a thread of its own. The slot gets
+/// them, or nothing when that fails, a panic included.
+fn read_in_background(m: Arc<Message>, read: Reader) -> Reading {
+    let slot: Reading = Arc::new(Mutex::new(None));
+    let done = slot.clone();
+    std::thread::spawn(move || {
+        QUIET.with(|q| q.set(true));
+        let rows = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&m)));
+        *done.lock().unwrap() = Some(rows.ok().flatten().unwrap_or_default());
+    });
+    slot
+}
 
 impl State {
     /// Whether the series are those of `key`.
@@ -137,20 +166,23 @@ impl State {
         match msgs.get(focused) {
             Some(m) if self.rows_of.as_ref().is_some_and(|(seq, _)| *seq == m.seq) => {}
             Some(m) => {
-                // What arrival kept, now; all of a big table, when read.
+                // What arrival kept, now; all of a big table, when read. One
+                // read at a time: a newer one waits for it (rather than
+                // whatever waited before), and what an older one reads is
+                // dropped.
                 self.rows_of = Some((m.seq, rows(m)));
-                self.reading = has_more(m).then(|| {
-                    let slot = Arc::new(Mutex::new(None));
-                    let (whole, done) = (m.clone(), slot.clone());
-                    std::thread::spawn(move || {
-                        *done.lock().unwrap() = Some(rows_whole(&whole).unwrap_or_default());
-                    });
-                    (m.seq, slot)
-                });
+                self.next_read = None;
+                if has_more(m) {
+                    if self.reading.is_some() {
+                        self.next_read = Some(m.clone());
+                    } else {
+                        self.reading = Some((m.seq, read_in_background(m.clone(), self.reader())));
+                    }
+                }
             }
             None => {
                 self.rows_of = None;
-                self.reading = None;
+                self.next_read = None;
             }
         }
         self.over = over_time(msgs, &mut self.fields);
@@ -165,7 +197,8 @@ impl State {
             return false;
         };
         let seq = *seq;
-        self.reading = None;
+        let reader = self.reader();
+        self.reading = self.next_read.take().map(|m| (m.seq, read_in_background(m, reader)));
         if self.rows_of.as_ref().is_none_or(|(s, _)| *s != seq) || all.is_empty() {
             return false;
         }
@@ -176,7 +209,13 @@ impl State {
 
     /// Whether all of a table's rows are still being read.
     pub fn reading(&self) -> bool {
-        self.reading.is_some()
+        let shown = self.rows_of.as_ref().map(|(seq, _)| *seq);
+        self.reading.as_ref().is_some_and(|(seq, _)| Some(*seq) == shown)
+            || self.next_read.as_ref().is_some_and(|m| Some(m.seq) == shown)
+    }
+
+    fn reader(&self) -> Reader {
+        self.reader.unwrap_or(rows_whole)
     }
 
     /// The series: the message's own rows, then the numbers its messages
@@ -199,6 +238,7 @@ impl State {
         self.fields.clear();
         self.rows_of = None;
         self.reading = None;
+        self.next_read = None;
         self.over.clear();
         self.from = None;
     }
@@ -913,6 +953,69 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(!st.reading() && st.current().unwrap().count == 500);
+    }
+
+    /// Polls until no read is under way.
+    fn wait_for_reads(st: &mut State) {
+        let start = std::time::Instant::now();
+        while st.reading.is_some() {
+            assert!(start.elapsed() < Duration::from_secs(10), "never read");
+            st.poll();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn one_read_at_a_time_and_a_panic_is_caught() {
+        let pq = std::fs::read(format!(
+            "{}/tests/fixtures/turbine-snappy.parquet",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let big = |seq: u64| {
+            Arc::new(Message {
+                seq,
+                payload: pq.clone(),
+                size: pq.len(),
+                decoded: crate::pretty::decode_on_arrival(Some("application/parquet"), &pq).map(Box::new),
+                ..message(seq, 0, "", Some("application/parquet"))
+            })
+        };
+
+        // A panic while reading is caught: the first rows stay, and
+        // nothing is left reading.
+        let mut st = State {
+            reader: Some(|_: &Message| -> Option<Vec<Series>> { panic!("a decoder bug") }),
+            ..Default::default()
+        };
+        st.update((1, 1, None, 1), &[big(1)], 0);
+        assert!(st.reading());
+        wait_for_reads(&mut st);
+        assert!(!st.reading() && st.current().unwrap().count < 500);
+
+        // A newer message while one is read waits for it, then is read;
+        // what the older read found is dropped.
+        let mut st = State {
+            reader: Some(|m: &Message| {
+                std::thread::sleep(Duration::from_millis(30));
+                Some(vec![Series {
+                    name: format!("all of {}", m.seq),
+                    points: vec![(0.0, 1.0), (1.0, 2.0)],
+                    axis: Axis::Rows,
+                    count: 2,
+                    unit: "rows",
+                    total: None,
+                    whole: None,
+                    over_time: false,
+                }])
+            }),
+            ..Default::default()
+        };
+        st.update((1, 1, None, 1), &[big(1)], 0);
+        st.update((1, 2, None, 2), &[big(2), big(1)], 0);
+        assert!(st.next_read.is_some() && st.reading());
+        wait_for_reads(&mut st);
+        assert_eq!(names(&st.series), ["all of 2"]);
     }
 
     #[test]

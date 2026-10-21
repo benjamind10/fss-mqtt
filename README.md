@@ -5,6 +5,8 @@ live topic tree you narrow down just by typing; edit any message and publish it 
 
 ![fss-mqtt: browsing two brokers, filtering, opening messages; Parquet, Avro, Arrow, SQLite, SQLite changeset, Protobuf, MessagePack, CBOR, CSV and gzip payloads decoded; pausing a subscription](docs/demo.gif)
 
+Vim user? See [`--vim`](#vim-keys---vim).
+
 ## Install
 
 Pre-built binaries for Linux, macOS and Windows are on the GitHub releases page.
@@ -155,27 +157,6 @@ clears. Clearing keeps the tree open at the topic you were on.
 | anywhere | `ctrl+n` | when a newer fss-mqtt was installed meanwhile: restart into it, continuing the session |
 | anywhere | `ctrl+c` | quit (saving the session for `--resume`) |
 
-### Vim keys (`--vim`)
-
-With `--vim` (or `FSS_MQTT_KEYS=vim`), letters move around instead of filtering, as in Ranger;
-`/` starts the filter. The keys above keep working, apart from `ctrl+u`, which pages up.
-
-| Where | Key | |
-|---|---|---|
-| connections, tree, messages | `j k` | down / up (like `↓ ↑`) |
-| tree | `h l` | collapse / expand (like `← →`) |
-| messages | `h` | back to the tree |
-| connections, tree, messages | `g` / `G` | first / last (like `home` / `end`) |
-| tree, full screen | `ctrl+d` / `ctrl+u` | page down / up |
-| messages | `ctrl+d` / `ctrl+u` | last / first (like `pgdn` / `pgup`) |
-| anywhere | `/` | filter: type it, then `⏎` keeps it and goes back to moving, `esc` clears it |
-| anywhere | `e` | publish (like `ctrl+e`) |
-| tree, messages | `t` / `y` | copy the topic / the message (like `ctrl+t` / `ctrl+y`) |
-| anywhere | `q` | quit (like `ctrl+c`) |
-
-While filtering, letters go to the filter, and `backspace`, `ctrl+w` and `ctrl+u` edit it as above;
-while moving they leave it alone. `tab` keeps the filter and goes back to moving.
-
 A green `•`/`▸` means the topic (or something under it) received a message in the last 1.5 s.
 
 Colours follow `$COLORFGBG` for light terminals (e.g. `export COLORFGBG='0;15'`) and default to dark.
@@ -196,6 +177,33 @@ the terminal instead (an OSC 52 escape sequence, up to 768 KB of text), which la
 clipboard of the machine you're sitting at. Most terminals support it (iTerm2, kitty, WezTerm,
 Alacritty, Windows Terminal, foot; Apple Terminal doesn't). In tmux, enable it with
 `set -g set-clipboard on`. `FSS_MQTT_CLIPBOARD=osc52`, `=native` or `=off` overrides the choice.
+
+## Vim keys (`--vim`)
+
+With `--vim` (or `FSS_MQTT_KEYS=vim`), letters move around instead of filtering, as in Ranger;
+`/` starts the filter. The other [keys](#keys) keep working, apart from `ctrl+u`, which pages up.
+
+![fss-mqtt --vim: j and l through the tree, / to filter, j and k to pick a message, h and l to older and newer ones full screen, y to copy, e to publish a copy, ctrl+d, ctrl+u, G and g through a Parquet table, q to quit; the keys pressed show below](docs/vim.gif)
+
+| Where | Key | |
+|---|---|---|
+| connections, tree, messages | `j k` | down / up (like `↓ ↑`) |
+| tree | `h l` | collapse / expand (like `← →`) |
+| messages | `h` | back to the tree |
+| connections, tree, messages | `g` / `G` | first / last (like `home` / `end`) |
+| tree, full screen | `ctrl+d` / `ctrl+u` | page down / up |
+| messages | `ctrl+d` / `ctrl+u` | last / first (like `pgdn` / `pgup`) |
+| connections, tree, messages | `/` | filter: type it, then `⏎` keeps it and goes back to moving, `esc` clears it |
+| anywhere | `e` | publish (like `ctrl+e`) |
+| tree, messages | `t` / `y` | copy the topic / the message (like `ctrl+t` / `ctrl+y`) |
+| connections, tree, messages | `q` | quit (like `ctrl+c`) |
+
+Full screen, `j k` scroll, `g G` go to the top and the end, `h l` step to older and newer messages
+and `q` closes the view, with or without `--vim`.
+
+While filtering, letters go to the filter, and `backspace`, `ctrl+w` and `ctrl+u` edit it as in
+[Filtering](#filtering); while moving they leave it alone. `tab` keeps the filter and goes back to
+moving.
 
 ## Publishing
 

@@ -144,7 +144,7 @@ clears. Clearing keeps the tree open at the topic you were on.
 | messages | `↑ ↓` | pick one of the last 10 messages (properties and payload follow) |
 | messages | `⏎` | open it full screen |
 | messages | `← esc` | back to the tree |
-| chart | `↑ ↓ home end` | pick the column or field to chart (see [Charts](#charts)) |
+| chart | `↑ ↓ home end pgup pgdn` | pick the column or field to chart (see [Charts](#charts)) |
 | chart | `⏎` | open the message full screen |
 | chart | `← esc` | back to the tree |
 | full screen | `↑ ↓ pgup pgdn` | scroll |
@@ -196,7 +196,7 @@ With `--vim` (or `FSS_MQTT_KEYS=vim`), letters move around instead of filtering,
 | messages, chart | `h` | back to the tree |
 | connections, tree, messages, chart | `g` / `G` | first / last (like `home` / `end`) |
 | tree, full screen | `ctrl+d` / `ctrl+u` | page down / up |
-| messages | `ctrl+d` / `ctrl+u` | last / first (like `pgdn` / `pgup`) |
+| messages, chart | `ctrl+d` / `ctrl+u` | last / first (like `pgdn` / `pgup`) |
 | connections, tree, messages | `/` | filter: type it, then `⏎` keeps it and goes back to moving, `esc` clears it |
 | anywhere | `e` | publish (like `ctrl+e`) |
 | tree, messages | `t` / `y` | copy the topic / the message (like `ctrl+t` / `ctrl+y`) |

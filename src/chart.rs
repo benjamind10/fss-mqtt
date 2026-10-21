@@ -207,7 +207,11 @@ fn table(prefix: &str, header: &[String], rows: &[Vec<Option<String>>], detail: 
 /// "2026-10-08 10:20:00Z" and "2026-10-08 10:20:51Z" (or with a `T`).
 /// Anything else as it is.
 fn without_common_day(a: &str, b: &str) -> (String, String) {
-    let common = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    let mut common = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    // Not into a character the two only start alike (Å, Ø).
+    while !a.is_char_boundary(common) {
+        common -= 1;
+    }
     // The day ends at a space or a `T` that follows a digit.
     let cut = a[..common]
         .char_indices()
@@ -442,35 +446,44 @@ fn json_fields(p: &[u8], out: &mut Vec<(String, f64)>) {
 /// A series per number the messages carry, over the messages kept: named as
 /// in the newest message first, then those only older ones have.
 fn over_time(msgs: &[Arc<Message>], cache: &mut HashMap<u64, Arc<Vec<(String, f64)>>>) -> Vec<Series> {
-    let mut names: Vec<String> = Vec::new();
-    let mut by: HashMap<String, Vec<(SystemTime, f64)>> = HashMap::new();
-    for m in msgs.iter().rev() {
-        let f = cache.entry(m.seq).or_insert_with(|| Arc::new(fields(m))).clone();
-        for (k, v) in f.iter() {
-            by.entry(k.clone()).or_default().push((m.time, *v));
-        }
+    // Each message is read once; the names are borrowed from what was
+    // read, not copied for every point (with a long --history, many).
+    for m in msgs {
+        cache.entry(m.seq).or_insert_with(|| Arc::new(fields(m)));
     }
-    if let Some(newest) = msgs.first().and_then(|m| cache.get(&m.seq)) {
-        names.extend(newest.iter().map(|(k, _)| k.clone()));
+    let cache = &*cache;
+    let mut names: Vec<&str> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    if let Some(newest) = msgs.first() {
+        names.extend(
+            cache[&newest.seq]
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .filter(|k| seen.insert(k)),
+        );
     }
+    let mut by: HashMap<&str, Vec<(SystemTime, f64)>> = HashMap::new();
     for m in msgs.iter().rev() {
-        for (k, _) in cache[&m.seq].iter() {
-            if !names.contains(k) {
-                names.push(k.clone());
+        for (k, v) in cache[&m.seq].iter() {
+            if seen.insert(k) {
+                names.push(k);
             }
+            by.entry(k).or_default().push((m.time, *v));
         }
     }
     let secs = |t: SystemTime| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
     let mut out = Vec::new();
     for name in names {
-        let Some(pts) = by.remove(&name) else { continue };
+        let Some(mut pts) = by.remove(name) else { continue };
         if pts.len() < 2 {
             continue;
         }
+        // In time order, should the clock have been set back meanwhile.
+        pts.sort_by_key(|p| p.0);
         let (t0, t1) = (pts[0].0, pts[pts.len() - 1].0);
         let start = secs(t0);
         out.push(Series {
-            name,
+            name: name.to_string(),
             ends: (clock(t0, t1), clock(t1, t0)),
             source: format!("{} messages", pts.len()),
             points: pts.iter().map(|&(t, v)| (secs(t) - start, v)).collect(),
@@ -663,6 +676,22 @@ mod tests {
         assert_eq!(w("T01", "T03"), pair("T01", "T03"));
         assert_eq!(w("North pump", "North fan"), pair("North pump", "North fan"));
         assert_eq!(w("same", "same"), pair("same", "same"));
+        // Different letters that start with the same byte.
+        assert_eq!(w("Ålborg", "Ørsted"), pair("Ålborg", "Ørsted"));
+        assert_eq!(w("Pumpe ä", "Pumpe ö"), pair("Pumpe ä", "Pumpe ö"));
+        assert_eq!(
+            w("2026-10-08 10:20 Å", "2026-10-08 10:21 Ø"),
+            pair("10:20 Å", "10:21 Ø")
+        );
+    }
+
+    #[test]
+    fn a_clock_set_back_keeps_time_in_order() {
+        // Newest first by arrival; the second to arrive is stamped latest.
+        let msgs = vec![msg(3, 5, "3", None), msg(2, 10, "2", None), msg(1, 0, "1", None)];
+        let mut st = State::default();
+        st.update((1, 3, None, 3), &msgs, 0);
+        assert_eq!(st.series[0].points, [(0.0, 1.0), (5.0, 3.0), (10.0, 2.0)]);
     }
 
     #[test]

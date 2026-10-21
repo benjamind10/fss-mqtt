@@ -228,9 +228,11 @@ fn panel_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
         (a, 0) => format!(" ↑ {a} more "),
         (a, b) => format!(" ↑ {a} · ↓ {b} more "),
     };
-    let used = fmt::str_width(&more);
+    let mut used = fmt::str_width(&more);
     if used > 0 && r.height > 2 && r.intersection(buf.area) == r && r.width as usize > used + 4 {
         buf.set_string(r.x + 2, r.bottom() - 1, &more, th.dim);
+    } else {
+        used = 0; // not drawn: the path may have the room
     }
     // Where the connections live (edits to the file apply while running),
     // on the right, in what room that leaves.

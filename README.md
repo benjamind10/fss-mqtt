@@ -181,7 +181,8 @@ Alacritty, Windows Terminal, foot; Apple Terminal doesn't). In tmux, enable it w
 ## Vim keys (`--vim`)
 
 With `--vim` (or `FSS_MQTT_KEYS=vim`), letters move around instead of filtering, as in Ranger;
-`/` starts the filter. The other [keys](#keys) keep working, apart from `ctrl+u`, which pages up.
+`/` starts the filter. The other [keys](#keys) keep working, apart from `ctrl+u`, which pages up
+(in messages, to the first one).
 
 ![fss-mqtt --vim: j and l through the tree, / to filter, j and k to pick a message, h and l to older and newer ones full screen, y to copy, e to publish a copy, ctrl+d, ctrl+u, G and g through a Parquet table, q to quit; the keys pressed show below](docs/vim.gif)
 

@@ -25,6 +25,7 @@ docker run -d --name fss-demo-pub-bergen --network $net -v "$root/docs/demo:/dem
 sleep 12 # let a few large payloads and alarms arrive first
 docker run --rm --network $net -v "$root:/vhs" -v "$bin:/usr/local/bin/fss-mqtt:ro" \
     ghcr.io/charmbracelet/vhs "$tape"
+# The tape's Output line: its GIF, as a path from the repo root without quotes.
 gif=$(sed -n 's/^Output //p' "$root/$tape")
 # A tape with a "# keys.py" line gets the keys it presses shown below the terminal.
 if grep -q '^# keys.py' "$root/$tape"; then
@@ -32,6 +33,6 @@ if grep -q '^# keys.py' "$root/$tape"; then
         docs/demo/keys.py "$tape" "$gif"
 fi
 # The theme needs few colours; fewer in the palette roughly halves the file.
-docker run --rm -v "$root/docs:/docs" alpine:3 \
-    sh -c "apk add -q gifsicle && gifsicle -b -O3 --colors 32 /$gif"
+docker run --rm -v "$root:/vhs" alpine:3 \
+    sh -c "apk add -q gifsicle && gifsicle -b -O3 --colors 32 '/vhs/$gif'"
 ls -lh "$root/$gif"

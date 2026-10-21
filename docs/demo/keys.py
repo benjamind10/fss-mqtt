@@ -3,7 +3,9 @@
 
 Usage: keys.py <tape> <gif>   (rewrites the GIF; runs in the VHS image, which
 has python3, ffmpeg and the font). record.sh runs it for tapes with a
-"# keys.py" line; the keys after that line are shown.
+"# keys.py" line; the keys after that line are shown. The key caps need
+ffmpeg 6.1 or later (drawtext's boxw, boxh, text_align and y_align); the
+image has 7.1.
 
 When each key was pressed is worked out from the tape as VHS plays it: Type
 waits TypingSpeed (or its @time) after each character, Enter, Escape and the
@@ -145,21 +147,21 @@ def main():
     y = h + (STRIP - CAP_H) // 2
     font = f"fontfile={FONT}:expansion=none:y_align=font"
     f = [f"pad=iw:ih+{STRIP}:0:0:black", f"drawtext={font}:text=keys:fontsize=17:fontcolor=0x5a5a5a:x=18:y={y + 1}"]
-    labels = tempfile.mkdtemp()
-    for i, (start, stop, x, label, newest) in enumerate(caps([(t * scale, *k) for t, *k in keys], w)):
-        # From a file: the labels need no escaping that way.
-        path = os.path.join(labels, f"{i}.txt")
-        with open(path, "w", encoding="utf-8") as out:
-            out.write(label)
-        fg, bg = ("0xffffff", "0x3a3a3a") if newest else ("0xa8a8a8", "0x222222")
-        f.append(
-            f"drawtext={font}:textfile={path}:fontsize={SIZE}:fontcolor={fg}:box=1:boxcolor={bg}"
-            f":boxw={round(len(label) * CELL + 2 * PAD)}:boxh={CAP_H}:text_align=C+M"
-            f":x={round(x)}:y={y}:enable='between(t,{start:.3f},{stop:.3f})'"
-        )
-    graph = ",".join(f) + ",split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=none"
-    out = gif + ".keys.gif"
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", gif, "-filter_complex", graph, out], check=True)
+    with tempfile.TemporaryDirectory() as labels:
+        for i, (start, stop, x, label, newest) in enumerate(caps([(t * scale, *k) for t, *k in keys], w)):
+            # From a file: the labels need no escaping that way.
+            path = os.path.join(labels, f"{i}.txt")
+            with open(path, "w", encoding="utf-8") as out:
+                out.write(label)
+            fg, bg = ("0xffffff", "0x3a3a3a") if newest else ("0xa8a8a8", "0x222222")
+            f.append(
+                f"drawtext={font}:textfile={path}:fontsize={SIZE}:fontcolor={fg}:box=1:boxcolor={bg}"
+                f":boxw={round(len(label) * CELL + 2 * PAD)}:boxh={CAP_H}:text_align=C+M"
+                f":x={round(x)}:y={y}:enable='between(t,{start:.3f},{stop:.3f})'"
+            )
+        graph = ",".join(f) + ",split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=none"
+        out = gif + ".keys.gif"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", gif, "-filter_complex", graph, out], check=True)
     os.replace(out, gif)
     print(f"keys.py: {len(keys)} keys shown on {gif} (times scaled by {scale:.3f})")
 

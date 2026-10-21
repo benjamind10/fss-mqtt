@@ -7,6 +7,7 @@ mod base64;
 mod broker;
 mod capture;
 mod changeset;
+mod chart;
 mod clipboard;
 mod composer;
 mod compressed;

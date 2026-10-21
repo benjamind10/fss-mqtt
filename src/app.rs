@@ -1455,6 +1455,7 @@ impl App {
             KeyCode::Down => self.chart.step(1),
             KeyCode::Home | KeyCode::PageUp => self.chart.pick(0),
             KeyCode::End | KeyCode::PageDown => self.chart.pick(usize::MAX),
+            KeyCode::Left | KeyCode::Right if !self.chart.scrollable() => self.why_no_scroll(),
             KeyCode::Left | KeyCode::Right => {
                 // A quarter of what's in view, or (with shift) all of it.
                 let room = self.chart.room.get().max(2) as isize;
@@ -1478,6 +1479,28 @@ impl App {
         }
     }
 
+    /// ← → with all of the chart in view: why there's nothing to scroll to.
+    fn why_no_scroll(&mut self) {
+        let Some(s) = self.chart.current() else { return };
+        let note = if self.chart.reading() {
+            "reading all the rows: a moment".to_string()
+        } else if let (Some(size), Some(total)) = (s.whole, s.total) {
+            format!(
+                "only the first {} of {} rows are kept: --max-payload {} keeps them all",
+                fmt::commas(s.count as u64),
+                fmt::commas(total as u64),
+                crate::chart::max_payload_for(size)
+            )
+        } else {
+            format!(
+                "all {} {} are in view: nothing to scroll to",
+                fmt::commas(s.count as u64),
+                s.unit
+            )
+        };
+        self.notify(note, false);
+    }
+
     /// Keeps the chart in step with the topic in view and the message
     /// picked in the list (the one whose own rows are charted).
     pub fn update_chart(&mut self) {
@@ -1492,13 +1515,16 @@ impl App {
             let newest = node.latest()?.seq;
             let key = (n, newest, picked, node.msg_count);
             // Nothing new: no need to look at the messages again.
-            Some((key, (!self.chart.is_for(key)).then(|| node.messages())))
+            Some((
+                key,
+                (!self.chart.is_for(key)).then(|| (node.messages(), node.whole.clone())),
+            ))
         });
         match found {
             Some((_, None)) => {}
-            Some((key, Some(msgs))) => {
+            Some((key, Some((msgs, whole)))) => {
                 let i = msg_index(&msgs, picked);
-                self.chart.update(key, &msgs, i);
+                self.chart.update(key, &msgs, i, whole.as_ref());
             }
             None => self.chart.clear(),
         }

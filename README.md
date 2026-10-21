@@ -145,8 +145,9 @@ clears. Clearing keeps the tree open at the topic you were on.
 | messages | `⏎` | open it full screen |
 | messages | `← esc` | back to the tree |
 | chart | `↑ ↓ home end pgup pgdn` | pick the column or field to chart (see [Charts](#charts)) |
+| chart | `← →` (`shift`: a page) | scroll through the rows (or messages) when there are more than fit |
 | chart | `⏎` | open the message full screen |
-| chart | `← esc` | back to the tree |
+| chart | `esc` | back to the tree |
 | full screen | `↑ ↓ pgup pgdn` | scroll |
 | full screen | `← →` | older / newer message |
 | full screen | `shift ←→` `<` `>` | pan wide tables (CSV, Parquet) |
@@ -193,7 +194,8 @@ With `--vim` (or `FSS_MQTT_KEYS=vim`), letters move around instead of filtering,
 |---|---|---|
 | connections, tree, messages, chart | `j k` | down / up (like `↓ ↑`) |
 | tree | `h l` | collapse / expand (like `← →`) |
-| messages, chart | `h` | back to the tree |
+| messages | `h` | back to the tree |
+| chart | `h l` | scroll (like `← →`) |
 | connections, tree, messages, chart | `g` / `G` | first / last (like `home` / `end`) |
 | tree, full screen | `ctrl+d` / `ctrl+u` | page down / up |
 | messages, chart | `ctrl+d` / `ctrl+u` | last / first (like `pgdn` / `pgup`) |
@@ -309,8 +311,11 @@ both. `tab` goes to it from the message list, and `↑ ↓` pick what it shows:
 
 - **The columns of a table in the message** (Parquet, Arrow, Avro, SQLite, CSV, Sparkplug
   DataSets), row by row. The x axis goes by the first column when that's text (a time, a name),
-  otherwise by row number. A decoded table keeps its first rows (up to 200, about 4 KB of text),
-  and the chart says so: `first 52 of 500 rows`.
+  otherwise by row number. On arrival, a decoded table keeps its first rows (up to 200, about 4 KB
+  of text), and the chart says so: `first 52 of 500 rows`. When `--max-payload` kept the whole
+  payload, a Parquet, Arrow or Avro table is read again for the chart, all of it (up to 100,000
+  rows); otherwise the chart's bottom border says which `--max-payload` would do
+  (`--max-payload 1MiB keeps all`). So would a CSV payload cut on arrival.
 - **JSON arrays** of numbers, or of records (`[{"ts": "…", "kw": 1.5}, …]`): each array, or each
   number field of the records, item by item. MessagePack and CBOR count as JSON.
 - **The numbers each message carries:** a payload that's a number, a JSON document's number fields
@@ -320,7 +325,11 @@ both. `tab` goes to it from the message list, and `↑ ↓` pick what it shows:
 
 The chart is of the message picked in the message list (the latest one otherwise). Its heading
 says where the numbers come from and their range, and a column or field you pick stays picked on
-other topics that have one by that name.
+other topics that have one by that name. With more rows (or messages) than fit, it shows a stretch
+of them, one to a dot, and `← →` scroll through (a quarter of the view at a time, `shift` a whole
+view); the bottom border says which are in view (`rows 1,201–1,400`). A message's rows start at
+the first; the numbers each message carries start at the newest, and keep following them until
+you scroll back.
 
 ## Capture to disk
 

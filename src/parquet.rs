@@ -9,11 +9,8 @@ use std::io::Read;
 
 use crate::fmt::commas;
 use crate::values::{be_i128, clip, date, decimal, hex, time_of_day, timestamp, uuid};
-use crate::view::{Body, DocView, Fact};
+use crate::view::{Body, DocView, Fact, Limits};
 
-/// Rows are decoded until the rendered cells reach about this many bytes.
-const ROW_BUDGET: usize = 4096;
-const MAX_ROWS: usize = 200;
 /// Refuse to inflate pages larger than this.
 const MAX_PAGE: usize = 32 << 20;
 
@@ -37,8 +34,13 @@ pub struct Column {
 }
 
 /// Decoder entry point (see `pretty::Decoder`): recognised by its magic bytes.
-pub fn sniff(_ct: &str, b: &[u8]) -> Option<Result<DocView, String>> {
-    is_parquet(b).then(|| decode(b).map(|v| v.to_view()))
+pub fn sniff(ct: &str, b: &[u8]) -> Option<Result<DocView, String>> {
+    rows(ct, b, Limits::SCREEN)
+}
+
+/// `sniff`, keeping as many rows as `limits` allow.
+pub fn rows(_ct: &str, b: &[u8], limits: Limits) -> Option<Result<DocView, String>> {
+    is_parquet(b).then(|| decode_with(b, limits).map(|v| v.to_view()))
 }
 
 impl ParquetView {
@@ -93,7 +95,12 @@ pub fn is_parquet(b: &[u8]) -> bool {
     b.len() >= 12 && b.starts_with(b"PAR1") && b.ends_with(b"PAR1")
 }
 
+#[cfg(test)]
 pub fn decode(file: &[u8]) -> Result<ParquetView, String> {
+    decode_with(file, Limits::SCREEN)
+}
+
+pub fn decode_with(file: &[u8], limits: Limits) -> Result<ParquetView, String> {
     if !is_parquet(file) {
         return Err("not a Parquet file".into());
     }
@@ -162,7 +169,7 @@ pub fn decode(file: &[u8]) -> Result<ParquetView, String> {
     }
 
     // First rows, column by column, then cut to the byte budget.
-    let want = (view.num_rows.max(0) as usize).min(MAX_ROWS);
+    let want = (view.num_rows.max(0) as usize).min(limits.rows);
     let mut cols: Vec<Vec<Option<String>>> = Vec::with_capacity(leaves.len());
     for (ci, leaf) in leaves.iter().enumerate() {
         let mut vals = Vec::new();
@@ -197,7 +204,7 @@ pub fn decode(file: &[u8]) -> Result<ParquetView, String> {
     for r in 0..rows_have {
         let row: Vec<Option<String>> = cols.iter().map(|c| c.get(r).cloned().unwrap_or(None)).collect();
         used += row.iter().map(|c| c.as_ref().map_or(4, |s| s.len()) + 1).sum::<usize>();
-        if used > ROW_BUDGET && !view.rows.is_empty() {
+        if used > limits.bytes && !view.rows.is_empty() {
             break;
         }
         view.rows.push(row);
@@ -994,7 +1001,10 @@ mod tests {
                 .flatten()
                 .map(|c| c.as_ref().map_or(4, |s| s.len()) + 1)
                 .sum();
-            assert!(rendered <= ROW_BUDGET + 200, "{name}: rows use {rendered} bytes");
+            assert!(
+                rendered <= Limits::SCREEN.bytes + 200,
+                "{name}: rows use {rendered} bytes"
+            );
         }
     }
 

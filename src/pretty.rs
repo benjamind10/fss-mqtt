@@ -15,7 +15,7 @@ use crate::protobuf;
 use crate::sqlite;
 use crate::store::Message;
 use crate::theme::Theme;
-use crate::view::DocView;
+use crate::view::{DocView, Limits};
 
 /// What a binary payload was turned into when it arrived.
 pub type Decoded = DocView;
@@ -45,6 +45,20 @@ const DECODERS: &[(&str, Decoder)] = &[
 pub fn decode_on_arrival(content_type: Option<&str>, payload: &[u8]) -> Option<Decoded> {
     let ct = content_type.unwrap_or("").to_ascii_lowercase();
     decode(&ct, payload, "")
+}
+
+/// A table payload decoded again, for a chart to scroll through: as many
+/// rows as `Limits::CHART` allows, where arrival kept a screenful. `format`
+/// is what it was decoded as then; Parquet, Arrow and Avro have the rows.
+pub fn decode_rows(format: &str, content_type: Option<&str>, payload: &[u8]) -> Option<Decoded> {
+    let ct = content_type.unwrap_or("").to_ascii_lowercase();
+    let rows = match format {
+        "Parquet" => parquet::rows,
+        "Arrow" => arrow::rows,
+        "Avro" => avro::rows,
+        _ => return None,
+    };
+    rows(&ct, payload, Limits::CHART)?.ok()
 }
 
 /// Decodes what a compressed payload unpacked to: every decoder but

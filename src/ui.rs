@@ -141,8 +141,13 @@ fn panel_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
             th.dim,
         ));
     }
-    // Keep the cursor in view.
-    let offset = app.panel_cursor.saturating_sub(ih.saturating_sub(1));
+    // Where the panel was scrolled to, unless the frame is another size
+    // than the app has heard of yet: then wherever shows the cursor.
+    let offset = if (app.panel_offset..app.panel_offset + ih).contains(&app.panel_cursor) {
+        app.panel_offset
+    } else {
+        app.panel_cursor.saturating_sub(ih.saturating_sub(1))
+    };
     let name_w = st
         .conns
         .iter()
@@ -215,8 +220,23 @@ fn panel_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
         n => format!("Connections {up}/{brokers} · {n} files"),
     };
     draw_box(buf, r, &title, lines, focused, sel_line, th);
-    // Where the connections live; edits to the file apply while running.
-    border_label(buf, r, &crate::config::tilde(&app.config_path), th.faint);
+    // Rows scrolled out of view, on the left of the bottom border.
+    let (above, below) = (offset, app.panel.len().saturating_sub(offset + ih));
+    let more = match (above, below) {
+        (0, 0) => String::new(),
+        (0, b) => format!(" ↓ {b} more "),
+        (a, 0) => format!(" ↑ {a} more "),
+        (a, b) => format!(" ↑ {a} · ↓ {b} more "),
+    };
+    let mut used = fmt::str_width(&more);
+    if used > 0 && r.height > 2 && r.intersection(buf.area) == r && r.width as usize > used + 4 {
+        buf.set_string(r.x + 2, r.bottom() - 1, &more, th.dim);
+    } else {
+        used = 0; // not drawn: the path may have the room
+    }
+    // Where the connections live (edits to the file apply while running),
+    // on the right, in what room that leaves.
+    border_label(buf, r, &crate::config::tilde(&app.config_path), used, th.faint);
 }
 
 /// A capture rule after `lead`: `● capture site/# → file.jsonl · 12 msgs`.
@@ -250,9 +270,10 @@ fn capture_row<'a>(th: &Theme, cap: &crate::capture::Capture, j: usize, lead: Ve
 }
 
 /// Writes `label` into the bottom border of `r`, right-aligned, keeping its
-/// end (the file name) when it has to be cut.
-fn border_label(buf: &mut Buffer, r: Rect, label: &str, style: ratatui::style::Style) {
-    let room = (r.width as usize).saturating_sub(8);
+/// end (the file name) when it has to be cut; `taken` cells on the left of
+/// the border are kept clear.
+fn border_label(buf: &mut Buffer, r: Rect, label: &str, taken: usize, style: ratatui::style::Style) {
+    let room = (r.width as usize).saturating_sub(8 + taken);
     if room < 12 || r.height < 2 {
         return;
     }
@@ -382,6 +403,16 @@ fn header<'a>(app: &App, st: &Store) -> Line<'a> {
     if let Some(v) = app.upgrade.as_ref().and_then(|w| w.offering()) {
         let v = if v == env!("CARGO_PKG_VERSION") { "new build" } else { v };
         left.push(Span::styled(format!("  ↑ {v} · ^n restart"), th.accent_b));
+    } else if let Some(v) = app.restarting_into() {
+        left.push(Span::styled(format!("  ↑ {v} · restarting…"), th.accent_b));
+    } else if let Some(j) = &app.updating {
+        let what = match j.step() {
+            crate::update::Step::Working(s) => s,
+            _ => "installing".into(),
+        };
+        left.push(Span::styled(format!("  ↑ {} · {what}…", j.version), th.accent_b));
+    } else if let Some(v) = app.update_offer() {
+        left.push(Span::styled(format!("  ↑ {v} available · ^n update"), th.accent_b));
     }
     let right = vec![
         Span::styled(commas(st.topic_count() as u64), th.text),
@@ -719,29 +750,6 @@ fn chart_box(buf: &mut Buffer, r: Rect, app: &App) {
     if inner.width < 16 || inner.height < 4 {
         return;
     }
-    let (lo, hi) = s.points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
-        (lo.min(p.1), hi.max(p.1))
-    });
-    // The latest value first (when it's a live one), where the numbers
-    // come from last: a narrow pane cuts that first.
-    let num = |v: f64| Span::styled(short(v), th.number);
-    let dim = |t: String| Span::styled(t, th.dim);
-    let mut head = vec![
-        Span::styled(s.name.clone(), th.accent_b),
-        dim(format!("  {}/{}", ch.sel + 1, ch.series.len())),
-    ];
-    if let (true, Some(last)) = (s.over_time, s.points.last()) {
-        head.extend([dim(" · last ".into()), num(last.1)]);
-    }
-    head.extend([
-        dim(" · min ".into()),
-        num(lo),
-        dim(" · max ".into()),
-        num(hi),
-        dim(format!(" · {}", s.source)),
-    ]);
-    put(buf, inner.x, inner.y, Line::from(head), inner.width);
-
     let body = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
     // With a choice and room for it, the list to pick from on the left.
     let mut plot = body;
@@ -768,12 +776,63 @@ fn chart_box(buf: &mut Buffer, r: Rect, app: &App) {
             ..body
         };
     }
+    // A point to a dot column (two to a cell, less the y labels'); more
+    // than that scroll.
+    ch.room.set((plot.width as usize).saturating_sub(8).max(1) * 2);
+    let Some((start, shown)) = ch.in_view() else { return };
 
-    let (x0, x1) = (s.points[0].0, s.points[s.points.len() - 1].0);
+    // The latest value first (when it's a live one), where the numbers
+    // come from last: a narrow pane cuts that first.
+    let (lo, hi) = range(&s.points);
+    let num = |v: f64| Span::styled(short(v), th.number);
+    let dim = |t: String| Span::styled(t, th.dim);
+    let mut head = vec![
+        Span::styled(s.name.clone(), th.accent_b),
+        dim(format!("  {}/{}", ch.sel + 1, ch.series.len())),
+    ];
+    if let (true, Some(last)) = (s.over_time, s.points.last()) {
+        head.extend([dim(" · last ".into()), num(last.1)]);
+    }
+    head.extend([
+        dim(" · min ".into()),
+        num(lo),
+        dim(" · max ".into()),
+        num(hi),
+        dim(format!(" · {}", s.source())),
+    ]);
+    put(buf, inner.x, inner.y, Line::from(head), inner.width);
+    // In the bottom border: which of them are in view (by message, or by
+    // row number), and what would keep all of a table cut on arrival.
+    let mut foot = Vec::new();
+    if shown.len() < s.points.len() {
+        let (a, b) = if s.over_time {
+            (start + 1, start + shown.len())
+        } else {
+            (shown[0].0 as usize + 1, shown[shown.len() - 1].0 as usize + 1)
+        };
+        foot.push(format!("{} {}–{}", s.unit, commas(a as u64), commas(b as u64)));
+    }
+    if ch.reading() {
+        foot.push("reading all rows…".into());
+    }
+    if let Some(size) = s.whole {
+        foot.push(format!(
+            "--max-payload {} keeps all",
+            crate::chart::max_payload_for(size)
+        ));
+    }
+    if !foot.is_empty() {
+        border_label(buf, r, &foot.join(" · "), 0, th.dim);
+    }
+
+    // The y axis fits what's in view.
+    let (x0, x1) = (shown[0].0, shown[shown.len() - 1].0);
+    let (vlo, vhi) = range(shown);
     let xb = if x1 > x0 { [x0, x1] } else { [x0 - 1.0, x0 + 1.0] };
-    let yb = if hi > lo { [lo, hi] } else { [lo - 1.0, hi + 1.0] };
+    let yb = if vhi > vlo { [vlo, vhi] } else { [vlo - 1.0, vhi + 1.0] };
     let ylabels = [yb[0], (yb[0] + yb[1]) / 2.0, yb[1]].map(|v| Span::styled(short(v), th.dim));
-    let xlabels = [&s.ends.0, &s.ends.1].map(|e| Span::styled(e.clone(), th.dim));
+    let (e0, e1) = s.axis.ends(x0, x1);
+    let xlabels = [e0, e1].map(|e| Span::styled(e, th.dim));
     // Braille dots: 2×4 to a cell. The Windows console fonts don't have
     // them; half blocks are the finest they draw.
     let marker = if cfg!(windows) {
@@ -786,16 +845,16 @@ fn chart_box(buf: &mut Buffer, r: Rect, app: &App) {
             .marker(marker)
             .graph_type(GraphType::Line)
             .style(th.accent_b)
-            .data(&s.points),
+            .data(shown),
     ];
     // Few enough to tell apart: each one marked.
-    if s.points.len() <= plot.width as usize / 3 {
+    if shown.len() <= plot.width as usize / 3 {
         sets.push(
             Dataset::default()
                 .marker(Marker::Dot)
                 .graph_type(GraphType::Scatter)
                 .style(th.accent_b)
-                .data(&s.points),
+                .data(shown),
         );
     }
     Chart::new(sets)
@@ -816,6 +875,13 @@ fn chart_box(buf: &mut Buffer, r: Rect, app: &App) {
         )
         .legend_position(None)
         .render(plot, buf);
+}
+
+/// The lowest and highest value.
+fn range(points: &[(f64, f64)]) -> (f64, f64) {
+    points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+        (lo.min(p.1), hi.max(p.1))
+    })
 }
 
 /// A number for an axis or a heading: short, but as precise as it is.
@@ -1123,10 +1189,11 @@ fn hints<'a>(app: &App) -> Line<'a> {
         ],
         (true, false, Focus::Chart) => vec![
             ("j k", "column / field", 3),
+            ("h l", "scroll", 2),
             (glyph::ENTER, "open", 2),
             ("e", "publish", 1),
             ("t y", "copy", 1),
-            ("h esc", "back", 2),
+            ("esc", "back", 2),
             ("tab", "pane", 2),
         ],
         (true, false, Focus::Tree) => vec![
@@ -1157,10 +1224,11 @@ fn hints<'a>(app: &App) -> Line<'a> {
         ],
         (false, _, Focus::Chart) => vec![
             ("↑↓", "column / field", 3),
+            ("←→", "scroll", 2),
             (glyph::ENTER, "open", 2),
             ("^e", "publish", 1),
             ("^t ^y", "copy", 1),
-            ("← esc", "back", 2),
+            ("esc", "back", 2),
             ("tab", "pane", 2),
         ],
         (false, _, Focus::Tree) => vec![
@@ -1174,8 +1242,14 @@ fn hints<'a>(app: &App) -> Line<'a> {
             ("tab", "pane", 2),
         ],
     };
+    // Scrolling the chart, when there's more than fits.
+    if app.focus == Focus::Chart && !app.chart.scrollable() {
+        keys.retain(|(k, _, _)| !matches!(*k, "←→" | "h l"));
+    }
     if app.upgrade.as_ref().is_some_and(|w| w.offering().is_some()) {
         keys.push(("^n", "restart", 0));
+    } else if app.updating.is_none() && app.update_offer().is_some() {
+        keys.push(("^n", "update", 0));
     }
     if !app.opts.vim {
         keys.push(("^c", "quit", 0));
@@ -1259,7 +1333,7 @@ fn composer_view(buf: &mut Buffer, area: Rect, app: &App) {
         }
     }
 
-    border_label(buf, r, &format!("ln {}, col {}", ed.row + 1, ed.col + 1), th.faint);
+    border_label(buf, r, &format!("ln {}, col {}", ed.row + 1, ed.col + 1), 0, th.faint);
     let keys = [
         ("^s", "send", 0),
         ("esc", "cancel", 0),
@@ -2555,6 +2629,58 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_n_updates_to_a_newer_release() {
+        use crate::update::{Checker, Job, Step};
+        let (mut app, _rx) = sample(tmp_config("update"));
+        let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        let notice = |app: &App| app.notice.as_ref().map(|n| n.0.clone()).unwrap_or_default();
+
+        // Looked, and this is the newest: nothing offered.
+        app.release = Some(Checker::found(env!("CARGO_PKG_VERSION")));
+        app.key(ctrl_n);
+        assert!(notice(&app).ends_with("is the newest"), "{}", notice(&app));
+        app.notice = None;
+        assert!(!frame(&app, "the newest").contains("^n"));
+
+        // A newer release: offered; ctrl+n installs it the way this copy
+        // was installed (a test binary is built from source: it says so).
+        app.release = Some(Checker::found("99.0.0"));
+        let v = frame(&app, "a release out");
+        assert!(
+            v.contains("↑ 99.0.0 available · ^n update") && v.contains("^n update · ^c quit"),
+            "{v}"
+        );
+        app.key(ctrl_n);
+        assert!(app.updating.is_none() && notice(&app).contains("built from source"));
+
+        // While it installs, the header says so; a failure says why.
+        app.updating = Some(Job::ended("99.0.0", Step::Working("downloading 40%".into())));
+        assert!(frame(&app, "installing").contains("↑ 99.0.0 · downloading 40%…"));
+        app.updating = Some(Job::ended("99.0.0", Step::Failed("no network".into())));
+        app.tick();
+        assert!(app.updating.is_none() && notice(&app) == "couldn't update: no network");
+
+        // Installed, but nothing watches where this one was started from;
+        // not offered again.
+        app.updating = Some(Job::ended("99.0.0", Step::Done));
+        app.tick();
+        assert!(!app.quit && notice(&app).contains("start it again"), "{}", notice(&app));
+        app.notice = None;
+        assert!(!frame(&app, "installed").contains("^n update"));
+        app.key(ctrl_n);
+        assert!(app.updating.is_none() && notice(&app).contains("99.0.0 is installed: start it again"));
+
+        // Installed in our place: the restart, continuing the session.
+        let bin = std::env::temp_dir().join(format!("fss-mqtt-test-{}-update", std::process::id()));
+        std::fs::write(&bin, "v99").unwrap();
+        app.upgrade = Some(crate::upgrade::Watch::found(bin.clone(), "99.0.0"));
+        app.updating = Some(Job::ended("99.0.0", Step::Done));
+        app.tick();
+        assert!(app.restart && app.quit);
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    #[test]
     fn a_frame_of_another_size_than_the_last_resize_still_fits() {
         // The window can change size between the app hearing of it and the
         // next frame (Terminal.app's tab bar appearing takes two rows):
@@ -2976,6 +3102,107 @@ mod tests {
     }
 
     #[test]
+    fn chart_rows_scroll_with_left_and_right() {
+        // The sample keeps payloads whole (64 KiB): the Parquet table, cut
+        // to its first rows on arrival, is read again with all 500.
+        let (mut app, _rx) = sample(tmp_config("chart-scroll"));
+        typ(&mut app, "fastlog");
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+        assert!(app.focus == Focus::Chart);
+        // Read on a thread of its own: the first rows meanwhile.
+        if app.chart.reading() {
+            assert!(frame(&app, "reading").contains("reading all rows…"));
+        }
+        let start = std::time::Instant::now();
+        while app.chart.reading() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(10), "never read");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            app.tick();
+        }
+        let v = frame(&app, "500 rows, the first in view");
+        assert!(v.contains("· 500 rows") && v.contains(" rows 1–"), "{v}");
+        assert!(v.contains("←→ scroll") && v.contains("esc back"), "{v}");
+        assert_eq!(app.chart.in_view().unwrap().0, 0);
+
+        // → a quarter of the view on, shift+→ a whole one, ← back.
+        press(&mut app, &[KeyCode::Right]);
+        let quarter = app.chart.in_view().unwrap().0;
+        assert!(quarter > 0);
+        assert!(frame(&app, "scrolled").contains(&format!(" rows {}–", quarter + 1)));
+        app.key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        assert_eq!(app.chart.in_view().unwrap().0, quarter + app.chart.room.get());
+        app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        press(&mut app, &[KeyCode::Left, KeyCode::Left]);
+        assert_eq!(app.chart.in_view().unwrap().0, 0, "no further back than the first");
+        // Another column of the same table keeps the place.
+        press(&mut app, &[KeyCode::Right, KeyCode::Down]);
+        assert_eq!(app.chart.in_view().unwrap().0, quarter);
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.focus == Focus::Tree);
+
+        // Messages kept to 4 KiB: the newest table is kept whole all the
+        // same, so its chart has every row.
+        let pq = std::fs::read(format!(
+            "{}/tests/fixtures/turbine-snappy.parquet",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let table_topic = |budget: usize| {
+            let mut st = Store::new(10, 4096);
+            st.set_whole_budget(budget);
+            let c = st.add_conn("local", "mqtt://x", None, vec![sub("#")]);
+            let decoded = crate::pretty::decode_on_arrival(Some("application/parquet"), &pq);
+            let props = Props {
+                content_type: Some("application/parquet".into()),
+                ..Default::default()
+            };
+            st.add_decoded(c, "turbine/fastlog", &pq, 0, false, props, decoded);
+            st
+        };
+        let (mut app, _rx) = app_with(table_topic(crate::store::WHOLE_BUDGET), tmp_config("chart-kept"));
+        typ(&mut app, "fastlog");
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+        let start = std::time::Instant::now();
+        while app.chart.reading() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(10), "never read");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            app.tick();
+        }
+        let v = frame(&app, "the newest kept whole");
+        assert!(v.contains("· 500 rows") && !v.contains("--max-payload"), "{v}");
+        press(&mut app, &[KeyCode::Right]);
+        assert!(app.chart.in_view().unwrap().0 > 0, "scrolls without --max-payload");
+
+        // Past the budget for whole payloads: the first rows, what would
+        // keep them all, and ← → say so rather than nothing.
+        let (mut app, _rx) = app_with(table_topic(1024), tmp_config("chart-cut"));
+        typ(&mut app, "fastlog");
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+        let v = frame(&app, "cut on arrival");
+        assert!(
+            v.contains("· first ") && v.contains(" --max-payload 32KiB keeps all "),
+            "{v}"
+        );
+        assert!(!v.contains("←→ scroll"), "nothing to scroll: no such hint\n{v}");
+        app.notice = None;
+        press(&mut app, &[KeyCode::Right]);
+        let n = app.notice.as_ref().map(|n| n.0.clone()).unwrap_or_default();
+        assert!(
+            n.starts_with("only the first ") && n.ends_with("--max-payload 32KiB keeps them all"),
+            "{n}"
+        );
+
+        // A chart that's all in view says so.
+        let (mut app, _rx) = sample(tmp_config("chart-all-in-view"));
+        typ(&mut app, "v1/plant/line1/temp");
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+        frame(&app, "all in view");
+        press(&mut app, &[KeyCode::Left]);
+        let n = app.notice.as_ref().map(|n| n.0.clone()).unwrap_or_default();
+        assert_eq!(n, "all 3 messages are in view: nothing to scroll to");
+    }
+
+    #[test]
     fn chart_numbers_read_short() {
         assert_eq!(super::short(0.0), "0");
         assert_eq!(super::short(-0.0), "0");
@@ -2987,5 +3214,77 @@ mod tests {
         assert_eq!(super::short(28450.5), "28450.5");
         assert_eq!(super::short(1.5e9), "1.50e9");
         assert_eq!(super::short(0.0004), "4.00e-4");
+    }
+
+    #[test]
+    fn many_connections_scroll_in_a_panel_of_five() {
+        let mut st = Store::new(10, 64 * 1024);
+        let mut ctls = Vec::new();
+        for i in 0..8 {
+            let name = format!("site{i}");
+            st.add_conn(&name, "mqtt://x:1883", None, vec![sub("#")]);
+            ctls.push(ConnCtl {
+                cfg: ConnCfg {
+                    name,
+                    url: "mqtt://x:1883".into(),
+                    topics: vec!["#".into()],
+                    ..Default::default()
+                },
+                saved: true,
+                tx: mpsc::channel().0,
+                password: None,
+                key_password: None,
+            });
+        }
+        let opts = Options {
+            inline_bytes: 64,
+            vim: false,
+        };
+        let mut app = App::new(
+            Arc::new(Mutex::new(st)),
+            opts,
+            Theme::new(false),
+            ctls,
+            tmp_config("many"),
+            vec![],
+        );
+        // However tall the window, five connections' rows; the rest scroll.
+        app.resize(110, 60);
+        app.tick();
+        assert_eq!(app.layout().panel_h, crate::app::PANEL_ROWS + 2);
+        let panel = |app: &App, label: &str| {
+            let v = frame(app, label);
+            let rows = crate::app::PANEL_ROWS as usize + 2;
+            v.lines().skip(1).take(rows).collect::<Vec<_>>().join("\n")
+        };
+        let p = panel(&app, "eight connections");
+        assert!(
+            p.contains("site0") && p.contains("site4") && !p.contains("site5"),
+            "{p}"
+        );
+        assert!(p.contains("↓ 6 more"), "{p}");
+
+        // In the panel, the end scrolls into view; moving up within the
+        // view doesn't scroll it.
+        press(&mut app, &[KeyCode::BackTab, KeyCode::End]);
+        assert!(app.focus == Focus::Conns);
+        let p = panel(&app, "scrolled to the end");
+        assert!(
+            p.contains("site7") && p.contains("site3") && !p.contains("site2"),
+            "{p}"
+        );
+        assert!(p.contains("↑ 6 more"), "{p}");
+        press(&mut app, &[KeyCode::Up, KeyCode::Up, KeyCode::Up]);
+        assert_eq!(app.panel_offset, 6, "still in view");
+        press(&mut app, &[KeyCode::PageUp]);
+        assert!(panel(&app, "a page up").contains("↑ 3 · ↓ 3 more"));
+        press(&mut app, &[KeyCode::Home]);
+        assert_eq!((app.panel_cursor, app.panel_offset), (0, 0));
+
+        // A short window has fewer rows, and still scrolls.
+        app.resize(110, 24);
+        press(&mut app, &[KeyCode::End]);
+        let p = frame(&app, "short window");
+        assert!(p.contains("site7") && p.contains("more"), "{p}");
     }
 }

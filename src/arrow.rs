@@ -13,11 +13,8 @@ use std::io::Read;
 
 use crate::fmt::commas;
 use crate::values::{clip, date, hex, time_of_day, timestamp};
-use crate::view::{Body, DocView, Fact};
+use crate::view::{Body, DocView, Fact, Limits};
 
-/// Rows are decoded until the rendered cells reach about this many bytes.
-const ROW_BUDGET: usize = 4096;
-const MAX_ROWS: usize = 200;
 const MAX_CELL: usize = 64;
 /// Refuse to inflate a buffer larger than this, or more than `MAX_INFLATE` in all.
 const MAX_BUFFER: usize = 32 << 20;
@@ -31,7 +28,12 @@ type R<T> = Result<T, String>;
 /// Decoder entry point (see `pretty::Decoder`): the file format by its magic
 /// bytes, the stream format by content type or a well-formed leading schema.
 pub fn sniff(ct: &str, b: &[u8]) -> Option<Result<DocView, String>> {
-    read(ct, b, MAX_ROWS, ROW_BUDGET).map(|r| r.map(|v| v.to_view()))
+    rows(ct, b, Limits::SCREEN)
+}
+
+/// `sniff`, keeping as many rows as `limits` allow.
+pub fn rows(ct: &str, b: &[u8], limits: Limits) -> Option<Result<DocView, String>> {
+    read(ct, b, limits.rows, limits.bytes).map(|r| r.map(|v| v.to_view()))
 }
 
 fn read(ct: &str, b: &[u8], max_rows: usize, budget: usize) -> Option<R<ArrowView>> {
@@ -1428,7 +1430,7 @@ mod tests {
     #[test]
     fn decodes_every_variant() {
         for name in TURBINE {
-            let v = decode(name, MAX_ROWS, ROW_BUDGET);
+            let v = decode(name, Limits::SCREEN.rows, Limits::SCREEN.bytes);
             assert!(v.notes.is_empty(), "{name}: {:?}", v.notes);
             let file = name.ends_with(".arrow");
             assert_eq!(v.kind, if file { "file" } else { "stream" }, "{name}");
@@ -1481,7 +1483,10 @@ mod tests {
                 .flatten()
                 .map(|c| c.as_ref().map_or(4, |s| s.len()) + 1)
                 .sum();
-            assert!(rendered <= ROW_BUDGET + 200, "{name}: rows use {rendered} bytes");
+            assert!(
+                rendered <= Limits::SCREEN.bytes + 200,
+                "{name}: rows use {rendered} bytes"
+            );
         }
     }
 
@@ -1501,7 +1506,7 @@ mod tests {
 
     #[test]
     fn schema_and_metadata() {
-        let v = decode("turbine-zstd.arrows", MAX_ROWS, ROW_BUDGET);
+        let v = decode("turbine-zstd.arrows", Limits::SCREEN.rows, Limits::SCREEN.bytes);
         let ty = |n: &str| v.columns.iter().find(|c| c.0 == n).unwrap().1.as_str();
         assert_eq!(ty("Timestamp"), "TIMESTAMP(ms, UTC)");
         assert_eq!(ty("TurbineId"), "STRING");
@@ -1526,7 +1531,7 @@ mod tests {
 
     #[test]
     fn rarer_types() {
-        let v = decode("types.arrow", MAX_ROWS, ROW_BUDGET);
+        let v = decode("types.arrow", Limits::SCREEN.rows, Limits::SCREEN.bytes);
         assert!(v.notes.is_empty(), "{:?}", v.notes);
         assert_eq!(v.header.len(), v.columns.len());
         let types: Vec<_> = v.columns.iter().map(|c| c.1.as_str()).collect();
@@ -1620,7 +1625,7 @@ mod tests {
     #[test]
     fn views_run_ends_and_unions() {
         for name in ["views.arrow", "views-zstd.arrows"] {
-            let v = decode(name, MAX_ROWS, ROW_BUDGET);
+            let v = decode(name, Limits::SCREEN.rows, Limits::SCREEN.bytes);
             assert!(v.notes.is_empty(), "{name}: {:?}", v.notes);
             let types: Vec<_> = v.columns.iter().map(|c| c.1.as_str()).collect();
             assert_eq!(
@@ -1671,7 +1676,7 @@ mod tests {
             );
         }
         // As Polars writes them (zstd, views by default).
-        let v = decode("polars.arrow", MAX_ROWS, ROW_BUDGET);
+        let v = decode("polars.arrow", Limits::SCREEN.rows, Limits::SCREEN.bytes);
         assert!(v.notes.is_empty(), "{:?}", v.notes);
         let types: Vec<_> = v.columns.iter().map(|c| c.1.as_str()).collect();
         assert_eq!(
@@ -1714,7 +1719,9 @@ mod tests {
             .map(|f| (0..3).map(|k| at(f, k)).collect())
             .collect();
         patch(&mut b, &|f, k| offsets[f][k]);
-        read("", &b, MAX_ROWS, ROW_BUDGET).unwrap().unwrap()
+        read("", &b, Limits::SCREEN.rows, Limits::SCREEN.bytes)
+            .unwrap()
+            .unwrap()
     }
 
     #[test]
@@ -1793,13 +1800,17 @@ mod tests {
         let stream = fixture("turbine-zstd.arrows");
         let all = legacy(&stream, |_| true);
         assert_ne!(all[..4], [0xff; 4]);
-        let v = read("", &all, MAX_ROWS, ROW_BUDGET).unwrap().unwrap();
+        let v = read("", &all, Limits::SCREEN.rows, Limits::SCREEN.bytes)
+            .unwrap()
+            .unwrap();
         assert!(v.notes.is_empty(), "{:?}", v.notes);
         assert_eq!((v.num_rows, v.batches), (500, 3));
         assert_eq!(v.rows[0][7].as_deref(), Some("IDLE"));
 
         let no_dict = legacy(&stream, |m| m.kind != 2);
-        let v = read("", &no_dict, MAX_ROWS, ROW_BUDGET).unwrap().unwrap();
+        let v = read("", &no_dict, Limits::SCREEN.rows, Limits::SCREEN.bytes)
+            .unwrap()
+            .unwrap();
         assert_eq!(v.notes, ["Status: dictionary 0 not available"]);
         assert!(!v.header.iter().any(|h| h == "Status"));
         assert_eq!(v.rows[0][0].as_deref(), Some("2026-10-08 10:20:00Z"));
@@ -1900,12 +1911,16 @@ mod tests {
             ]
         };
         let ok = schema_stream(vec![(1, Fb::Tables(vec![int_field()]))]);
-        let v = read("", &ok, MAX_ROWS, ROW_BUDGET).unwrap().unwrap();
+        let v = read("", &ok, Limits::SCREEN.rows, Limits::SCREEN.bytes)
+            .unwrap()
+            .unwrap();
         assert_eq!((v.kind, v.num_rows, v.batches), ("stream", 0, 0));
         assert_eq!(v.columns, [("a".to_string(), "UINT16".to_string(), true)]);
 
         let big = schema_stream(vec![(0, Fb::I16(1)), (1, Fb::Tables(vec![int_field()]))]);
-        let v = read("", &big, MAX_ROWS, ROW_BUDGET).unwrap().unwrap();
+        let v = read("", &big, Limits::SCREEN.rows, Limits::SCREEN.bytes)
+            .unwrap()
+            .unwrap();
         assert_eq!(v.notes, ["big-endian data: values not shown"]);
 
         // An integer can't be 12 bits wide: not taken for a stream.
@@ -1930,10 +1945,12 @@ mod tests {
             schema_stream(vec![(1, Fb::Tables(vec![field]))])
         };
         let ct = "application/vnd.apache.arrow.stream";
-        let v = read(ct, &union(vec![5, 9]), MAX_ROWS, ROW_BUDGET).unwrap().unwrap();
+        let v = read(ct, &union(vec![5, 9]), Limits::SCREEN.rows, Limits::SCREEN.bytes)
+            .unwrap()
+            .unwrap();
         assert_eq!(v.columns[0].1, "UNION<a: UINT32, b: UINT32>");
         let refused = |ids: Vec<i32>, why: &str| {
-            let r = read(ct, &union(ids), MAX_ROWS, ROW_BUDGET).unwrap();
+            let r = read(ct, &union(ids), Limits::SCREEN.rows, Limits::SCREEN.bytes).unwrap();
             assert!(
                 r.as_ref().err().is_some_and(|e| e.contains(why)),
                 "{why}: {:?}",

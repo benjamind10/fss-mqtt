@@ -16,6 +16,7 @@ mod crc32;
 mod fmt;
 mod glyph;
 mod gzip;
+mod http;
 mod json;
 mod keys;
 mod mqtt;
@@ -30,6 +31,7 @@ mod sqlite;
 mod store;
 mod theme;
 mod ui;
+mod update;
 mod upgrade;
 mod values;
 mod view;
@@ -95,7 +97,7 @@ messages on those topics, whole, to fss-mqtt-<connection>-<time>.jsonl.
 
 Environment: FSS_MQTT_BROKER, FSS_MQTT_USERNAME, FSS_MQTT_PASSWORD, FSS_MQTT_CAFILE,
 FSS_MQTT_KEY_PASSWORD (the --key passphrase), FSS_MQTT_CAPTURE_DIR, FSS_MQTT_SESSION,
-FSS_MQTT_KEYS (vim: as --vim)";
+FSS_MQTT_KEYS (vim: as --vim), FSS_MQTT_UPDATE (off: no looking for new releases)";
 
 struct Args {
     broker: Option<String>,
@@ -613,11 +615,24 @@ fn run() -> Result<(), String> {
         app.restore_view(view);
     }
     app.upgrade = upgrade::Watch::new();
+    if !update::off() {
+        let kept = session::default_path().and_then(|p| Some(p.parent()?.join("update-check")));
+        app.release = Some(update::Checker::new(kept));
+    }
+    update::clean_up();
     if let Some((text, err)) = notice {
         app.notify(text, err);
     }
 
     let mut terminal = ratatui::init();
+    // A panic on a thread that catches it (a table read in the background,
+    // chart.rs) leaves the terminal as it is.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if !chart::quiet_panics() {
+            hook(info);
+        }
+    }));
     let _ = execute!(stdout(), EnableBracketedPaste);
     let res = event_loop(&mut terminal, &mut app);
     let _ = execute!(stdout(), DisableBracketedPaste);
@@ -775,6 +790,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut app::App) -> st
             }
         }
         app.tick();
+        // A restart into an update that just got installed.
+        if app.quit {
+            return Ok(());
+        }
     }
 }
 

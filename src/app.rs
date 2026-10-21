@@ -25,6 +25,11 @@ const NOTICE_FOR: Duration = Duration::from_secs(6);
 const CONFIG_EVERY: Duration = Duration::from_secs(1);
 /// Hex dumps copied outside the full screen view: 16 bytes a line.
 const CLIP_HEX_WIDTH: usize = 80;
+/// The most rows the connections panel shows: five connections with a
+/// subscription each. More scroll.
+pub const PANEL_ROWS: u16 = 10;
+/// How long the new version may take to be noticed after an update.
+const RESTART_WAIT: Duration = Duration::from_secs(30);
 
 /// The connections file's modified time and size, to notice edits.
 type Stamp = Option<(SystemTime, u64)>;
@@ -146,6 +151,8 @@ pub struct App {
     config_checked: Instant,
     pub panel: Vec<PanelRow>,
     pub panel_cursor: usize,
+    /// The first panel row in view (it scrolls when its rows don't fit).
+    pub panel_offset: usize,
     pub prompt: Option<Prompt>,
     prompt_queue: Vec<usize>,
     pub notice: Option<(String, bool, Instant)>, // text, is_error, when
@@ -182,6 +189,16 @@ pub struct App {
     pub quit: bool,
     /// Watching for a newer fss-mqtt in our place (not in tests).
     pub upgrade: Option<crate::upgrade::Watch>,
+    /// Newer releases on GitHub, looked for now and then (not with
+    /// FSS_MQTT_UPDATE=off, nor in tests).
+    pub release: Option<crate::update::Checker>,
+    /// A release being installed (ctrl+n).
+    pub updating: Option<crate::update::Job>,
+    /// The version an update installed, to restart into once it's noticed
+    /// in our place, and since when.
+    restart_into: Option<(String, Instant)>,
+    /// The version an update installed this run: not offered again.
+    installed: Option<String>,
     /// Quit to restart into it (ctrl+n), continuing the session.
     pub restart: bool,
 }
@@ -212,6 +229,7 @@ impl App {
             config_path,
             panel: Vec::new(),
             panel_cursor: 0,
+            panel_offset: 0,
             prompt: None,
             prompt_queue: ask,
             notice: None,
@@ -240,6 +258,10 @@ impl App {
             rate_at: Instant::now(),
             quit: false,
             upgrade: None,
+            release: None,
+            updating: None,
+            restart_into: None,
+            installed: None,
             restart: false,
         };
         app.refresh_panel();
@@ -259,8 +281,9 @@ impl App {
     /// of the frame it draws, which can be newer than the last resize the
     /// app has seen (the window shrank just before the frame).
     pub fn layout_for(&self, width: u16, height: u16) -> Layout {
-        // The connections panel takes what it needs, up to a third of the screen.
-        let max_panel = (height / 3).max(3);
+        // The connections panel takes what it needs, up to a third of the
+        // screen and `PANEL_ROWS` rows; more scroll.
+        let max_panel = (height / 3).clamp(3, PANEL_ROWS + 2);
         let panel_h = (self.panel.len() as u16 + 2).clamp(3, max_panel);
         let body_h = height.saturating_sub(5 + panel_h).max(4); // header + input box (3) + hints
         if width < 80 {
@@ -302,6 +325,7 @@ impl App {
             c.fit(w, h);
         }
         self.clamp_cursor();
+        self.clamp_panel();
     }
 
     pub fn tick(&mut self) {
@@ -338,12 +362,102 @@ impl App {
                 false,
             );
         }
+        if let Some(c) = &mut self.release
+            && c.check()
+            && let Some(v) = c.available().map(str::to_string)
+        {
+            self.notify(format!("fss-mqtt {v} is out · ctrl+n updates"), false);
+        }
+        self.follow_update();
         if self.config_checked.elapsed() >= CONFIG_EVERY {
             self.config_checked = Instant::now();
             self.check_config();
         }
         self.rebuild(false);
         self.update_chart();
+    }
+
+    /// ctrl+n with a newer release out: installs it the way this copy was
+    /// installed. The restart into it follows (`follow_update`).
+    fn update(&mut self) {
+        if let Some(j) = &self.updating {
+            let note = format!("already updating to fss-mqtt {}", j.version);
+            return self.notify(note, false);
+        }
+        let Some(v) = self.update_offer().map(str::to_string) else {
+            let note = match (&self.release, &self.installed) {
+                (_, Some(v)) => format!("fss-mqtt {v} is installed: start it again to use it"),
+                (Some(c), _) if c.known() => format!("fss-mqtt {} is the newest", env!("CARGO_PKG_VERSION")),
+                (Some(_), _) => "no newer fss-mqtt found (yet)".into(),
+                (None, _) => "no newer fss-mqtt is installed".into(),
+            };
+            return self.notify(note, false);
+        };
+        let how = match std::env::current_exe().and_then(std::fs::canonicalize) {
+            Ok(exe) => crate::update::how(&exe),
+            Err(e) => return self.notify(format!("can't tell where fss-mqtt is: {e}"), true),
+        };
+        match crate::update::start(&how, &v) {
+            Ok(job) => {
+                self.notify(format!("updating to fss-mqtt {v}…"), false);
+                self.updating = Some(job);
+            }
+            Err(e) => self.notify(e, false),
+        }
+    }
+
+    /// An update under way: how it ends, then the restart it's for, once
+    /// the new version is noticed in our place.
+    fn follow_update(&mut self) {
+        use crate::update::Step;
+        if let Some(job) = &self.updating {
+            match job.step() {
+                Step::Working(_) => {}
+                Step::Done => {
+                    let v = job.version.clone();
+                    self.updating = None;
+                    self.installed = Some(v.clone());
+                    if let Some(w) = &mut self.upgrade {
+                        w.look_now();
+                        self.restart_into = Some((v.clone(), Instant::now()));
+                        self.notify(format!("fss-mqtt {v} is installed · restarting into it…"), false);
+                    } else {
+                        self.notify(format!("fss-mqtt {v} is installed: start it again to use it"), false);
+                    }
+                }
+                Step::Failed(e) => {
+                    self.updating = None;
+                    self.notify(format!("couldn't update: {e}"), true);
+                }
+            }
+        }
+        if let Some((v, since)) = &self.restart_into {
+            if self
+                .upgrade
+                .as_ref()
+                .is_some_and(|w| w.offering() == Some(v.as_str()) && w.ready())
+            {
+                self.restart_into = None;
+                self.restart = true;
+                self.quit = true;
+            } else if since.elapsed() > RESTART_WAIT {
+                let note =
+                    format!("fss-mqtt {v} was installed, but not where this one was started from: start it again");
+                self.restart_into = None;
+                self.notify(note, true);
+            }
+        }
+    }
+
+    /// A newer release to offer: not one an update already installed.
+    pub fn update_offer(&self) -> Option<&str> {
+        let v = self.release.as_ref()?.available()?;
+        (self.installed.as_deref() != Some(v)).then_some(v)
+    }
+
+    /// The version an update just installed, while the restart into it waits.
+    pub fn restarting_into(&self) -> Option<&str> {
+        self.restart_into.as_ref().map(|(v, _)| v.as_str())
     }
 
     pub(crate) fn refresh_panel(&mut self) {
@@ -357,6 +471,7 @@ impl App {
         }
         drop(st);
         self.panel_cursor = self.panel_cursor.min(self.panel.len().saturating_sub(1));
+        self.clamp_panel();
     }
 
     /// Recomputes visible rows if the tree, filter or expansion changed.
@@ -527,7 +642,7 @@ impl App {
                     self.quit = true;
                 }
                 (Some(_), false) => self.notify("fss-mqtt is changing on disk; try again in a moment", false),
-                (None, _) => self.notify("no newer fss-mqtt is installed", false),
+                (None, _) => self.update(),
             }
             return;
         }
@@ -731,12 +846,27 @@ impl App {
 
     // ── Connections panel ──────────────────────────────────────────────────
 
+    /// Scrolls the panel just enough to show its cursor.
+    fn clamp_panel(&mut self) {
+        let rows = (self.layout().panel_h.saturating_sub(2) as usize).max(1);
+        if self.panel_cursor < self.panel_offset {
+            self.panel_offset = self.panel_cursor;
+        }
+        if self.panel_cursor >= self.panel_offset + rows {
+            self.panel_offset = self.panel_cursor + 1 - rows;
+        }
+        self.panel_offset = self.panel_offset.min(self.panel.len().saturating_sub(rows));
+    }
+
     /// Handles a key in the panel; false lets it fall through (e.g. typing).
     fn panel_key(&mut self, k: KeyEvent) -> bool {
         let last = self.panel.len().saturating_sub(1);
+        let page = (self.layout().panel_h.saturating_sub(3) as usize).max(1);
         match k.code {
             KeyCode::Up => self.panel_cursor = self.panel_cursor.saturating_sub(1),
             KeyCode::Down => self.panel_cursor = (self.panel_cursor + 1).min(last),
+            KeyCode::PageUp => self.panel_cursor = self.panel_cursor.saturating_sub(page),
+            KeyCode::PageDown => self.panel_cursor = (self.panel_cursor + page).min(last),
             KeyCode::Home => self.panel_cursor = 0,
             KeyCode::End => self.panel_cursor = last,
             KeyCode::Char(' ') | KeyCode::Enter => match self.panel.get(self.panel_cursor).copied() {
@@ -748,6 +878,7 @@ impl App {
             KeyCode::Esc => self.focus = Focus::Tree,
             _ => return false,
         }
+        self.clamp_panel();
         true
     }
 
@@ -1316,14 +1447,26 @@ impl App {
         self.msg_sel = Some(msgs[i].seq);
     }
 
-    /// Keys in the chart: through its columns and fields.
+    /// Keys in the chart: through its columns and fields, and along the
+    /// rows (or messages) when there are more than fit.
     fn chart_key(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Up => self.chart.step(-1),
             KeyCode::Down => self.chart.step(1),
             KeyCode::Home | KeyCode::PageUp => self.chart.pick(0),
             KeyCode::End | KeyCode::PageDown => self.chart.pick(usize::MAX),
-            KeyCode::Left | KeyCode::Esc => {
+            KeyCode::Left | KeyCode::Right if !self.chart.scrollable() => self.why_no_scroll(),
+            KeyCode::Left | KeyCode::Right => {
+                // A quarter of what's in view, or (with shift) all of it.
+                let room = self.chart.room.get().max(2) as isize;
+                let by = if k.modifiers.contains(KeyModifiers::SHIFT) {
+                    room
+                } else {
+                    (room / 4).max(1)
+                };
+                self.chart.scroll(if k.code == KeyCode::Left { -by } else { by });
+            }
+            KeyCode::Esc => {
                 self.focus = Focus::Tree;
                 self.msg_sel = None;
             }
@@ -1336,9 +1479,33 @@ impl App {
         }
     }
 
+    /// ← → with all of the chart in view: why there's nothing to scroll to.
+    fn why_no_scroll(&mut self) {
+        let Some(s) = self.chart.current() else { return };
+        let note = if self.chart.reading() {
+            "reading all the rows: a moment".to_string()
+        } else if let (Some(size), Some(total)) = (s.whole, s.total) {
+            format!(
+                "only the first {} of {} rows are kept: --max-payload {} keeps them all",
+                fmt::commas(s.count as u64),
+                fmt::commas(total as u64),
+                crate::chart::max_payload_for(size)
+            )
+        } else {
+            format!(
+                "all {} {} are in view: nothing to scroll to",
+                fmt::commas(s.count as u64),
+                s.unit
+            )
+        };
+        self.notify(note, false);
+    }
+
     /// Keeps the chart in step with the topic in view and the message
     /// picked in the list (the one whose own rows are charted).
     pub fn update_chart(&mut self) {
+        // All of a big table's rows, read meanwhile.
+        self.chart.poll();
         let picked = matches!(self.focus, Focus::Msgs | Focus::Chart)
             .then_some(self.msg_sel)
             .flatten();
@@ -1348,13 +1515,16 @@ impl App {
             let newest = node.latest()?.seq;
             let key = (n, newest, picked, node.msg_count);
             // Nothing new: no need to look at the messages again.
-            Some((key, (!self.chart.is_for(key)).then(|| node.messages())))
+            Some((
+                key,
+                (!self.chart.is_for(key)).then(|| (node.messages(), node.whole.clone())),
+            ))
         });
         match found {
             Some((_, None)) => {}
-            Some((key, Some(msgs))) => {
+            Some((key, Some((msgs, whole)))) => {
                 let i = msg_index(&msgs, picked);
-                self.chart.update(key, &msgs, i);
+                self.chart.update(key, &msgs, i, whole.as_ref());
             }
             None => self.chart.clear(),
         }

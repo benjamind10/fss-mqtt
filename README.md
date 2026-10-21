@@ -95,9 +95,11 @@ autoconnect  = true                        # connect when started without -c or 
   the new settings. A file with an error is reported and not applied. The panel's bottom border
   shows the file's path.
 
-The panel at the top lists each connection with its subscriptions. `tab` moves between the panel,
-the topic tree and the message list; in the panel, `space` or `⏎` connects or disconnects a
-connection, or turns a subscription (subscribed and unsubscribed live) or a capture rule on or off.
+The panel at the top lists each connection with its subscriptions, ten rows at most (five
+connections with a subscription each); the rest scroll, and its bottom border says how many are out
+of view. `tab` moves between the panel, the topic tree and the message list; in the panel, `space`
+or `⏎` connects or disconnects a connection, or turns a subscription (subscribed and unsubscribed
+live) or a capture rule on or off.
 
 | Flag | Default | |
 |---|---|---|
@@ -135,7 +137,7 @@ clears. Clearing keeps the tree open at the topic you were on.
 | Where | Key | |
 |---|---|---|
 | anywhere | `tab` / `shift+tab` | next / previous pane: connections, topics, messages, chart |
-| connections | `↑ ↓` | move |
+| connections | `↑ ↓ pgup pgdn home end` | move |
 | connections | `space` `⏎` | connect / disconnect, or subscription / capture rule on / off |
 | tree | `↑ ↓ pgup pgdn home end` | move |
 | tree | `→` | expand; on a topic with messages, enter its message list |
@@ -145,8 +147,9 @@ clears. Clearing keeps the tree open at the topic you were on.
 | messages | `⏎` | open it full screen |
 | messages | `← esc` | back to the tree |
 | chart | `↑ ↓ home end pgup pgdn` | pick the column or field to chart (see [Charts](#charts)) |
+| chart | `← →` (`shift`: a page) | scroll through the rows (or messages) when there are more than fit |
 | chart | `⏎` | open the message full screen |
-| chart | `← esc` | back to the tree |
+| chart | `esc` | back to the tree |
 | full screen | `↑ ↓ pgup pgdn` | scroll |
 | full screen | `← →` | older / newer message |
 | full screen | `shift ←→` `<` `>` | pan wide tables (CSV, Parquet) |
@@ -157,7 +160,7 @@ clears. Clearing keeps the tree open at the topic you were on.
 | tree, messages | `ctrl+t` / `ctrl+y` | copy the topic / the message (see [Clipboard](#clipboard)) |
 | full screen | `t` / `y` | copy the topic / what the view shows |
 | tree, messages | `ctrl+r` | capture this topic and everything below it to disk; again to stop |
-| anywhere | `ctrl+n` | when a newer fss-mqtt was installed meanwhile: restart into it, continuing the session |
+| anywhere | `ctrl+n` | with a newer release out: install it (see [Updating](#updating)); when a newer fss-mqtt was installed meanwhile: restart into it, continuing the session |
 | anywhere | `ctrl+c` | quit (saving the session for `--resume`) |
 
 A green `•`/`▸` means the topic (or something under it) received a message in the last 1.5 s.
@@ -193,9 +196,10 @@ With `--vim` (or `FSS_MQTT_KEYS=vim`), letters move around instead of filtering,
 |---|---|---|
 | connections, tree, messages, chart | `j k` | down / up (like `↓ ↑`) |
 | tree | `h l` | collapse / expand (like `← →`) |
-| messages, chart | `h` | back to the tree |
+| messages | `h` | back to the tree |
+| chart | `h l` | scroll (like `← →`) |
 | connections, tree, messages, chart | `g` / `G` | first / last (like `home` / `end`) |
-| tree, full screen | `ctrl+d` / `ctrl+u` | page down / up |
+| connections, tree, full screen | `ctrl+d` / `ctrl+u` | page down / up |
 | messages, chart | `ctrl+d` / `ctrl+u` | last / first (like `pgdn` / `pgup`) |
 | connections, tree, messages | `/` | filter: type it, then `⏎` keeps it and goes back to moving, `esc` clears it |
 | anywhere | `e` | publish (like `ctrl+e`) |
@@ -309,8 +313,12 @@ both. `tab` goes to it from the message list, and `↑ ↓` pick what it shows:
 
 - **The columns of a table in the message** (Parquet, Arrow, Avro, SQLite, CSV, Sparkplug
   DataSets), row by row. The x axis goes by the first column when that's text (a time, a name),
-  otherwise by row number. A decoded table keeps its first rows (up to 200, about 4 KB of text),
-  and the chart says so: `first 52 of 500 rows`.
+  otherwise by row number. On arrival, a decoded table keeps its first rows (up to 200, about 4 KB
+  of text). The newest message of a topic whose payload is a Parquet, Arrow or Avro table, or CSV,
+  is kept whole as well (see [Performance notes](#performance-notes)), so its chart reads the
+  table again, all of it (up to 100,000 rows), in the background. For an older message, or one
+  past that budget, the chart has the first rows (`first 52 of 500 rows`), and its bottom border
+  says which `--max-payload` would keep every message whole (`--max-payload 1MiB keeps all`).
 - **JSON arrays** of numbers, or of records (`[{"ts": "…", "kw": 1.5}, …]`): each array, or each
   number field of the records, item by item. MessagePack and CBOR count as JSON.
 - **The numbers each message carries:** a payload that's a number, a JSON document's number fields
@@ -320,7 +328,11 @@ both. `tab` goes to it from the message list, and `↑ ↓` pick what it shows:
 
 The chart is of the message picked in the message list (the latest one otherwise). Its heading
 says where the numbers come from and their range, and a column or field you pick stays picked on
-other topics that have one by that name.
+other topics that have one by that name. With more rows (or messages) than fit, it shows a stretch
+of them, one to a dot, and `← →` scroll through (a quarter of the view at a time, `shift` a whole
+view); the bottom border says which are in view (`rows 1,201–1,400`). A message's rows start at
+the first; the numbers each message carries start at the newest, and keep following them until
+you scroll back. With all of it in view, `← →` say so, and what would keep more.
 
 ## Capture to disk
 
@@ -422,6 +434,29 @@ continued as far as it can be read, and the status line says so. `--no-session`
 `FSS_MQTT_KEYS=vim` turns on vim keys like `--vim`, the way `FSS_MQTT_SESSION=off` stands in for
 `--no-session`.
 
+## Updating
+
+fss-mqtt looks for a newer release when it starts, at most once a day, and daily while it runs: it
+asks where `github.com/mbilling/fss-mqtt/releases/latest` leads, and sends nothing else. When there's
+one, the header says so (`↑ 0.9.0 available · ^n update`), and `ctrl+n` installs it the way this
+fss-mqtt was installed, then restarts into it, continuing the session:
+
+- **Homebrew:** `brew update`, then `brew upgrade mbilling/tap/fss-mqtt`, in the background.
+- **A release archive or `cargo install`:** the release's archive for this platform is downloaded,
+  checked against the release's `SHA256SUMS`, run once (`--version`) to be sure it works here, and
+  put in place of the running program. On Windows the running one is moved aside, and removed the
+  next time fss-mqtt starts.
+- **Scoop** doesn't update a program while it runs: quit, `scoop update fss-mqtt`, then
+  `fss-mqtt --resume`.
+- **A `.deb` or `.rpm`** needs your package manager and sudo: install the new package from the
+  release page.
+
+On Windows the restart is yours to do: fss-mqtt quits and prints the command to continue. Downloads
+go straight to GitHub over HTTPS, not through a proxy. The `SHA256SUMS` check catches a broken
+download, not a tampered release: it comes from the same release, so trusting it means trusting
+GitHub and the TLS to it, as when you download a release by hand. `FSS_MQTT_UPDATE=off` turns looking for
+releases off, and then no request is made.
+
 ## Performance notes
 
 Messages are written straight into an in-memory tree; the UI redraws at ~15 fps rather than per
@@ -429,7 +464,9 @@ message, and only the visible rows are rendered. Large payloads are never render
 topic keeps its last `--history` messages (10), and each message keeps only the first `--max-payload`
 bytes (4 KiB); the rest is discarded as it arrives, so a topic costs at most about 40 KiB of payload
 however large or frequent its messages are (captured topics are written to disk whole, as they
-arrive). Filtering 100k topics takes a few milliseconds.
+arrive). The one exception is for [charts](#charts): the newest message of a topic whose payload is
+a table (Parquet, Arrow, Avro, CSV) is kept whole too, up to 64 MB for all topics together, the
+ones kept longest making room. Filtering 100k topics takes a few milliseconds.
 
 The MQTT client (`src/mqtt.rs`) is a small MQTT v5 client on blocking I/O with one thread per
 connection and no async runtime, which keeps the binary around 1 MB. TLS uses rustls.

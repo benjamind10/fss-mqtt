@@ -4,29 +4,81 @@
 //! message carries once: a number payload, a JSON document's number fields,
 //! Sparkplug metrics.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::fmt::commas;
 use crate::json::Json;
 use crate::pretty::{self, Format};
 use crate::store::Message;
-use crate::view::Body;
+use crate::view::{Body, DocView};
 
 /// A column, array or field worth a chart.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Series {
     /// `ActivePower`, `power_kw`, `readings.v`, `turbines · rated_kw`.
     pub name: String,
-    /// x counts rows from 0, or (over time) seconds from the first message.
+    /// x counts rows (or items) from 0, or (over time) seconds from the
+    /// first message.
     pub points: Vec<(f64, f64)>,
-    /// The ends of the x axis: a table's first column (when it isn't a
-    /// number column) or row numbers; the first and last arrival times.
-    pub ends: (String, String),
-    /// Where the points come from: "60 rows", "first 52 of 500 rows", "10 messages".
-    pub source: String,
+    pub axis: Axis,
+    /// How many rows, items, records or messages the points come from…
+    pub count: usize,
+    /// …of what: "rows", "items", "records", "messages".
+    pub unit: &'static str,
+    /// How many rows there are, when more than `count`: a table cut to its
+    /// first rows on arrival.
+    pub total: Option<usize>,
+    /// The size of a payload cut on arrival: a `--max-payload` of that would
+    /// keep all of its rows.
+    pub whole: Option<usize>,
     /// One value per message, rather than the rows of one.
     pub over_time: bool,
+}
+
+impl Series {
+    /// Where the points come from: "60 rows", "first 52 of 500 rows", "10 messages".
+    pub fn source(&self) -> String {
+        match self.total {
+            Some(t) if t > self.count => format!(
+                "first {} of {} {}",
+                commas(self.count as u64),
+                commas(t as u64),
+                self.unit
+            ),
+            _ => format!("{} {}", commas(self.count as u64), self.unit),
+        }
+    }
+}
+
+/// What the x axis goes by, to label any stretch of it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Axis {
+    /// Rows (or items) by number, from 1.
+    Rows,
+    /// Rows by their first column: a time, a name.
+    Named(Arc<Vec<String>>),
+    /// Seconds from the first message, which arrived then.
+    Time(SystemTime),
+}
+
+impl Axis {
+    /// The labels for the two ends of the stretch from `x0` to `x1`.
+    pub fn ends(&self, x0: f64, x1: f64) -> (String, String) {
+        match self {
+            Axis::Rows => (commas(x0 as u64 + 1), commas(x1 as u64 + 1)),
+            Axis::Named(names) => {
+                let at = |x: f64| names.get(x as usize).map_or("", String::as_str);
+                without_common_day(at(x0), at(x1))
+            }
+            Axis::Time(t0) => {
+                let at = |x: f64| *t0 + Duration::from_secs_f64(x.max(0.0));
+                (clock(at(x0), at(x1)), clock(at(x1), at(x0)))
+            }
+        }
+    }
 }
 
 /// The series for one topic, and which one is shown.
@@ -42,10 +94,54 @@ pub struct State {
     picked: Option<String>,
     /// The numbers each message carries (by seq), read once.
     fields: HashMap<u64, Arc<Vec<(String, f64)>>>,
+    /// The picked message's own rows, and its seq: a big table is decoded
+    /// once, not again for every message that arrives meanwhile.
+    rows_of: Option<(u64, Vec<Series>)>,
+    /// All the rows of a message's table, being read (by seq): one at a
+    /// time, the newest wanted one waiting meanwhile.
+    reading: Option<(u64, Reading)>,
+    next_read: Option<(Arc<Message>, Arc<Vec<u8>>)>,
+    /// What reads them: `rows_whole` (tests stand in for it).
+    reader: Option<Reader>,
+    /// The numbers its messages carry, one series each.
+    over: Vec<Series>,
+    /// Where the stretch in view starts (a point), once scrolled; at first,
+    /// at a message's first rows, and at the newest messages.
+    from: Option<usize>,
+    /// How many points the chart had room for, the last time it was drawn.
+    pub room: Cell<usize>,
 }
 
 /// (topic node, newest message's seq, picked message's seq, messages).
 pub type Key = (usize, u64, Option<u64>, u64);
+
+/// Where a thread puts the rows it read.
+type Reading = Arc<Mutex<Option<Vec<Series>>>>;
+type Reader = fn(&Message, &[u8]) -> Option<Vec<Series>>;
+
+thread_local! {
+    /// On a thread that reads a table in the background, where a panic is
+    /// caught: the panic hook leaves the terminal be (see `main`).
+    static QUIET: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether a panic on this thread is caught where it happens.
+pub fn quiet_panics() -> bool {
+    QUIET.with(Cell::get)
+}
+
+/// Reads all of a message's rows from its whole payload, on a thread of
+/// its own. The slot gets them, or nothing when that fails, a panic included.
+fn read_in_background(m: Arc<Message>, payload: Arc<Vec<u8>>, read: Reader) -> Reading {
+    let slot: Reading = Arc::new(Mutex::new(None));
+    let done = slot.clone();
+    std::thread::spawn(move || {
+        QUIET.with(|q| q.set(true));
+        let rows = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&m, &payload)));
+        *done.lock().unwrap() = Some(rows.ok().flatten().unwrap_or_default());
+    });
+    slot
+}
 
 impl State {
     /// Whether the series are those of `key`.
@@ -54,19 +150,85 @@ impl State {
     }
 
     /// Makes the series for a topic's messages (newest first, as the store
-    /// keeps them); `focused` is the one whose own rows are charted.
-    pub fn update(&mut self, key: Key, msgs: &[Arc<Message>], focused: usize) {
+    /// keeps them); `focused` is the one whose own rows are charted, and
+    /// `whole` the newest one's whole payload when the store kept it.
+    pub fn update(&mut self, key: Key, msgs: &[Arc<Message>], focused: usize, whole: Option<&(u64, Arc<Vec<u8>>)>) {
         if self.key.map(|k| k.0) != Some(key.0) {
             self.fields.clear();
+            self.rows_of = None;
+        }
+        // Another topic or message: back to the start of what's shown.
+        if self.key.map(|k| (k.0, k.2)) != Some((key.0, key.2)) {
+            self.from = None;
         }
         self.key = Some(key);
         let kept: HashSet<u64> = msgs.iter().map(|m| m.seq).collect();
         self.fields.retain(|seq, _| kept.contains(seq));
+        match msgs.get(focused) {
+            Some(m) if self.rows_of.as_ref().is_some_and(|(seq, _)| *seq == m.seq) => {}
+            Some(m) => {
+                // What arrival kept, now; all of a big table, when read. One
+                // read at a time: a newer one waits for it (rather than
+                // whatever waited before), and what an older one reads is
+                // dropped.
+                let payload = to_read(m, whole);
+                self.rows_of = Some((m.seq, rows(m, payload.is_some())));
+                self.next_read = None;
+                if let Some(p) = payload {
+                    if self.reading.is_some() {
+                        self.next_read = Some((m.clone(), p));
+                    } else {
+                        self.reading = Some((m.seq, read_in_background(m.clone(), p, self.reader())));
+                    }
+                }
+            }
+            None => {
+                self.rows_of = None;
+                self.next_read = None;
+            }
+        }
+        self.over = over_time(msgs, &mut self.fields);
+        self.combine();
+    }
+
+    /// Takes the rows of a table read in full, once they're there; true
+    /// when that changed the series.
+    pub fn poll(&mut self) -> bool {
+        let Some((seq, slot)) = &self.reading else { return false };
+        let Some(all) = slot.lock().unwrap().take() else {
+            return false;
+        };
+        let seq = *seq;
+        let reader = self.reader();
+        self.reading = self
+            .next_read
+            .take()
+            .map(|(m, p)| (m.seq, read_in_background(m, p, reader)));
+        if self.rows_of.as_ref().is_none_or(|(s, _)| *s != seq) || all.is_empty() {
+            return false;
+        }
+        self.rows_of = Some((seq, all));
+        self.combine();
+        true
+    }
+
+    /// Whether all of a table's rows are still being read.
+    pub fn reading(&self) -> bool {
+        let shown = self.rows_of.as_ref().map(|(seq, _)| *seq);
+        self.reading.as_ref().is_some_and(|(seq, _)| Some(*seq) == shown)
+            || self.next_read.as_ref().is_some_and(|(m, _)| Some(m.seq) == shown)
+    }
+
+    fn reader(&self) -> Reader {
+        self.reader.unwrap_or(rows_whole)
+    }
+
+    /// The series: the message's own rows, then the numbers its messages
+    /// carry. The one picked stays picked, else the one shown before.
+    fn combine(&mut self) {
         let shown = self.series.get(self.sel).map(|s| s.name.clone());
-        let mut series = msgs.get(focused).map(|m| rows(m)).unwrap_or_default();
-        series.extend(over_time(msgs, &mut self.fields));
-        self.series = series;
-        // The one picked, else the one shown before, else the first.
+        let rows = self.rows_of.as_ref().map(|(_, r)| r.as_slice()).unwrap_or_default();
+        self.series = rows.iter().chain(&self.over).cloned().collect();
         let find = |name: &Option<String>| {
             name.as_ref()
                 .and_then(|n| self.series.iter().position(|s| &s.name == n))
@@ -79,6 +241,49 @@ impl State {
         self.series.clear();
         self.sel = 0;
         self.fields.clear();
+        self.rows_of = None;
+        self.reading = None;
+        self.next_read = None;
+        self.over.clear();
+        self.from = None;
+    }
+
+    /// Whether the current series has more points than fit, to scroll through.
+    pub fn scrollable(&self) -> bool {
+        match (self.current(), self.in_view()) {
+            (Some(s), Some((_, shown))) => shown.len() < s.points.len(),
+            _ => false,
+        }
+    }
+
+    /// The current series' points in view, and where they start: all of
+    /// them when they fit the room the chart had, else a stretch.
+    pub fn in_view(&self) -> Option<(usize, &[(f64, f64)])> {
+        let s = self.current()?;
+        // Not drawn yet: all of it.
+        let room = self.room.get();
+        let n = s.points.len();
+        if room == 0 || n <= room {
+            return Some((0, &s.points));
+        }
+        let room = room.max(2);
+        let last = n - room;
+        let start = match self.from {
+            Some(f) => f.min(last),
+            None if s.over_time => last,
+            None => 0,
+        };
+        Some((start, &s.points[start..start + room]))
+    }
+
+    /// Scrolls the stretch in view by `delta` points (back when negative).
+    pub fn scroll(&mut self, delta: isize) {
+        let Some((start, shown)) = self.in_view() else { return };
+        let (len, over_time) = (shown.len(), self.current().is_some_and(|s| s.over_time));
+        let last = self.current().map_or(0, |s| s.points.len()) - len;
+        let to = start.saturating_add_signed(delta).min(last);
+        // Back at the newest messages: following them again.
+        self.from = if over_time && to == last { None } else { Some(to) };
     }
 
     /// The topic node the series are of.
@@ -107,12 +312,68 @@ impl State {
 
 /// A message's own rows: a series per number column of its tables and per
 /// number array (or record field) of its JSON.
-pub fn rows(m: &Message) -> Vec<Series> {
-    let mut out = Vec::new();
-    let Some(v) = m.decoded.as_deref() else {
-        text_rows(&m.payload, m.size, content_type(m), &mut out);
+/// `coming`: all of them are being read (`to_read`), so a payload cut on
+/// arrival needn't say what would keep it whole.
+pub fn rows(m: &Message, coming: bool) -> Vec<Series> {
+    let Some(arrived) = m.decoded.as_deref() else {
+        let mut out = Vec::new();
+        text_rows(&m.payload, m.size, content_type(m), !coming, &mut out);
         return out;
     };
+    let whole = (cut(arrived) && m.truncated() && !coming).then_some(m.size);
+    view_rows(arrived, whole)
+}
+
+/// Whether a table in `v` was cut to its first rows on arrival.
+fn cut(v: &DocView) -> bool {
+    v.sections.iter().any(|s| match &s.body {
+        Body::Table { rows, .. } => total_rows(&s.detail).is_some_and(|t| t > rows.len()),
+        _ => false,
+    })
+}
+
+/// The whole payload to read all of a message's rows from, when there's
+/// more to them than arrival kept: its own (kept whole by a raised
+/// --max-payload), or the one the store kept for its topic's newest message.
+pub fn to_read(m: &Message, whole: Option<&(u64, Arc<Vec<u8>>)>) -> Option<Arc<Vec<u8>>> {
+    let more = match m.decoded.as_deref() {
+        Some(v) => cut(v),
+        None => m.truncated(),
+    };
+    if !more || !pretty::rows_to_read(m) {
+        return None;
+    }
+    if !m.truncated() {
+        return Some(Arc::new(m.payload.clone()));
+    }
+    whole.filter(|(seq, _)| *seq == m.seq).map(|(_, p)| p.clone())
+}
+
+/// A message's own rows, all of them, read from its whole `payload`: slow
+/// for a big table, so `State` does it on a thread of its own.
+pub fn rows_whole(m: &Message, payload: &[u8]) -> Option<Vec<Series>> {
+    let Some(arrived) = m.decoded.as_deref() else {
+        let mut out = Vec::new();
+        text_rows(payload, payload.len(), content_type(m), false, &mut out);
+        return Some(out);
+    };
+    let v = pretty::decode_rows(arrived.format, m.props.content_type.as_deref(), payload)?;
+    Some(view_rows(&v, None))
+}
+
+/// The `--max-payload` that keeps `size` bytes: "512KiB", "2MiB".
+pub fn max_payload_for(size: usize) -> String {
+    let p = size.max(1).next_power_of_two();
+    if p >= 1 << 20 {
+        format!("{}MiB", p >> 20)
+    } else {
+        format!("{}KiB", (p >> 10).max(1))
+    }
+}
+
+/// The rows of a decoded payload's tables, JSON and unpacked payloads.
+fn view_rows(v: &DocView, whole: Option<usize>) -> Vec<Series> {
+    let mut out = Vec::new();
     // Tables of data, not of what the payload holds (its schema, SQLite's
     // list of tables) or of named values (fields, below).
     let data = |s: &crate::view::Section| match &s.body {
@@ -127,14 +388,14 @@ pub fn rows(m: &Message) -> Vec<Series> {
             Body::Table { header, rows } if data(s) => {
                 // Several tables (SQLite): their columns go by table name.
                 let prefix = if tables > 1 { s.title.as_str() } else { "" };
-                out.extend(table(prefix, header, rows, &s.detail));
+                out.extend(table(prefix, header, rows, &s.detail, whole));
             }
             Body::Json(t) => json_rows(t.as_bytes(), &mut out),
             Body::Payload {
                 bytes,
                 size,
                 content_type,
-            } => text_rows(bytes, *size, content_type, &mut out),
+            } => text_rows(bytes, *size, content_type, false, &mut out),
             _ => {}
         }
     }
@@ -145,10 +406,11 @@ fn content_type(m: &Message) -> &str {
     m.props.content_type.as_deref().unwrap_or("")
 }
 
-fn text_rows(p: &[u8], size: usize, ct: &str, out: &mut Vec<Series>) {
+/// `hint`: a payload cut on arrival says which --max-payload keeps it whole.
+fn text_rows(p: &[u8], size: usize, ct: &str, hint: bool, out: &mut Vec<Series>) {
     match pretty::detect_payload(p, size, ct) {
         Format::Json => json_rows(p, out),
-        Format::Csv(d) => csv_rows(p, d, p.len() < size, out),
+        Format::Csv(d) => csv_rows(p, d, p.len() < size, (hint && p.len() < size).then_some(size), out),
         _ => {}
     }
 }
@@ -159,8 +421,15 @@ fn number(s: &str) -> Option<f64> {
 }
 
 /// A series per column whose cells are all numbers (nulls and blanks
-/// aside), at least two of them. `detail` is the section's ("· first 52 of 500").
-fn table(prefix: &str, header: &[String], rows: &[Vec<Option<String>>], detail: &str) -> Vec<Series> {
+/// aside), at least two of them. `detail` is the section's ("· first 52 of
+/// 500"); `whole`, the size of a payload that was cut on arrival.
+fn table(
+    prefix: &str,
+    header: &[String],
+    rows: &[Vec<Option<String>>],
+    detail: &str,
+    whole: Option<usize>,
+) -> Vec<Series> {
     fn cell(r: &[Option<String>], j: usize) -> Option<&str> {
         r.get(j).and_then(|c| c.as_deref()).filter(|c| !c.trim().is_empty())
     }
@@ -175,15 +444,14 @@ fn table(prefix: &str, header: &[String], rows: &[Vec<Option<String>>], detail: 
     };
     // The x axis goes by the first column when it names the rows (a time,
     // a turbine), else by row number.
-    let ends = match (
-        column(0),
-        rows.first().and_then(|r| cell(r, 0)),
-        rows.last().and_then(|r| cell(r, 0)),
-    ) {
-        (None, Some(a), Some(b)) => without_common_day(a, b),
-        _ => ("1".to_string(), rows.len().to_string()),
+    let axis = match (column(0), rows.first().and_then(|r| cell(r, 0))) {
+        (None, Some(_)) => Axis::Named(Arc::new(
+            rows.iter().map(|r| cell(r, 0).unwrap_or("").to_string()).collect(),
+        )),
+        _ => Axis::Rows,
     };
-    let source = rows_source(rows.len(), detail);
+    let total = total_rows(detail);
+    let cut = total.is_some_and(|t| t > rows.len());
     let mut out = Vec::new();
     for (j, name) in header.iter().enumerate() {
         if let Some(points) = column(j) {
@@ -194,8 +462,11 @@ fn table(prefix: &str, header: &[String], rows: &[Vec<Option<String>>], detail: 
                     format!("{prefix} · {name}")
                 },
                 points,
-                ends: ends.clone(),
-                source: source.clone(),
+                axis: axis.clone(),
+                count: rows.len(),
+                unit: "rows",
+                total,
+                whole: whole.filter(|_| cut || detail.is_empty()),
                 over_time: false,
             });
         }
@@ -226,21 +497,16 @@ fn without_common_day(a: &str, b: &str) -> (String, String) {
     }
 }
 
-/// "60 rows", or "first 52 of 500 rows" when the table was cut short.
-fn rows_source(n: usize, detail: &str) -> String {
-    let total = detail
-        .split_once(" of ")
-        .map(|(_, rest)| {
-            rest.chars()
-                .take_while(|c| c.is_ascii_digit() || *c == ',')
-                .filter(|c| *c != ',')
-        })
-        .and_then(|digits| digits.collect::<String>().parse::<usize>().ok());
-    match total {
-        Some(t) if t > n => format!("first {n} of {} rows", crate::fmt::commas(t as u64)),
-        _ if n == 1 => "1 row".into(),
-        _ => format!("{n} rows"),
-    }
+/// How many rows a table has in all, from a section's detail ("· first
+/// 52 of 1,500").
+fn total_rows(detail: &str) -> Option<usize> {
+    let (_, rest) = detail.split_once(" of ")?;
+    let digits: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == ',')
+        .filter(|c| *c != ',')
+        .collect();
+    digits.parse().ok()
 }
 
 /// A table that lists named values, as Sparkplug's metrics do: a `name` and
@@ -262,7 +528,9 @@ fn named_values(header: &[String], rows: &[Vec<Option<String>>]) -> Option<Vec<(
     Some(out)
 }
 
-fn csv_rows(p: &[u8], d: u8, cut: bool, out: &mut Vec<Series>) {
+/// `cut`: the payload was cut on arrival (its last line may be too);
+/// `whole`, its size, to say what keeps it whole.
+fn csv_rows(p: &[u8], d: u8, cut: bool, whole: Option<usize>, out: &mut Vec<Series>) {
     let text = String::from_utf8_lossy(p);
     let mut rows: Vec<Vec<String>> = text
         .replace("\r\n", "\n")
@@ -283,7 +551,7 @@ fn csv_rows(p: &[u8], d: u8, cut: bool, out: &mut Vec<Series>) {
         rows.remove(0)
     };
     let rows: Vec<Vec<Option<String>>> = rows.into_iter().map(|r| r.into_iter().map(Some).collect()).collect();
-    out.extend(table("", &header, &rows, ""));
+    out.extend(table("", &header, &rows, "", whole));
 }
 
 /// Deep enough for any document worth a chart.
@@ -305,15 +573,17 @@ fn arrays(j: &Json, path: &str, out: &mut Vec<Series>) {
             }
         }
         Json::Arr(items) if items.len() >= 2 => {
-            let n = items.len().to_string();
             if items.iter().all(|i| i.num().is_some() || matches!(i, Json::Null)) {
                 let points: Vec<(f64, f64)> = number_points(items.iter().map(Json::num));
                 if points.len() >= 2 {
                     out.push(Series {
                         name: if path.is_empty() { "values".into() } else { path.into() },
                         points,
-                        ends: ("1".into(), n),
-                        source: format!("{} items", items.len()),
+                        axis: Axis::Rows,
+                        count: items.len(),
+                        unit: "items",
+                        total: None,
+                        whole: None,
                         over_time: false,
                     });
                 }
@@ -349,9 +619,10 @@ fn records(items: &[Json], path: &str, out: &mut Vec<Series>) {
     // Rows go by the first field when it's text (a time, a name).
     let first = names.first().cloned().unwrap_or_default();
     let label = |i: &Json| i.get(&first).and_then(Json::str).map(str::to_string);
-    let ends = match (items.first().and_then(label), items.last().and_then(label)) {
-        (Some(a), Some(b)) => without_common_day(&a, &b),
-        _ => ("1".into(), items.len().to_string()),
+    let axis = if items.first().and_then(label).is_some() {
+        Axis::Named(Arc::new(items.iter().map(|i| label(i).unwrap_or_default()).collect()))
+    } else {
+        Axis::Rows
     };
     for name in names {
         let values: Option<Vec<Option<f64>>> = items
@@ -367,8 +638,11 @@ fn records(items: &[Json], path: &str, out: &mut Vec<Series>) {
             out.push(Series {
                 name: join(path, &name),
                 points,
-                ends: ends.clone(),
-                source: format!("{} records", items.len()),
+                axis: axis.clone(),
+                count: items.len(),
+                unit: "records",
+                total: None,
+                whole: None,
                 over_time: false,
             });
         }
@@ -480,12 +754,15 @@ fn over_time(msgs: &[Arc<Message>], cache: &mut HashMap<u64, Arc<Vec<(String, f6
         }
         // In time order, should the clock have been set back meanwhile.
         pts.sort_by_key(|p| p.0);
-        let (t0, t1) = (pts[0].0, pts[pts.len() - 1].0);
+        let t0 = pts[0].0;
         let start = secs(t0);
         out.push(Series {
             name: name.to_string(),
-            ends: (clock(t0, t1), clock(t1, t0)),
-            source: format!("{} messages", pts.len()),
+            axis: Axis::Time(t0),
+            count: pts.len(),
+            unit: "messages",
+            total: None,
+            whole: None,
             points: pts.iter().map(|&(t, v)| (secs(t) - start, v)).collect(),
             over_time: true,
         });
@@ -531,6 +808,15 @@ mod tests {
         s.iter().map(|s| s.name.as_str()).collect()
     }
 
+    /// The x axis labels of a whole series.
+    fn ends(s: &Series) -> (String, String) {
+        s.axis.ends(s.points[0].0, s.points[s.points.len() - 1].0)
+    }
+
+    fn pair(a: &str, b: &str) -> (String, String) {
+        (a.to_string(), b.to_string())
+    }
+
     #[test]
     fn fields_of_a_message() {
         let f = |p: &str| fields(&msg(1, 0, p, None));
@@ -549,38 +835,39 @@ mod tests {
 
     #[test]
     fn json_arrays_and_records_are_rows() {
-        let r = |p: &str| rows(&msg(1, 0, p, None));
+        let r = |p: &str| rows(&msg(1, 0, p, None), false);
         let s = r(r#"{"samples":[1,2.5,null,4],"meta":{"gain":[3,4]},"one":[5],"mixed":[1,"a"]}"#);
         assert_eq!(names(&s), ["samples", "meta.gain"]);
         assert_eq!(s[0].points, [(0.0, 1.0), (1.0, 2.5), (3.0, 4.0)]);
-        assert_eq!(
-            (s[0].ends.clone(), s[0].source.as_str()),
-            (("1".into(), "4".into()), "4 items")
-        );
+        assert_eq!((ends(&s[0]), s[0].source()), (pair("1", "4"), "4 items".into()));
         let s = r(r#"[{"ts":"08:00","v":1,"ok":true},{"ts":"08:01","v":2},{"ts":"08:02","v":null,"w":3}]"#);
         // `ok` isn't a number; `w` is there once.
         assert_eq!(names(&s), ["v"]);
         assert_eq!(s[0].points, [(0.0, 1.0), (1.0, 2.0)]);
-        assert_eq!(s[0].ends, ("08:00".into(), "08:02".into()));
+        // The axis spans the points: `v` is null in the last record.
+        assert_eq!(ends(&s[0]), pair("08:00", "08:01"));
         assert_eq!(names(&r("[1,2,3]")), ["values"]);
     }
 
     #[test]
     fn csv_columns_are_rows() {
-        let s = rows(&msg(
-            1,
-            0,
-            "turbine;energy_kwh;availability;status\nT01;28450.5;99.2;RUNNING\nT02;27110;;RUNNING\nT03;0;0;IDLE\n",
-            None,
-        ));
+        let s = rows(
+            &msg(
+                1,
+                0,
+                "turbine;energy_kwh;availability;status\nT01;28450.5;99.2;RUNNING\nT02;27110;;RUNNING\nT03;0;0;IDLE\n",
+                None,
+            ),
+            false,
+        );
         assert_eq!(names(&s), ["energy_kwh", "availability"]);
         assert_eq!(s[1].points, [(0.0, 99.2), (2.0, 0.0)], "a blank cell is a gap");
-        assert_eq!(s[0].ends, ("T01".into(), "T03".into()));
-        assert_eq!(s[0].source, "3 rows");
+        assert_eq!(ends(&s[0]), pair("T01", "T03"));
+        assert_eq!(s[0].source(), "3 rows");
         // No header: numbered columns, rows by number.
-        let s = rows(&msg(1, 0, "1,2\n3,4\n5,6\n", Some("text/csv")));
+        let s = rows(&msg(1, 0, "1,2\n3,4\n5,6\n", Some("text/csv")), false);
         assert_eq!(names(&s), ["column 1", "column 2"]);
-        assert_eq!(s[1].ends, ("1".into(), "3".into()));
+        assert_eq!(ends(&s[1]), pair("1", "3"));
     }
 
     #[test]
@@ -593,7 +880,7 @@ mod tests {
         let mut m = message(1, 0, "", None);
         m.size = pq.len();
         m.decoded = crate::pretty::decode_on_arrival(Some("application/parquet"), &pq).map(Box::new);
-        let s = rows(&m);
+        let s = rows(&m, false);
         assert!(!s.is_empty(), "number columns");
         assert!(
             s.iter().all(|x| !x.name.contains(" · ")),
@@ -602,7 +889,7 @@ mod tests {
         );
         for x in &s {
             assert!(x.points.len() >= 2 && !x.over_time, "{x:?}");
-            assert!(x.source.ends_with("rows"), "{}", x.source);
+            assert!(x.source().ends_with("rows"), "{}", x.source());
         }
 
         // Several tables go by table name; a list of named values isn't rows.
@@ -633,7 +920,7 @@ mod tests {
             &[&["a", "Float", "1.5"], &["b", "String", "x"]],
         ));
         m.decoded = Some(Box::new(v));
-        let s = rows(&m);
+        let s = rows(&m, false);
         assert_eq!(
             names(&s),
             [
@@ -648,13 +935,172 @@ mod tests {
     }
 
     #[test]
-    fn rows_source_says_when_cut() {
-        assert_eq!(rows_source(52, "· first 52 of 500"), "first 52 of 500 rows");
-        assert_eq!(rows_source(60, "· first 60 of 60"), "60 rows");
-        assert_eq!(rows_source(10, "· first 10 of 1,234 rows"), "first 10 of 1,234 rows");
-        assert_eq!(rows_source(1, ""), "1 row");
-        assert_eq!(rows_source(10, "· first 10 of 1,234+ rows"), "first 10 of 1,234 rows");
-        assert_eq!(rows_source(3, "· 3 rows"), "3 rows");
+    fn where_the_points_come_from() {
+        assert_eq!(total_rows("· first 52 of 500"), Some(500));
+        assert_eq!(total_rows("· first 10 of 1,234+ rows"), Some(1234));
+        assert_eq!(total_rows("· 3 rows"), None);
+        let s = |count, total| Series {
+            name: "x".into(),
+            points: vec![],
+            axis: Axis::Rows,
+            count,
+            unit: "rows",
+            total,
+            whole: None,
+            over_time: false,
+        };
+        assert_eq!(s(52, Some(500)).source(), "first 52 of 500 rows");
+        assert_eq!(s(60, Some(60)).source(), "60 rows");
+        assert_eq!(s(30_000, None).source(), "30,000 rows");
+    }
+
+    #[test]
+    fn a_cut_table_is_read_whole_when_its_payload_was_kept() {
+        let pq = std::fs::read(format!(
+            "{}/tests/fixtures/turbine-snappy.parquet",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let decoded = crate::pretty::decode_on_arrival(Some("application/parquet"), &pq).unwrap();
+        let arrived = decoded.sections.iter().find(|s| s.title == "Rows").unwrap();
+        assert!(arrived.detail.contains("of 500"), "cut on arrival: {}", arrived.detail);
+        let message = |kept: usize| Message {
+            payload: pq[..kept].to_vec(),
+            size: pq.len(),
+            decoded: crate::pretty::decode_on_arrival(Some("application/parquet"), &pq).map(Box::new),
+            ..message(1, 0, "", Some("application/parquet"))
+        };
+        // Kept whole (a raised --max-payload): the first rows at once, and
+        // all 500 read again.
+        let kept = message(pq.len());
+        let s = rows(&kept, true);
+        assert!(s[0].count < 500 && s[0].whole.is_none(), "{}", s[0].source());
+        let payload = to_read(&kept, None).expect("its own payload, whole");
+        let s = rows_whole(&kept, &payload).unwrap();
+        assert!(
+            s.iter().all(|x| x.count == 500 && x.whole.is_none()),
+            "{:?}",
+            s[0].source()
+        );
+        assert_eq!(s[0].source(), "500 rows");
+        // Cut to the default 4 KiB: the first rows, and how much would keep them all.
+        let cut = message(4096);
+        assert!(to_read(&cut, None).is_none(), "nothing whole to read from");
+        let s = rows(&cut, false);
+        assert!(s[0].count < 500 && s[0].total == Some(500), "{}", s[0].source());
+        assert_eq!(s[0].whole, Some(pq.len()));
+
+        // The state reads it on a thread of its own, then has all of it.
+        let mut st = State::default();
+        st.update((1, 1, None, 1), &[Arc::new(kept)], 0, None);
+        assert!(st.reading() && st.current().unwrap().count < 500);
+        let start = std::time::Instant::now();
+        while !st.poll() {
+            assert!(start.elapsed() < Duration::from_secs(10), "never read");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!st.reading() && st.current().unwrap().count == 500);
+    }
+
+    /// Polls until no read is under way.
+    fn wait_for_reads(st: &mut State) {
+        let start = std::time::Instant::now();
+        while st.reading.is_some() {
+            assert!(start.elapsed() < Duration::from_secs(10), "never read");
+            st.poll();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn one_read_at_a_time_and_a_panic_is_caught() {
+        let pq = std::fs::read(format!(
+            "{}/tests/fixtures/turbine-snappy.parquet",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let big = |seq: u64| {
+            Arc::new(Message {
+                seq,
+                payload: pq.clone(),
+                size: pq.len(),
+                decoded: crate::pretty::decode_on_arrival(Some("application/parquet"), &pq).map(Box::new),
+                ..message(seq, 0, "", Some("application/parquet"))
+            })
+        };
+
+        // A panic while reading is caught: the first rows stay, and
+        // nothing is left reading.
+        let mut st = State {
+            reader: Some(|_: &Message, _: &[u8]| -> Option<Vec<Series>> { panic!("a decoder bug") }),
+            ..Default::default()
+        };
+        st.update((1, 1, None, 1), &[big(1)], 0, None);
+        assert!(st.reading());
+        wait_for_reads(&mut st);
+        assert!(!st.reading() && st.current().unwrap().count < 500);
+
+        // A newer message while one is read waits for it, then is read;
+        // what the older read found is dropped.
+        let mut st = State {
+            reader: Some(|m: &Message, _: &[u8]| {
+                std::thread::sleep(Duration::from_millis(30));
+                Some(vec![Series {
+                    name: format!("all of {}", m.seq),
+                    points: vec![(0.0, 1.0), (1.0, 2.0)],
+                    axis: Axis::Rows,
+                    count: 2,
+                    unit: "rows",
+                    total: None,
+                    whole: None,
+                    over_time: false,
+                }])
+            }),
+            ..Default::default()
+        };
+        st.update((1, 1, None, 1), &[big(1)], 0, None);
+        st.update((1, 2, None, 2), &[big(2), big(1)], 0, None);
+        assert!(st.next_read.is_some() && st.reading());
+        wait_for_reads(&mut st);
+        assert_eq!(names(&st.series), ["all of 2"]);
+    }
+
+    #[test]
+    fn a_long_series_scrolls() {
+        let mut st = State::default();
+        let points: Vec<(f64, f64)> = (0..1000).map(|i| (i as f64, (i % 7) as f64)).collect();
+        let series = |over_time| Series {
+            name: "x".into(),
+            points: points.clone(),
+            axis: Axis::Rows,
+            count: 1000,
+            unit: "rows",
+            total: None,
+            whole: None,
+            over_time,
+        };
+        st.series = vec![series(false)];
+        st.room.set(100);
+        // A message's rows start at the first; scrolling moves along, no further than the end.
+        assert_eq!(st.in_view().map(|(a, v)| (a, v.len())), Some((0, 100)));
+        st.scroll(25);
+        assert_eq!(st.in_view().unwrap().0, 25);
+        st.scroll(-1000);
+        assert_eq!(st.in_view().unwrap().0, 0);
+        st.scroll(5000);
+        assert_eq!(st.in_view().unwrap().0, 900);
+        // Room for all: all of it.
+        st.room.set(2000);
+        assert_eq!(st.in_view().map(|(a, v)| (a, v.len())), Some((0, 1000)));
+        // Messages start at the newest and follow them, until scrolled back.
+        st.room.set(100);
+        st.series = vec![series(true)];
+        st.from = None;
+        assert_eq!(st.in_view().unwrap().0, 900);
+        st.scroll(-50);
+        assert_eq!((st.in_view().unwrap().0, st.from), (850, Some(850)));
+        st.scroll(50);
+        assert_eq!(st.from, None, "at the newest again: following");
     }
 
     #[test]
@@ -690,7 +1136,7 @@ mod tests {
         // Newest first by arrival; the second to arrive is stamped latest.
         let msgs = vec![msg(3, 5, "3", None), msg(2, 10, "2", None), msg(1, 0, "1", None)];
         let mut st = State::default();
-        st.update((1, 3, None, 3), &msgs, 0);
+        st.update((1, 3, None, 3), &msgs, 0, None);
         assert_eq!(st.series[0].points, [(0.0, 1.0), (5.0, 3.0), (10.0, 2.0)]);
     }
 
@@ -703,13 +1149,13 @@ mod tests {
             msg(1, 0, r#"{"t":20,"old":1}"#, None),
         ];
         let mut st = State::default();
-        st.update((7, 3, None, 3), &msgs, 0);
+        st.update((7, 3, None, 3), &msgs, 0, None);
         assert_eq!(names(&st.series), ["t"], "rpm and old are there once");
         let t = &st.series[0];
         assert!(t.over_time);
         assert_eq!(t.points, [(0.0, 20.0), (10.0, 21.0), (20.0, 22.0)]);
-        assert_eq!(t.source, "3 messages");
-        assert_eq!(t.ends.0.len(), "08:00:00".len(), "{:?}", t.ends);
+        assert_eq!(t.source(), "3 messages");
+        assert_eq!(ends(t).0.len(), "08:00:00".len(), "{:?}", ends(t));
         assert!(st.is_for((7, 3, None, 3)) && !st.is_for((7, 4, None, 4)));
 
         // A topic with a table and fields: its rows first.
@@ -717,7 +1163,7 @@ mod tests {
             msg(5, 5, r#"{"v":[1,2,3],"t":2}"#, None),
             msg(4, 0, r#"{"v":[1],"t":1}"#, None),
         ];
-        st.update((8, 5, None, 2), &msgs, 0);
+        st.update((8, 5, None, 2), &msgs, 0, None);
         assert_eq!(names(&st.series), ["v", "t"]);
     }
 
@@ -726,16 +1172,16 @@ mod tests {
         let a = vec![msg(2, 1, r#"{"x":1,"y":2}"#, None), msg(1, 0, r#"{"x":3,"y":4}"#, None)];
         let b = vec![msg(4, 1, r#"{"y":5,"z":6}"#, None), msg(3, 0, r#"{"y":7,"z":8}"#, None)];
         let mut st = State::default();
-        st.update((1, 2, None, 2), &a, 0);
+        st.update((1, 2, None, 2), &a, 0, None);
         assert_eq!(st.current().unwrap().name, "x");
         st.step(1);
         assert_eq!(st.current().unwrap().name, "y");
         st.step(5);
         assert_eq!(st.sel, 1, "stops at the last");
         // Another topic with a `y`: shown; one without: the first.
-        st.update((2, 4, None, 2), &b, 0);
+        st.update((2, 4, None, 2), &b, 0, None);
         assert_eq!(st.current().unwrap().name, "y");
-        st.update((3, 9, None, 2), &[msg(9, 1, "1", None), msg(8, 0, "2", None)], 0);
+        st.update((3, 9, None, 2), &[msg(9, 1, "1", None), msg(8, 0, "2", None)], 0, None);
         assert_eq!(st.current().unwrap().name, "value");
         st.clear();
         assert!(st.current().is_none());
@@ -758,7 +1204,7 @@ mod tests {
         let n = store.find(c, "plant/temp").unwrap();
         let msgs = store.nodes[n].messages();
         let mut st = State::default();
-        st.update((n, msgs[0].seq, None, 4), &msgs, 0);
+        st.update((n, msgs[0].seq, None, 4), &msgs, 0, None);
         assert_eq!(names(&st.series), ["value"]);
         let ys: Vec<f64> = st.series[0].points.iter().map(|p| p.1).collect();
         assert_eq!(ys, [20.0, 21.0, 22.0, 23.0]);

@@ -28,6 +28,8 @@ const CLIP_HEX_WIDTH: usize = 80;
 /// The most rows the connections panel shows: five connections with a
 /// subscription each. More scroll.
 pub const PANEL_ROWS: u16 = 10;
+/// How long the new version may take to be noticed after an update.
+const RESTART_WAIT: Duration = Duration::from_secs(30);
 
 /// The connections file's modified time and size, to notice edits.
 type Stamp = Option<(SystemTime, u64)>;
@@ -187,6 +189,16 @@ pub struct App {
     pub quit: bool,
     /// Watching for a newer fss-mqtt in our place (not in tests).
     pub upgrade: Option<crate::upgrade::Watch>,
+    /// Newer releases on GitHub, looked for now and then (not with
+    /// FSS_MQTT_UPDATE=off, nor in tests).
+    pub release: Option<crate::update::Checker>,
+    /// A release being installed (ctrl+n).
+    pub updating: Option<crate::update::Job>,
+    /// The version an update installed, to restart into once it's noticed
+    /// in our place, and since when.
+    restart_into: Option<(String, Instant)>,
+    /// The version an update installed this run: not offered again.
+    installed: Option<String>,
     /// Quit to restart into it (ctrl+n), continuing the session.
     pub restart: bool,
 }
@@ -246,6 +258,10 @@ impl App {
             rate_at: Instant::now(),
             quit: false,
             upgrade: None,
+            release: None,
+            updating: None,
+            restart_into: None,
+            installed: None,
             restart: false,
         };
         app.refresh_panel();
@@ -346,12 +362,102 @@ impl App {
                 false,
             );
         }
+        if let Some(c) = &mut self.release
+            && c.check()
+            && let Some(v) = c.available().map(str::to_string)
+        {
+            self.notify(format!("fss-mqtt {v} is out · ctrl+n updates"), false);
+        }
+        self.follow_update();
         if self.config_checked.elapsed() >= CONFIG_EVERY {
             self.config_checked = Instant::now();
             self.check_config();
         }
         self.rebuild(false);
         self.update_chart();
+    }
+
+    /// ctrl+n with a newer release out: installs it the way this copy was
+    /// installed. The restart into it follows (`follow_update`).
+    fn update(&mut self) {
+        if let Some(j) = &self.updating {
+            let note = format!("already updating to fss-mqtt {}", j.version);
+            return self.notify(note, false);
+        }
+        let Some(v) = self.update_offer().map(str::to_string) else {
+            let note = match (&self.release, &self.installed) {
+                (_, Some(v)) => format!("fss-mqtt {v} is installed: start it again to use it"),
+                (Some(c), _) if c.known() => format!("fss-mqtt {} is the newest", env!("CARGO_PKG_VERSION")),
+                (Some(_), _) => "no newer fss-mqtt found (yet)".into(),
+                (None, _) => "no newer fss-mqtt is installed".into(),
+            };
+            return self.notify(note, false);
+        };
+        let how = match std::env::current_exe().and_then(std::fs::canonicalize) {
+            Ok(exe) => crate::update::how(&exe),
+            Err(e) => return self.notify(format!("can't tell where fss-mqtt is: {e}"), true),
+        };
+        match crate::update::start(&how, &v) {
+            Ok(job) => {
+                self.notify(format!("updating to fss-mqtt {v}…"), false);
+                self.updating = Some(job);
+            }
+            Err(e) => self.notify(e, false),
+        }
+    }
+
+    /// An update under way: how it ends, then the restart it's for, once
+    /// the new version is noticed in our place.
+    fn follow_update(&mut self) {
+        use crate::update::Step;
+        if let Some(job) = &self.updating {
+            match job.step() {
+                Step::Working(_) => {}
+                Step::Done => {
+                    let v = job.version.clone();
+                    self.updating = None;
+                    self.installed = Some(v.clone());
+                    if let Some(w) = &mut self.upgrade {
+                        w.look_now();
+                        self.restart_into = Some((v.clone(), Instant::now()));
+                        self.notify(format!("fss-mqtt {v} is installed · restarting into it…"), false);
+                    } else {
+                        self.notify(format!("fss-mqtt {v} is installed: start it again to use it"), false);
+                    }
+                }
+                Step::Failed(e) => {
+                    self.updating = None;
+                    self.notify(format!("couldn't update: {e}"), true);
+                }
+            }
+        }
+        if let Some((v, since)) = &self.restart_into {
+            if self
+                .upgrade
+                .as_ref()
+                .is_some_and(|w| w.offering() == Some(v.as_str()) && w.ready())
+            {
+                self.restart_into = None;
+                self.restart = true;
+                self.quit = true;
+            } else if since.elapsed() > RESTART_WAIT {
+                let note =
+                    format!("fss-mqtt {v} was installed, but not where this one was started from: start it again");
+                self.restart_into = None;
+                self.notify(note, true);
+            }
+        }
+    }
+
+    /// A newer release to offer: not one an update already installed.
+    pub fn update_offer(&self) -> Option<&str> {
+        let v = self.release.as_ref()?.available()?;
+        (self.installed.as_deref() != Some(v)).then_some(v)
+    }
+
+    /// The version an update just installed, while the restart into it waits.
+    pub fn restarting_into(&self) -> Option<&str> {
+        self.restart_into.as_ref().map(|(v, _)| v.as_str())
     }
 
     pub(crate) fn refresh_panel(&mut self) {
@@ -536,7 +642,7 @@ impl App {
                     self.quit = true;
                 }
                 (Some(_), false) => self.notify("fss-mqtt is changing on disk; try again in a moment", false),
-                (None, _) => self.notify("no newer fss-mqtt is installed", false),
+                (None, _) => self.update(),
             }
             return;
         }

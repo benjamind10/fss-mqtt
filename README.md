@@ -95,9 +95,11 @@ autoconnect  = true                        # connect when started without -c or 
   the new settings. A file with an error is reported and not applied. The panel's bottom border
   shows the file's path.
 
-The panel at the top lists each connection with its subscriptions. `tab` moves between the panel,
-the topic tree and the message list; in the panel, `space` or `⏎` connects or disconnects a
-connection, or turns a subscription (subscribed and unsubscribed live) or a capture rule on or off.
+The panel at the top lists each connection with its subscriptions, ten rows at most (five
+connections with a subscription each); the rest scroll, and its bottom border says how many are out
+of view. `tab` moves between the panel, the topic tree and the message list; in the panel, `space`
+or `⏎` connects or disconnects a connection, or turns a subscription (subscribed and unsubscribed
+live) or a capture rule on or off.
 
 | Flag | Default | |
 |---|---|---|
@@ -135,7 +137,7 @@ clears. Clearing keeps the tree open at the topic you were on.
 | Where | Key | |
 |---|---|---|
 | anywhere | `tab` / `shift+tab` | next / previous pane: connections, topics, messages, chart |
-| connections | `↑ ↓` | move |
+| connections | `↑ ↓ pgup pgdn home end` | move |
 | connections | `space` `⏎` | connect / disconnect, or subscription / capture rule on / off |
 | tree | `↑ ↓ pgup pgdn home end` | move |
 | tree | `→` | expand; on a topic with messages, enter its message list |
@@ -158,7 +160,7 @@ clears. Clearing keeps the tree open at the topic you were on.
 | tree, messages | `ctrl+t` / `ctrl+y` | copy the topic / the message (see [Clipboard](#clipboard)) |
 | full screen | `t` / `y` | copy the topic / what the view shows |
 | tree, messages | `ctrl+r` | capture this topic and everything below it to disk; again to stop |
-| anywhere | `ctrl+n` | when a newer fss-mqtt was installed meanwhile: restart into it, continuing the session |
+| anywhere | `ctrl+n` | with a newer release out: install it (see [Updating](#updating)); when a newer fss-mqtt was installed meanwhile: restart into it, continuing the session |
 | anywhere | `ctrl+c` | quit (saving the session for `--resume`) |
 
 A green `•`/`▸` means the topic (or something under it) received a message in the last 1.5 s.
@@ -197,7 +199,7 @@ With `--vim` (or `FSS_MQTT_KEYS=vim`), letters move around instead of filtering,
 | messages | `h` | back to the tree |
 | chart | `h l` | scroll (like `← →`) |
 | connections, tree, messages, chart | `g` / `G` | first / last (like `home` / `end`) |
-| tree, full screen | `ctrl+d` / `ctrl+u` | page down / up |
+| connections, tree, full screen | `ctrl+d` / `ctrl+u` | page down / up |
 | messages, chart | `ctrl+d` / `ctrl+u` | last / first (like `pgdn` / `pgup`) |
 | connections, tree, messages | `/` | filter: type it, then `⏎` keeps it and goes back to moving, `esc` clears it |
 | anywhere | `e` | publish (like `ctrl+e`) |
@@ -430,6 +432,29 @@ continued as far as it can be read, and the status line says so. `--no-session`
 
 `FSS_MQTT_KEYS=vim` turns on vim keys like `--vim`, the way `FSS_MQTT_SESSION=off` stands in for
 `--no-session`.
+
+## Updating
+
+fss-mqtt looks for a newer release when it starts, at most once a day, and daily while it runs: it
+asks where `github.com/mbilling/fss-mqtt/releases/latest` leads, and sends nothing else. When there's
+one, the header says so (`↑ 0.9.0 available · ^n update`), and `ctrl+n` installs it the way this
+fss-mqtt was installed, then restarts into it, continuing the session:
+
+- **Homebrew:** `brew update`, then `brew upgrade mbilling/tap/fss-mqtt`, in the background.
+- **A release archive or `cargo install`:** the release's archive for this platform is downloaded,
+  checked against the release's `SHA256SUMS`, run once (`--version`) to be sure it works here, and
+  put in place of the running program. On Windows the running one is moved aside, and removed the
+  next time fss-mqtt starts.
+- **Scoop** doesn't update a program while it runs: quit, `scoop update fss-mqtt`, then
+  `fss-mqtt --resume`.
+- **A `.deb` or `.rpm`** needs your package manager and sudo: install the new package from the
+  release page.
+
+On Windows the restart is yours to do: fss-mqtt quits and prints the command to continue. Downloads
+go straight to GitHub over HTTPS, not through a proxy. The `SHA256SUMS` check catches a broken
+download, not a tampered release: it comes from the same release, so trusting it means trusting
+GitHub and the TLS to it, as when you download a release by hand. `FSS_MQTT_UPDATE=off` turns looking for
+releases off, and then no request is made.
 
 ## Performance notes
 

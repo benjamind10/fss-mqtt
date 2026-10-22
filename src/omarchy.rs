@@ -13,23 +13,38 @@ use crate::theme::Theme;
 
 const CHECK_EVERY: Duration = Duration::from_secs(1);
 
-/// Where the current theme's colours are, if Omarchy is here.
-pub fn colors_path() -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME")?);
+/// Where Omarchy may keep the current theme's colours.
+fn places() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
     [
         ".config/omarchy/current/theme/colors.toml",
         ".local/state/omarchy/current/theme/colors.toml",
     ]
     .iter()
     .map(|p| home.join(p))
-    .find(|p| p.is_file())
+    .collect()
 }
 
-/// `key = "value"` lines; comments, sections and anything else skipped.
+/// The first of `places` that's there.
+fn find(places: &[PathBuf]) -> Option<&Path> {
+    places.iter().find(|p| p.is_file()).map(PathBuf::as_path)
+}
+
+/// `key = "value"` lines, a comment after the value or not; comments,
+/// sections and anything else skipped.
 fn read(text: &str) -> HashMap<&str, &str> {
     text.lines()
         .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim(), v.trim().trim_matches('"')))
+        .filter_map(|(k, v)| {
+            let v = v.trim();
+            let v = match v.chars().next() {
+                Some(q @ ('"' | '\'')) => v[1..].split(q).next().filter(|_| v[1..].contains(q))?,
+                _ => v.split(['#', ' ', '\t']).next().unwrap_or(""),
+            };
+            Some((k.trim(), v))
+        })
         .filter(|(k, _)| !k.is_empty() && !k.starts_with('#'))
         .collect()
 }
@@ -79,36 +94,37 @@ pub fn theme(text: &str) -> Theme {
 
 /// The theme in place now, if Omarchy is here.
 pub fn current() -> Option<Theme> {
-    Some(theme(&std::fs::read_to_string(colors_path()?).ok()?))
+    Some(theme(&std::fs::read_to_string(find(&places())?).ok()?))
 }
 
 /// Notices when Omarchy switches to another theme (or the colours change).
 pub struct Watch {
-    file: Option<PathBuf>,
+    places: Vec<PathBuf>,
     seen: Option<(PathBuf, SystemTime)>,
     checked: Instant,
 }
 
 impl Watch {
     pub fn new() -> Watch {
-        Watch::of(colors_path())
+        Watch::of(places())
     }
 
-    fn of(file: Option<PathBuf>) -> Watch {
+    fn of(places: Vec<PathBuf>) -> Watch {
         Watch {
-            seen: file.as_deref().and_then(stamp),
-            file,
+            seen: find(&places).and_then(stamp),
+            places,
             checked: Instant::now(),
         }
     }
 
-    /// Looks now and then; the new theme when it changed.
+    /// Looks now and then; the new theme when it changed. Where it's kept is
+    /// looked for each time: Omarchy may arrive, or move it, meanwhile.
     pub fn check(&mut self) -> Option<Theme> {
         if self.checked.elapsed() < CHECK_EVERY {
             return None;
         }
         self.checked = Instant::now();
-        let now = stamp(self.file.as_deref()?)?;
+        let now = stamp(find(&self.places)?)?;
         if self.seen.as_ref() == Some(&now) {
             return None;
         }
@@ -173,7 +189,8 @@ bright_magenta = "#bb9af7"
     #[cfg(unix)]
     #[test]
     fn a_theme_switch_is_noticed() {
-        // Two themes and a link to the current one, as Omarchy has them.
+        // Two themes and a link to the current one, as Omarchy has them;
+        // the link is in the second of two places, and not there at first.
         let dir = std::env::temp_dir().join(format!("fss-mqtt-test-{}-omarchy", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for (name, accent) in [("a", "#111111"), ("b", "#222222")] {
@@ -181,10 +198,16 @@ bright_magenta = "#bb9af7"
             std::fs::write(dir.join(name).join("colors.toml"), format!("accent = \"{accent}\"\n")).unwrap();
         }
         let current = dir.join("current");
-        std::os::unix::fs::symlink(dir.join("a"), &current).unwrap();
-        let mut w = Watch::of(Some(current.join("colors.toml")));
+        let mut w = Watch::of(vec![dir.join("elsewhere/colors.toml"), current.join("colors.toml")]);
         let a_second_on = |w: &mut Watch| w.checked = Instant::now() - CHECK_EVERY;
+        a_second_on(&mut w);
+        assert!(w.check().is_none(), "no Omarchy yet");
+
+        std::os::unix::fs::symlink(dir.join("a"), &current).unwrap();
         assert!(w.check().is_none(), "too soon to look");
+        a_second_on(&mut w);
+        let th = w.check().expect("Omarchy arrived");
+        assert_eq!(th.accent.fg, Some(Color::Rgb(0x11, 0x11, 0x11)));
         a_second_on(&mut w);
         assert!(w.check().is_none(), "nothing changed");
 
@@ -200,7 +223,7 @@ bright_magenta = "#bb9af7"
         std::fs::remove_dir_all(&dir).unwrap();
         a_second_on(&mut w);
         assert!(w.check().is_none());
-        assert!(Watch::of(None).check().is_none());
+        assert!(Watch::of(Vec::new()).check().is_none());
     }
 
     #[test]
@@ -210,6 +233,12 @@ bright_magenta = "#bb9af7"
         assert_eq!(th.accent.fg, ours.accent.fg, "not a colour");
         assert_eq!(th.red.fg, ours.red.fg, "a comment");
         assert_eq!(th.green.fg, ours.green.fg);
+        // A comment after a value, single quotes, a quote left open.
+        let th = theme("accent = \"#7aa2f7\" # blue\ngreen = '#00ff00'\nred = \"#ff0000\nblue = #0000ff # bare\n");
+        assert_eq!(th.accent.fg, Some(Color::Rgb(0x7a, 0xa2, 0xf7)));
+        assert_eq!(th.green.fg, Some(Color::Rgb(0, 0xff, 0)));
+        assert_eq!(th.red.fg, ours.red.fg, "never closed");
+        assert_eq!(th.blue.fg, ours.blue.fg, "a bare # starts a comment");
         // A light theme starts from the light colours; alpha is dropped.
         let th = theme("mode = \"light\"\nblue = \"#11223344\"\n");
         assert_eq!(th.text.fg, Theme::new(true).text.fg);

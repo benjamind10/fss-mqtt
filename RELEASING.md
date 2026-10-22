@@ -60,12 +60,12 @@ scoop install fss-mqtt
 
 ### Omarchy (OmaMQTT)
 
-On [Omarchy](https://omarchy.org), fss-mqtt is packaged as `omamqtt` for Omarchy's package
-repository: the recipe is `pkgbuilds/omamqtt` in
-[omacom/omarchy-pkgs](https://github.com/omacom/omarchy-pkgs). A bot there watches this
-repository's GitHub releases and proposes each new version itself, so a release needs nothing more.
-The recipe builds the release's source and installs `packaging/omarchy/omamqtt.desktop` and
-`omamqtt.svg` from it: moving those means changing the recipe too.
+The `omamqtt` package for [Omarchy](https://omarchy.org)'s package repository is a recipe in
+[omacom/omarchy-pkgs](https://github.com/omacom/omarchy-pkgs) (`pkgbuilds/omamqtt`), proposed there
+by a PR after the first release with OmaMQTT. Once it's in, a bot there follows this repository's
+GitHub releases and proposes each new version itself, so a release needs nothing more. The recipe
+builds the release's source and installs `packaging/omarchy/omamqtt.desktop` and `omamqtt.svg`
+from it: moving those means changing the recipe too.
 
 ### winget (Windows)
 

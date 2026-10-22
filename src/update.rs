@@ -179,6 +179,8 @@ pub enum How {
     Scoop,
     /// By a package manager (.deb, .rpm, Nix, snap), where it's updated.
     Package,
+    /// By Omarchy's package (`/usr/bin/omamqtt`), updated with Omarchy.
+    Omarchy,
     /// Built from the source.
     Source,
     /// Any other way (a release archive, cargo install): replaced in place.
@@ -203,6 +205,9 @@ pub fn how(exe: &Path) -> How {
     }
     if lower.contains("/target/release/") || lower.contains("/target/debug/") {
         return How::Source;
+    }
+    if s == "/usr/bin/omamqtt" {
+        return How::Omarchy;
     }
     if ["/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/", "/nix/store/", "/snap/"]
         .iter()
@@ -267,7 +272,7 @@ pub fn start(how: &How, version: &str) -> Result<Job, String> {
                     .into(),
             );
         }
-        How::Package if crate::brand::oma() => {
+        How::Omarchy => {
             return Err(format!(
                 "OmaMQTT {version} comes with Omarchy's updates: omarchy-update"
             ));
@@ -567,6 +572,7 @@ mod tests {
         assert_eq!(h(r"\\?\C:\Users\me\scoop\apps\fss-mqtt\0.8.0\fss-mqtt.exe"), How::Scoop);
         assert_eq!(h("/home/me/code/fss-mqtt/target/release/fss-mqtt"), How::Source);
         assert_eq!(h("/usr/bin/fss-mqtt"), How::Package);
+        assert_eq!(h("/usr/bin/omamqtt"), How::Omarchy, "Omarchy's package");
         assert_eq!(h("/nix/store/abc-fss-mqtt-0.8.0/bin/fss-mqtt"), How::Package);
         assert_eq!(h("/snap/fss-mqtt/12/bin/fss-mqtt"), How::Package);
         assert_eq!(
@@ -578,6 +584,7 @@ mod tests {
             matches!(start(&How::Package, "9.9.9"), Err(e) if e.contains("update it there") && e.contains("/releases/tag/v9.9.9"))
         );
         assert!(matches!(start(&How::Source, "9.9.9"), Err(e) if e.contains("built from source")));
+        assert!(matches!(start(&How::Omarchy, "9.9.9"), Err(e) if e.ends_with("updates: omarchy-update")));
     }
 
     #[test]

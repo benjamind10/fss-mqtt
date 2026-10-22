@@ -464,7 +464,6 @@ fss-mqtt was installed, then restarts into it, continuing the session:
   `fss-mqtt --resume`.
 - **A `.deb` or `.rpm`** needs your package manager and sudo: install the new package from the
   release page.
-- **OmaMQTT installed by Omarchy** updates with Omarchy: `omarchy-update`.
 
 On Windows the restart is yours to do: fss-mqtt quits and prints the command to continue. Downloads
 go straight to GitHub over HTTPS, not through a proxy. The `SHA256SUMS` check catches a broken

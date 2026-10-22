@@ -297,6 +297,19 @@ fn parse_blocks(text: &str) -> Result<Vec<Block>, String> {
         if b.cfg.url.is_empty() {
             return Err(format!("line {}: connection {:?} has no url", b.start + 1, b.cfg.name));
         }
+        // A login that would never be sent: say so rather than ignore it.
+        let proxy_user = b
+            .cfg
+            .proxy
+            .as_deref()
+            .and_then(|u| crate::proxy::Proxy::parse(u, None).ok()?.user);
+        if b.cfg.proxy_password_env.is_some() && proxy_user.is_none() {
+            return Err(format!(
+                "line {}: connection {:?} has proxy_password_env, but no user@ in its proxy url to log in as",
+                b.start + 1,
+                b.cfg.name
+            ));
+        }
     }
     Ok(blocks)
 }
@@ -573,6 +586,14 @@ topics = ["#"]
         assert!(e.contains("line 4") && e.contains("proxy_password_env"), "{e}");
         let e = parse("[[connection]]\nname = \"a\"\nurl = \"mqtt://x\"\nproxy = \"http://p\"").unwrap_err();
         assert!(e.contains("port is missing"), "{e}");
+        // A password with no proxy user to log in as.
+        for proxy in ["proxy = \"http://p:8080\"\n", ""] {
+            let e = parse(&format!(
+                "[[connection]]\nname = \"a\"\nurl = \"mqtt://x\"\n{proxy}proxy_password_env = \"PW\""
+            ))
+            .unwrap_err();
+            assert!(e.contains("line 1") && e.contains("no user@"), "{e}");
+        }
     }
 
     #[test]

@@ -322,7 +322,9 @@ fn cli_connection(a: &Args, b: &broker::Broker, saved: Option<&config::ConnCfg>)
     if a.proxy.is_some() {
         c.proxy = a.proxy.clone();
     }
-    if a.proxy_password_from_env {
+    // Only for a proxy with a user to log in as (the file refuses it otherwise).
+    let proxy_user = c.proxy.as_deref().and_then(|u| proxy::Proxy::parse(u, None).ok()?.user);
+    if a.proxy_password_from_env && proxy_user.is_some() {
         c.proxy_password_env = Some("FSS_MQTT_PROXY_PASSWORD".into());
     }
     c.insecure |= a.insecure;

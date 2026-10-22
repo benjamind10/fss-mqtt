@@ -45,7 +45,7 @@ impl Proxy {
             Some((u, _)) if u.contains(':') => {
                 return Err("proxy: a password isn't read from the url; set proxy_password_env".into());
             }
-            Some((u, h)) => (Some(u.to_string()), h),
+            Some((u, h)) => (Some(decode(u)?), h),
             None => (None, rest),
         };
         let (host, port) = match hostport.strip_prefix('[') {
@@ -171,6 +171,9 @@ impl Proxy {
                 auth.extend_from_slice(pw.as_bytes());
                 s.write_all(&auth).map_err(io)?;
                 s.read_exact(&mut r).map_err(io)?;
+                if r[0] != 1 {
+                    return Err("isn't a SOCKS5 proxy (its answer to the login is wrong)".into());
+                }
                 if r[1] != 0 {
                     return Err(format!("refused {user}'s login"));
                 }
@@ -233,6 +236,24 @@ impl Proxy {
         s.read_exact(&mut rest).map_err(io)?;
         Ok(())
     }
+}
+
+/// A URL's percent-encoded text (alice%40corp is alice@corp).
+fn decode(s: &str) -> Result<String, String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok());
+            out.push(hex.ok_or_else(|| format!("proxy: {s:?} has a % that isn't %XX"))?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| format!("proxy: {s:?} isn't UTF-8 once decoded"))
 }
 
 fn io(e: std::io::Error) -> String {
@@ -312,6 +333,9 @@ mod tests {
         assert!(Proxy::parse("http://p", None).unwrap_err().contains("port is missing"));
         assert!(Proxy::parse("ftp://p:21", None).unwrap_err().contains("ftp"));
         assert!(Proxy::parse("p:8080", None).is_err());
+        let p = Proxy::parse("socks5://alice%40corp@p:1080", None).unwrap();
+        assert_eq!(p.user.as_deref(), Some("alice@corp"), "percent-decoded");
+        assert!(Proxy::parse("http://a%4@p:8080", None).is_err());
         let p = Proxy::parse("http://alice@p:8080", None).unwrap();
         assert!(p.password().unwrap_err().contains("proxy_password_env"));
         assert_eq!(Proxy::parse("http://p:8080", None).unwrap().password(), Ok(None));
@@ -358,11 +382,12 @@ mod tests {
             ),
         ] {
             let (p, server) = proxy("http", user, move |mut s| {
-                head(&mut s);
+                let h = head(&mut s);
+                assert!(h.starts_with("CONNECT [::1]:1883 HTTP/1.1\r\n"), "{h}");
                 s.write_all(answer.as_bytes()).unwrap();
             });
             let e = p
-                .connect(Some("x"), "[::1]", 1883, dial, Duration::from_secs(5))
+                .connect(Some("x"), "::1", 1883, dial, Duration::from_secs(5))
                 .unwrap_err();
             assert!(e.starts_with("proxy 127.0.0.1:") && e.contains(want), "{e}");
             server.join().unwrap();

@@ -126,8 +126,10 @@ proxy_password_env = "PROXY_PW"                       # alice's password
 - **Proxies:** `proxy` reaches the broker through an HTTP proxy (`http://host:port`, with CONNECT)
   or a SOCKS5 one (`socks5://host:port`, an `ssh -D` tunnel say), for any kind of broker URL: TLS,
   WebSockets and MQTT run over the tunnel as they would without it, and the broker's name is the
-  proxy's to resolve. A user in the proxy URL logs in with the password in `proxy_password_env`
-  (Basic for HTTP proxies); a password in the URL isn't read. Many proxies only let tunnels
+  proxy's to resolve (with `socks5://` too, which curl takes to resolve locally; `socks5h://` is
+  accepted and means the same). A user in the proxy URL (percent-encoded, as in any URL) logs in
+  with the password in `proxy_password_env` (Basic for HTTP proxies); a password in the URL isn't
+  read, and `proxy_password_env` without a user is an error. Many proxies only let tunnels
   through to port 443, which a broker's `wss://…:443` is made for. Not supported: NTLM or Kerberos
   logins, TLS to the proxy itself, PAC files, and `HTTPS_PROXY`-style variables (`--proxy` and
   `FSS_MQTT_PROXY` are fss-mqtt's own).

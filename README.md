@@ -28,6 +28,8 @@ The Linux binaries are static and run on any distribution. winget isn't set up y
 
 ### OmaMQTT (Omarchy)
 
+![OmaMQTT in Omarchy's Tokyo Night theme: browsing two brokers and charting a topic's numbers; partway through, Omarchy switches to its Osaka Jade theme and OmaMQTT's colours follow; the keys pressed show below](docs/omamqtt.gif)
+
 Started as `omamqtt`, fss-mqtt goes by OmaMQTT and shows the current
 [Omarchy](https://omarchy.org) theme's colours, and changes with the theme while it runs.
 Otherwise it's fss-mqtt, with the same keys, connections file

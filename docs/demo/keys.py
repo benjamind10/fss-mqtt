@@ -22,6 +22,7 @@ The keys of a part of the tape (up to the next comment) line up side by
 side, the newest one lit, until a pause of a few seconds.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -103,6 +104,16 @@ def presses(tape):
     return out, t, on
 
 
+def background(tape):
+    """The terminal's background in the tape's Set Theme, for the strip to
+    match (as 0xrrggbb); black without one."""
+    for line in open(tape, encoding="utf-8"):
+        if line.startswith("Set Theme {"):
+            colour = json.loads(line[len("Set Theme "):]).get("background", "#000000")
+            return "0x" + colour.lstrip("#")
+    return "black"
+
+
 def caps(keys, width):
     """[(start, stop, x, label, newest)]: each key cap while it shows."""
     shown = []  # the row of caps: [x, label, text, since, newest]
@@ -152,7 +163,7 @@ def main():
     font = f"fontfile={FONT}:expansion=none:y_align=font"
     f = []
     if shown:
-        f += [f"pad=iw:ih+{STRIP}:0:0:black", f"drawtext={font}:text=keys:fontsize=17:fontcolor=0x5a5a5a:x=18:y={y + 1}"]
+        f += [f"pad=iw:ih+{STRIP}:0:0:{background(tape)}", f"drawtext={font}:text=keys:fontsize=17:fontcolor=0x5a5a5a:x=18:y={y + 1}"]
     with tempfile.TemporaryDirectory() as work:
         for i, (start, stop, x, label, newest) in enumerate(caps([(t * scale, *k) for t, *k in keys], w)):
             # From a file: the labels need no escaping that way.

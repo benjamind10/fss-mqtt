@@ -57,6 +57,7 @@ fss-mqtt mqtts://broker:8883 -u me         # TLS (system trust store); asks for 
 fss-mqtt broker:8883 --cafile ca.pem       # TLS with your own CA
 fss-mqtt broker:8883 --cafile ca.pem --cert me.pem --key me.key   # mutual TLS
 fss-mqtt wss://broker.example.com:8884/mqtt -u me   # MQTT over WebSockets, with TLS
+fss-mqtt broker:8883 --proxy http://proxy.corp:8080   # through an HTTP proxy (or socks5://)
 fss-mqtt broker -t 'v1/#' -t '$SYS/#'      # several subscriptions
 fss-mqtt                                   # connect the saved connections marked autoconnect
 fss-mqtt -c local -c staging               # connect these saved connections
@@ -100,6 +101,8 @@ name         = "plant"
 url          = "wss://mqtt.example.com/mqtt"          # MQTT over WebSockets
 headers      = ["CF-Access-Client-Id: 1a2b.access"]   # sent with the WebSocket handshake
 headers_env  = ["CF-Access-Client-Secret: CF_SECRET"]  # its value from $CF_SECRET
+proxy        = "http://alice@proxy.corp:8080"         # or "socks5://127.0.0.1:1080"
+proxy_password_env = "PROXY_PW"                       # alice's password
 ```
 
 - **Adding:** connect from the command line (the entry is added or updated, named `user@host:port`
@@ -120,6 +123,14 @@ headers_env  = ["CF-Access-Client-Secret: CF_SECRET"]  # its value from $CF_SECR
   `Upgrade`, `Sec-WebSocket-…`) can't be set, though a `User-Agent` of your own replaces
   fss-mqtt's. A query in a `ws://`/`wss://` URL is sent too, and saved with the connection, but not
   shown in the panel; a signed URL that expires (AWS SigV4, say) stops working when it does.
+- **Proxies:** `proxy` reaches the broker through an HTTP proxy (`http://host:port`, with CONNECT)
+  or a SOCKS5 one (`socks5://host:port`, an `ssh -D` tunnel say), for any kind of broker URL: TLS,
+  WebSockets and MQTT run over the tunnel as they would without it, and the broker's name is the
+  proxy's to resolve. A user in the proxy URL logs in with the password in `proxy_password_env`
+  (Basic for HTTP proxies); a password in the URL isn't read. Many proxies only let tunnels
+  through to port 443, which a broker's `wss://…:443` is made for. Not supported: NTLM or Kerberos
+  logins, TLS to the proxy itself, PAC files, and `HTTPS_PROXY`-style variables (`--proxy` and
+  `FSS_MQTT_PROXY` are fss-mqtt's own).
 - **Saving** rewrites only that connection's block, so your comments elsewhere in the file stay.
   Pausing or resuming a subscription in the panel is saved the same way.
 - **Live:** edits to the file apply while fss-mqtt runs (it checks once a second). New connections
@@ -148,6 +159,7 @@ live) or a capture rule on or off.
 | `--cafile` | | PEM file of CA certificates to trust (implies TLS) |
 | `--cert`, `--key` | | client certificate and key (PEM) for mutual TLS; the key may be encrypted |
 | `--insecure` | | skip TLS certificate verification |
+| `--proxy` | | proxy to reach the broker through: `http://[user@]host:port` or `socks5://[user@]host:port` (also `FSS_MQTT_PROXY`; the user's password from `FSS_MQTT_PROXY_PASSWORD`) |
 | `--capture` | | topic filter to capture to disk (repeatable; see [Capture to disk](#capture-to-disk)) |
 | `--capture-dir` | current directory | where capture files go (also `FSS_MQTT_CAPTURE_DIR`) |
 | `--vim` | | vim keys for moving around (also `FSS_MQTT_KEYS=vim`; see [Vim keys](#vim-keys---vim)) |

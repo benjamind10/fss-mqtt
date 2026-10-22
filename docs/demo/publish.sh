@@ -28,6 +28,7 @@ sample() { # <topic> <file> <content-type> [more mosquitto_pub options]
     pub -r -t "site/$site/$topic" -f "/demo/samples/$file" -D publish content-type "$ct" "$@"
 }
 sample turbine/T01/fastlog fastlog.parquet application/vnd.apache.parquet -D publish user-property TurbineId T01
+sample turbine/T01/daylog daylog.parquet application/vnd.apache.parquet -D publish user-property TurbineId T01
 sample turbine/T02/events events.avro application/avro -D publish user-property TurbineId T02
 sample turbine/T03/vibration samples.arrow application/vnd.apache.arrow.file -D publish user-property TurbineId T03
 sample turbine/T04/reading reading.pb application/x-protobuf -D publish user-property TurbineId T04

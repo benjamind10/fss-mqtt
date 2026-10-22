@@ -52,6 +52,20 @@ fastlog = pa.table({
 pq.write_table(fastlog, "fastlog.parquet", compression="snappy", row_group_size=n, store_schema=False)
 check("fastlog.parquet")
 
+# Parquet, bigger than --max-payload on purpose: a day of one-minute
+# averages, for the chart to scroll through (the newest message of a table
+# topic is kept whole for its chart).
+n = 24 * 60
+day = dt.datetime(2026, 10, 7, tzinfo=dt.timezone.utc)
+wind = [max(0.5, 8 + 4 * math.sin(i / 180) + 2 * math.sin(i / 23) + (i * 7919 % 100) / 100) for i in range(n)]
+daylog = pa.table({
+    "Timestamp": pa.array([day + dt.timedelta(minutes=i) for i in range(n)], pa.timestamp("ms", tz="UTC")),
+    "ActivePower": pa.array([round(min(3600.0, 3600 * (w / 12) ** 3), 1) for w in wind]),
+    "WindSpeed": pa.array([round(w, 2) for w in wind], pa.float32()),
+    "RotorRpm": pa.array([round(min(16.0, 8 + w * 0.7), 2) for w in wind], pa.float32()),
+}).replace_schema_metadata({b"ProviderName": b"TurbineDaylog", b"Version": b"1.0.0"})
+pq.write_table(daylog, "daylog.parquet", compression="snappy", store_schema=False)
+
 # Avro container file: the turbine event log.
 schema = fastavro.parse_schema({
     "type": "record", "name": "TurbineEvent", "namespace": "energy.wind",

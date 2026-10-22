@@ -24,11 +24,28 @@ const OURS: [&str; 6] = [
 ];
 
 /// What the opening request asks for: the path (with any query) and the
-/// connection's own headers.
+/// connection's own headers, some with their values in environment
+/// variables (read when connecting, not when the file is).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Upgrade {
     pub path: String,
     pub headers: Vec<(String, String)>,
+    /// (name, environment variable)
+    pub headers_env: Vec<(String, String)>,
+}
+
+impl Upgrade {
+    /// All the headers to send, those from the environment read now.
+    pub fn headers(&self) -> Result<Vec<(String, String)>, String> {
+        let mut out = self.headers.clone();
+        for (name, var) in &self.headers_env {
+            match std::env::var(var) {
+                Ok(v) if !v.is_empty() => out.push(header(&format!("{name}: {v}"))?),
+                _ => return Err(format!("the {name} header is to come from ${var}, which isn't set")),
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// A header from the connections file, "Name: value": a name a request can
@@ -86,7 +103,14 @@ fn accept(key: &str) -> String {
 
 /// Opens the WebSocket on `s`, to `host`:`port` (`tls` for wss): the
 /// request, then the server's 101 checked. `s` should have a read timeout.
-pub fn handshake<S: Read + Write>(mut s: S, host: &str, port: u16, tls: bool, up: &Upgrade) -> Result<Ws<S>, String> {
+pub fn handshake<S: Read + Write>(
+    mut s: S,
+    host: &str,
+    port: u16,
+    tls: bool,
+    up: &Upgrade,
+    headers: &[(String, String)],
+) -> Result<Ws<S>, String> {
     let key = crate::base64::encode(&random::<16>().map_err(|e| e.to_string())?);
     let host = if host.contains(':') {
         format!("[{host}]")
@@ -99,12 +123,14 @@ pub fn handshake<S: Read + Write>(mut s: S, host: &str, port: u16, tls: bool, up
     };
     let mut req = format!(
         "GET {} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-         Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\n\
-         User-Agent: fss-mqtt/{}\r\n",
+         Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\n",
         up.path,
-        env!("CARGO_PKG_VERSION")
     );
-    for (k, v) in &up.headers {
+    // The connection's own User-Agent, if it sets one (a gateway may look at it).
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent")) {
+        req += &format!("User-Agent: fss-mqtt/{}\r\n", env!("CARGO_PKG_VERSION"));
+    }
+    for (k, v) in headers {
         req += &format!("{k}: {v}\r\n");
     }
     req += "\r\n";
@@ -143,6 +169,11 @@ pub fn handshake<S: Read + Write>(mut s: S, host: &str, port: u16, tls: bool, up
         .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim()))
         .collect();
     let get = |k: &str| headers.iter().find(|(n, _)| n == k).map(|(_, v)| *v);
+    let upgraded = get("upgrade").is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+        && get("connection").is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")));
+    if !upgraded {
+        return Err("websocket: the broker's 101 doesn't say it upgraded (Upgrade, Connection)".into());
+    }
     if get("sec-websocket-accept") != Some(accept(&key).as_str()) {
         return Err("websocket: the broker's handshake doesn't match the request (Sec-WebSocket-Accept)".into());
     }
@@ -197,6 +228,9 @@ impl<S: Read + Write> Ws<S> {
             return Err(bad("a frame with reserved bits set"));
         }
         let op = b[0] & 0x0f;
+        if op >= 0x8 && (b[0] & 0x80 == 0 || b[1] & 0x7f > 125) {
+            return Err(bad("a control frame in parts, or over 125 bytes"));
+        }
         let (len, mut at) = match b[1] & 0x7f {
             126 if b.len() >= 4 => (u16::from_be_bytes([b[2], b[3]]) as u64, 4),
             127 if b.len() >= 10 => (u64::from_be_bytes(b[2..10].try_into().unwrap()), 10),
@@ -375,6 +409,7 @@ mod tests {
         Upgrade {
             path: path.into(),
             headers: vec![("CF-Access-Client-Id".into(), "abc.access".into())],
+            ..Default::default()
         }
     }
 
@@ -421,7 +456,7 @@ mod tests {
             s.write_all(&frame(0x8, &1000u16.to_be_bytes())).unwrap();
             assert_eq!(read_frame(&mut s), (0x8, 1000u16.to_be_bytes().to_vec()));
         });
-        let mut ws = handshake(c, "localhost", 1884, false, &up("/mqtt?x=1")).unwrap();
+        let mut ws = handshake(c, "localhost", 1884, false, &up("/mqtt?x=1"), &up("").headers).unwrap();
         // CONNACK's bytes, across the two frames and the pause.
         let mut got = Vec::new();
         let mut buf = [0u8; 64];
@@ -464,16 +499,17 @@ mod tests {
             s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
                 .unwrap();
         });
-        let e = handshake(c, "h", 80, false, &up("/nope")).err().unwrap();
+        let e = handshake(c, "h", 80, false, &up("/nope"), &[]).err().unwrap();
         assert!(e.contains("refused the upgrade: HTTP 404 Not Found"), "{e}");
         server.join().unwrap();
 
         let (c, server) = pair(|mut s| {
             read_request(&mut s);
-            let r = "HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: nope\r\n\r\n";
+            let r = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                     Sec-WebSocket-Accept: nope\r\n\r\n";
             s.write_all(r.as_bytes()).unwrap();
         });
-        let e = handshake(c, "h", 80, false, &up("/mqtt")).err().unwrap();
+        let e = handshake(c, "h", 80, false, &up("/mqtt"), &[]).err().unwrap();
         assert!(e.contains("Sec-WebSocket-Accept"), "{e}");
         server.join().unwrap();
 
@@ -481,14 +517,78 @@ mod tests {
             let (_, h) = read_request(&mut s);
             assert_eq!(get(&h, "host"), "h", "the default port goes unnamed");
             let r = format!(
-                "HTTP/1.1 101 OK\r\nSec-WebSocket-Accept: {}\r\nSec-WebSocket-Protocol: chat\r\n\r\n",
+                "HTTP/1.1 101 OK\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\
+                 Sec-WebSocket-Accept: {}\r\nSec-WebSocket-Protocol: chat\r\n\r\n",
                 accept(get(&h, "sec-websocket-key"))
             );
             s.write_all(r.as_bytes()).unwrap();
         });
-        let e = handshake(c, "h", 80, false, &up("/mqtt")).err().unwrap();
+        let e = handshake(c, "h", 80, false, &up("/mqtt"), &[]).err().unwrap();
         assert!(e.contains("\"chat\""), "{e}");
         server.join().unwrap();
+
+        // A 101 that doesn't say it upgraded.
+        let (c, server) = pair(|mut s| {
+            let (_, h) = read_request(&mut s);
+            let r = format!(
+                "HTTP/1.1 101 OK\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+                accept(get(&h, "sec-websocket-key"))
+            );
+            s.write_all(r.as_bytes()).unwrap();
+        });
+        let e = handshake(c, "h", 80, false, &up("/mqtt"), &[]).err().unwrap();
+        assert!(e.contains("Upgrade, Connection"), "{e}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn its_own_user_agent_and_bad_control_frames() {
+        let (c, server) = pair(|mut s| {
+            let (_, h) = read_request(&mut s);
+            assert_eq!(h.iter().filter(|(k, _)| k == "user-agent").count(), 1);
+            assert_eq!(get(&h, "user-agent"), "plant-gateway/2");
+            let r = format!(
+                "HTTP/1.1 101 OK\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+                accept(get(&h, "sec-websocket-key"))
+            );
+            s.write_all(r.as_bytes()).unwrap();
+            // A ping without FIN: a protocol error.
+            s.write_all(&[0x09, 0x00]).unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+        let agent = [("User-Agent".to_string(), "plant-gateway/2".to_string())];
+        let mut ws = handshake(c, "h", 80, false, &up("/mqtt"), &agent).unwrap();
+        let mut buf = [0u8; 8];
+        let e = loop {
+            match ws.read(&mut buf) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {}
+                other => break other.unwrap_err(),
+            }
+        };
+        assert!(e.to_string().contains("control frame"), "{e}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn headers_from_the_environment_when_connecting() {
+        let var = format!("FSS_MQTT_TEST_HEADER_{}", std::process::id());
+        let up = Upgrade {
+            headers: vec![("X-A".into(), "1".into())],
+            headers_env: vec![("Authorization".into(), var.clone())],
+            ..Default::default()
+        };
+        let e = up.headers().unwrap_err();
+        assert!(
+            e.contains("Authorization") && e.contains(&var) && e.contains("isn't set"),
+            "{e}"
+        );
+        // SAFETY: the variable is this test's own, read by nothing else.
+        unsafe { std::env::set_var(&var, "Bearer t") };
+        assert_eq!(
+            up.headers().unwrap(),
+            vec![("X-A".into(), "1".into()), ("Authorization".into(), "Bearer t".into())]
+        );
+        unsafe { std::env::remove_var(&var) };
     }
 
     #[test]

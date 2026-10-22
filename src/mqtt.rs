@@ -246,11 +246,11 @@ impl Conn {
     }
 
     /// The same connection carrying a WebSocket, once its handshake is done.
-    fn upgrade(self, cfg: &Config, up: &crate::ws::Upgrade) -> Result<Conn, String> {
+    fn upgrade(self, cfg: &Config, up: &crate::ws::Upgrade, headers: &[(String, String)]) -> Result<Conn, String> {
         use crate::ws::handshake;
         Ok(match self {
-            Conn::Plain(s) => Conn::Ws(Box::new(handshake(s, &cfg.host, cfg.port, false, up)?)),
-            Conn::Tls(s) => Conn::Wss(Box::new(handshake(*s, &cfg.host, cfg.port, true, up)?)),
+            Conn::Plain(s) => Conn::Ws(Box::new(handshake(s, &cfg.host, cfg.port, false, up, headers)?)),
+            Conn::Tls(s) => Conn::Wss(Box::new(handshake(*s, &cfg.host, cfg.port, true, up, headers)?)),
             ws => ws,
         })
     }
@@ -605,6 +605,11 @@ fn publish_id(o: &Outgoing, ids: &mut Ids, outbox: &Outbox, lim: &Limits) -> Res
 
 /// One connection's lifetime.
 fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut Inbox, outbox: &mut Outbox) -> End {
+    // A header from an unset environment variable won't be set by retrying.
+    let ws_headers = match cfg.ws.as_ref().map(|up| up.headers()).transpose() {
+        Ok(h) => h.unwrap_or_default(),
+        Err(e) => return End::Halted(e),
+    };
     let tls = match tls_config(cfg) {
         Ok(t) => t,
         Err(e @ TlsError::Key(..)) => return End::Halted(e.to_string()),
@@ -630,7 +635,7 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut I
     };
     let _ = conn.tcp().set_read_timeout(Some(CONNECT_TIMEOUT));
     if let Some(up) = &cfg.ws {
-        conn = match conn.upgrade(cfg, up) {
+        conn = match conn.upgrade(cfg, up, &ws_headers) {
             Ok(c) => c,
             Err(e) => return End::Failed(e),
         };
@@ -1981,6 +1986,7 @@ mod e2e {
             Some(crate::ws::Upgrade {
                 path: "/mqtt".into(),
                 headers: vec![("X-Test".into(), "fss-mqtt".into())],
+                ..Default::default()
             })
         };
         for (port, tls, tcp_port) in [(18890, false, "18830"), (18891, true, "18883")] {

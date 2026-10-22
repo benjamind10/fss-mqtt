@@ -40,6 +40,10 @@ pub fn parse_broker(s: &str, tls_wanted: bool) -> Result<Broker, String> {
         "wss" => (true, true),
         other => return Err(format!("broker: unsupported scheme {other:?}")),
     };
+    // Credentials off first (up to the last @ before a path), so a ? or #
+    // in an unencoded password isn't taken for a query or a fragment.
+    let auth = &rest[..rest.find('/').unwrap_or(rest.len())];
+    let rest = auth.rfind('@').map_or(rest, |i| &rest[i + 1..]);
     let rest = rest.split('#').next().unwrap_or("");
     let (hostport, path) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
     let ws = websocket.then(|| match path {
@@ -47,7 +51,6 @@ pub fn parse_broker(s: &str, tls_wanted: bool) -> Result<Broker, String> {
         p if p.starts_with('?') => format!("/mqtt{p}"),
         p => p.to_string(),
     });
-    let hostport = hostport.rsplit_once('@').map(|(_, h)| h).unwrap_or(hostport);
     let (host, port) = if let Some(r) = hostport.strip_prefix('[') {
         // [ipv6]:port
         let (h, p) = r.split_once(']').ok_or("broker: bad IPv6 address")?;
@@ -104,7 +107,16 @@ pub fn mqtt_config(
     let ws = match b.ws {
         Some(path) => Some(crate::ws::Upgrade {
             path,
-            headers: headers(c)?,
+            headers: c
+                .headers
+                .iter()
+                .map(|h| crate::ws::header(h))
+                .collect::<Result<_, _>>()?,
+            headers_env: c
+                .headers_env
+                .iter()
+                .map(|h| crate::ws::header(h))
+                .collect::<Result<_, _>>()?,
         }),
         None if c.headers.is_empty() && c.headers_env.is_empty() => None,
         None => return Err("headers are sent with a WebSocket handshake: the url needs ws:// or wss://".into()),
@@ -125,22 +137,6 @@ pub fn mqtt_config(
         qos: c.qos,
         ws,
     })
-}
-
-/// A connection's headers, with headers_env's values from the environment.
-fn headers(c: &ConnCfg) -> Result<Vec<(String, String)>, String> {
-    let mut out = Vec::new();
-    for h in &c.headers {
-        out.push(crate::ws::header(h)?);
-    }
-    for h in &c.headers_env {
-        let (name, var) = crate::ws::header(h)?;
-        match std::env::var(&var) {
-            Ok(v) if !v.is_empty() => out.push(crate::ws::header(&format!("{name}: {v}"))?),
-            _ => return Err(format!("headers_env: {name} is to come from ${var}, which isn't set")),
-        }
-    }
-    Ok(out)
 }
 
 /// The broker URL as shown in the UI (no credentials).
@@ -184,5 +180,10 @@ mod tests {
         assert_eq!(b.display, "wss://[::1]:8884/mqtt");
         // Not for MQTT over TCP: a path there means nothing.
         assert!(parse_broker("mqtt://host/x", false).unwrap().ws.is_none());
+        // An unencoded ? or # in a password is still the password's.
+        let b = parse_broker("mqtt://me:pa?ss@host", false).unwrap();
+        assert!(b.host == "host" && b.port == 1883, "{}", b.url);
+        let b = parse_broker("ws://u:p#w@host:8080/ws", false).unwrap();
+        assert!(b.host == "host" && b.port == 8080 && b.ws.as_deref() == Some("/ws"));
     }
 }

@@ -115,8 +115,9 @@ headers_env  = ["CF-Access-Client-Secret: CF_SECRET"]  # its value from $CF_SECR
   gateway that wants them (Cloudflare Access, an `Authorization: Bearer …` check, an API key).
   `headers` are sent as written; for a secret, `headers_env` names the environment variable that
   holds the value, so the secret stays out of the file. The handshake's own headers (`Host`,
-  `Upgrade`, `Sec-WebSocket-…`) can't be set. A query in a `ws://`/`wss://` URL is sent too, but
-  not shown in the panel.
+  `Upgrade`, `Sec-WebSocket-…`) can't be set, though a `User-Agent` of your own replaces
+  fss-mqtt's. A query in a `ws://`/`wss://` URL is sent too, and saved with the connection, but not
+  shown in the panel; a signed URL that expires (AWS SigV4, say) stops working when it does.
 - **Saving** rewrites only that connection's block, so your comments elsewhere in the file stay.
   Pausing or resuming a subscription in the panel is saved the same way.
 - **Live:** edits to the file apply while fss-mqtt runs (it checks once a second). New connections

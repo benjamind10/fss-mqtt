@@ -206,6 +206,8 @@ pub fn how(exe: &Path) -> How {
     if lower.contains("/target/release/") || lower.contains("/target/debug/") {
         return How::Source;
     }
+    // Omarchy's package installs the program itself under this name
+    // (pkgbuilds/omamqtt in omacom/omarchy-pkgs); a link would resolve away.
     if s == "/usr/bin/omamqtt" {
         return How::Omarchy;
     }

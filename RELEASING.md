@@ -64,8 +64,10 @@ The `omamqtt` package for [Omarchy](https://omarchy.org)'s package repository is
 [omacom/omarchy-pkgs](https://github.com/omacom/omarchy-pkgs) (`pkgbuilds/omamqtt`), proposed there
 by a PR after the first release with OmaMQTT. Once it's in, a bot there follows this repository's
 GitHub releases and proposes each new version itself, so a release needs nothing more. The recipe
-builds the release's source and installs `packaging/omarchy/omamqtt.desktop` and `omamqtt.svg`
-from it: moving those means changing the recipe too.
+builds the release's source and installs the program as `/usr/bin/omamqtt` (not a link to it:
+`how()` in `src/update.rs` knows Omarchy's package by that path), and
+`packaging/omarchy/omamqtt.desktop` and `omamqtt.svg` from it. Changing any of those means
+changing the recipe too.
 
 ### winget (Windows)
 

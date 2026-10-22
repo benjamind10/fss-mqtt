@@ -18,6 +18,8 @@
 //! url          = "wss://mqtt.example.com/mqtt"         # MQTT over WebSockets
 //! headers      = ["CF-Access-Client-Id: 1a2b.access"]  # sent with its handshake
 //! headers_env  = ["CF-Access-Client-Secret: CF_SECRET"] # the value from $CF_SECRET
+//! proxy        = "http://alice@proxy.corp:8080"         # or socks5://host:port
+//! proxy_password_env = "PROXY_PW"                       # alice's password
 //! ```
 //!
 //! Passwords are never written to the file. Saving an entry rewrites only that
@@ -48,6 +50,10 @@ pub struct ConnCfg {
     /// "Name: VAR" for a value read from the environment variable VAR.
     pub headers: Vec<String>,
     pub headers_env: Vec<String>,
+    /// A proxy to reach the broker through (proxy.rs), and the environment
+    /// variable with its user's password.
+    pub proxy: Option<String>,
+    pub proxy_password_env: Option<String>,
 }
 
 /// Default location: $XDG_CONFIG_HOME or ~/.config on Unix, %APPDATA% on Windows.
@@ -154,6 +160,8 @@ pub(crate) fn render(c: &ConnCfg) -> String {
         ("password_env", &c.password_env),
         ("key_password_env", &c.key_password_env),
         ("client_id", &c.client_id),
+        ("proxy", &c.proxy),
+        ("proxy_password_env", &c.proxy_password_env),
     ] {
         if let Some(v) = v {
             kv(k, quote(v));
@@ -289,6 +297,19 @@ fn parse_blocks(text: &str) -> Result<Vec<Block>, String> {
         if b.cfg.url.is_empty() {
             return Err(format!("line {}: connection {:?} has no url", b.start + 1, b.cfg.name));
         }
+        // A login that would never be sent: say so rather than ignore it.
+        let proxy_user = b
+            .cfg
+            .proxy
+            .as_deref()
+            .and_then(|u| crate::proxy::Proxy::parse(u, None).ok()?.user);
+        if b.cfg.proxy_password_env.is_some() && proxy_user.is_none() {
+            return Err(format!(
+                "line {}: connection {:?} has proxy_password_env, but no user@ in its proxy url to log in as",
+                b.start + 1,
+                b.cfg.name
+            ));
+        }
     }
     Ok(blocks)
 }
@@ -413,6 +434,12 @@ fn set(c: &mut ConnCfg, key: &str, v: Value) -> Result<(), String> {
         "password_env" => c.password_env = Some(s(v)?),
         "key_password_env" => c.key_password_env = Some(s(v)?),
         "client_id" => c.client_id = Some(s(v)?),
+        "proxy" => {
+            let url = s(v)?;
+            crate::proxy::Proxy::parse(&url, None)?;
+            c.proxy = Some(url);
+        }
+        "proxy_password_env" => c.proxy_password_env = Some(s(v)?),
         "insecure" | "autoconnect" => {
             let Value::Bool(b) = v else {
                 return Err(format!("{key} must be true or false"));
@@ -544,6 +571,29 @@ topics = ["#"]
         assert!(bad("headers = [\"Host: elsewhere\"]").contains("handshake itself"));
         assert!(bad("headers_env = [\"Authorization: Bearer x\"]").contains("environment variable"));
         assert!(bad("headers = \"X-A: y\"").contains("list of strings"));
+    }
+
+    #[test]
+    fn proxies() {
+        let text = "[[connection]]\nname = \"p\"\nurl = \"mqtts://b:8883\"\n\
+                    proxy = \"socks5://bob@127.0.0.1:1080\"\nproxy_password_env = \"SOCKS_PW\"\n";
+        let c = parse(text).unwrap().remove(0);
+        assert_eq!(c.proxy.as_deref(), Some("socks5://bob@127.0.0.1:1080"));
+        assert_eq!(c.proxy_password_env.as_deref(), Some("SOCKS_PW"));
+        assert_eq!(parse(&upsert("", &c).unwrap()).unwrap(), vec![c]);
+        let e =
+            parse("[[connection]]\nname = \"a\"\nurl = \"mqtt://x\"\nproxy = \"http://bob:pw@p:8080\"").unwrap_err();
+        assert!(e.contains("line 4") && e.contains("proxy_password_env"), "{e}");
+        let e = parse("[[connection]]\nname = \"a\"\nurl = \"mqtt://x\"\nproxy = \"http://p\"").unwrap_err();
+        assert!(e.contains("port is missing"), "{e}");
+        // A password with no proxy user to log in as.
+        for proxy in ["proxy = \"http://p:8080\"\n", ""] {
+            let e = parse(&format!(
+                "[[connection]]\nname = \"a\"\nurl = \"mqtt://x\"\n{proxy}proxy_password_env = \"PW\""
+            ))
+            .unwrap_err();
+            assert!(e.contains("line 1") && e.contains("no user@"), "{e}");
+        }
     }
 
     #[test]

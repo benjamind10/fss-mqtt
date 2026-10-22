@@ -30,6 +30,8 @@ pub struct Config {
     pub qos: u8,
     /// MQTT over WebSockets: what the opening handshake asks for.
     pub ws: Option<crate::ws::Upgrade>,
+    /// A proxy to reach the broker through.
+    pub proxy: Option<crate::proxy::Proxy>,
 }
 
 impl Config {
@@ -605,9 +607,14 @@ fn publish_id(o: &Outgoing, ids: &mut Ids, outbox: &Outbox, lim: &Limits) -> Res
 
 /// One connection's lifetime.
 fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut Inbox, outbox: &mut Outbox) -> End {
-    // A header from an unset environment variable won't be set by retrying.
+    // A header or a password from an unset environment variable won't be
+    // set by retrying.
     let ws_headers = match cfg.ws.as_ref().map(|up| up.headers()).transpose() {
         Ok(h) => h.unwrap_or_default(),
+        Err(e) => return End::Halted(e),
+    };
+    let proxy_password = match cfg.proxy.as_ref().map(|p| p.password()).transpose() {
+        Ok(p) => p.flatten(),
         Err(e) => return End::Halted(e),
     };
     let tls = match tls_config(cfg) {
@@ -615,7 +622,11 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut I
         Err(e @ TlsError::Key(..)) => return End::Halted(e.to_string()),
         Err(e) => return End::Failed(e.to_string()),
     };
-    let tcp = match dial(&cfg.host, cfg.port) {
+    let tcp = match &cfg.proxy {
+        None => dial(&cfg.host, cfg.port),
+        Some(p) => p.connect(proxy_password.as_deref(), &cfg.host, cfg.port, dial, CONNECT_TIMEOUT),
+    };
+    let tcp = match tcp {
         Ok(s) => s,
         Err(e) => return End::Failed(e),
     };
@@ -1412,6 +1423,7 @@ mod tests {
             password: None,
             qos: 0,
             ws: None,
+            proxy: None,
         };
         (Arc::new(Mutex::new(st)), cfg)
     }
@@ -1644,6 +1656,7 @@ mod e2e {
             password: None,
             qos: 2,
             ws: None,
+            proxy: None,
         };
         (Arc::new(Mutex::new(st)), cfg)
     }
@@ -2029,6 +2042,119 @@ mod e2e {
             .unwrap();
             assert_eq!(wait_for(&st, 3), 3, "{port}: published over the WebSocket");
             assert_eq!(latest(&st, "ews/echo").unwrap().payload, b"over the websocket");
+            tx.send(Cmd::Disconnect).unwrap();
+        }
+    }
+
+    /// A proxy for the tests that follow: HTTP CONNECT, or SOCKS5 without a
+    /// login, relaying to wherever it's asked. Its port.
+    fn relay(socks: bool) -> u16 {
+        use std::net::{TcpListener, TcpStream};
+        fn target_http(c: &mut TcpStream) -> Option<String> {
+            let mut h = Vec::new();
+            let mut b = [0u8; 1];
+            while !h.ends_with(b"\r\n\r\n") {
+                c.read_exact(&mut b).ok()?;
+                h.push(b[0]);
+            }
+            let line = String::from_utf8(h).ok()?;
+            Some(line.strip_prefix("CONNECT ")?.split(' ').next()?.to_string())
+        }
+        fn target_socks(c: &mut TcpStream) -> Option<String> {
+            let mut b = [0u8; 2];
+            c.read_exact(&mut b).ok()?;
+            let mut m = vec![0u8; b[1] as usize];
+            c.read_exact(&mut m).ok()?;
+            c.write_all(&[5, 0]).ok()?;
+            let mut r = [0u8; 4];
+            c.read_exact(&mut r).ok()?;
+            let host = match r[3] {
+                1 => {
+                    let mut a = [0u8; 4];
+                    c.read_exact(&mut a).ok()?;
+                    std::net::Ipv4Addr::from(a).to_string()
+                }
+                3 => {
+                    let mut n = [0u8; 1];
+                    c.read_exact(&mut n).ok()?;
+                    let mut name = vec![0u8; n[0] as usize];
+                    c.read_exact(&mut name).ok()?;
+                    String::from_utf8(name).ok()?
+                }
+                _ => return None,
+            };
+            let mut p = [0u8; 2];
+            c.read_exact(&mut p).ok()?;
+            Some(format!("{host}:{}", u16::from_be_bytes(p)))
+        }
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { continue };
+                std::thread::spawn(move || {
+                    let target = if socks {
+                        target_socks(&mut c)
+                    } else {
+                        target_http(&mut c)
+                    };
+                    let Some(Ok(up)) = target.map(TcpStream::connect) else {
+                        return;
+                    };
+                    let ok: &[u8] = if socks {
+                        &[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]
+                    } else {
+                        b"HTTP/1.1 200 Connection established\r\n\r\n"
+                    };
+                    if c.write_all(ok).is_err() {
+                        return;
+                    }
+                    let (mut c2, mut up2) = (c.try_clone().unwrap(), up.try_clone().unwrap());
+                    std::thread::spawn(move || std::io::copy(&mut up2, &mut c2));
+                    let mut up = up;
+                    let _ = std::io::copy(&mut c, &mut up);
+                });
+            }
+        });
+        port
+    }
+
+    /// Through a proxy: plain MQTT through HTTP CONNECT, and MQTT over a
+    /// WebSocket over TLS through SOCKS5 (the proxy resolving "localhost").
+    #[test]
+    #[ignore]
+    fn e2e_proxies() {
+        let ca = std::env::var("FSS_TEST_CA").expect("set FSS_TEST_CA");
+        let http = relay(false);
+        let socks = relay(true);
+        for (proxy, port, tls, ws) in [
+            (format!("http://127.0.0.1:{http}"), 18830, false, false),
+            (format!("socks5://127.0.0.1:{socks}"), 18891, true, true),
+        ] {
+            let (st, mut cfg) = setup(port, tls, tls.then_some(ca.as_str()), &["eproxy/#"]);
+            cfg.client_id = format!("e2e-proxy-{port}");
+            cfg.proxy = Some(crate::proxy::Proxy::parse(&proxy, None).unwrap());
+            if ws {
+                cfg.ws = Some(crate::ws::Upgrade {
+                    path: "/mqtt".into(),
+                    ..Default::default()
+                });
+            }
+            let tx = spawn(cfg, st.clone(), true);
+            let s = wait_state(&st, ConnState::Connected);
+            assert!(
+                s.state == ConnState::Connected && s.err.is_none(),
+                "{proxy} to {port}: {:?}",
+                s.err
+            );
+            if tls {
+                #[rustfmt::skip]
+                publish(&["-p", "18883", "-h", "localhost", "--cafile", &ca, "-q", "1", "-t", "eproxy/a", "-m", "through"]);
+            } else {
+                publish(&["-p", "18830", "-q", "1", "-t", "eproxy/a", "-m", "through"]);
+            }
+            assert_eq!(wait_for(&st, 1), 1, "{proxy} to {port}");
+            assert_eq!(latest(&st, "eproxy/a").unwrap().payload, b"through");
             tx.send(Cmd::Disconnect).unwrap();
         }
     }

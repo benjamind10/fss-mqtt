@@ -139,6 +139,11 @@ pub fn mqtt_config(
         password,
         qos: c.qos,
         ws,
+        proxy: c
+            .proxy
+            .as_deref()
+            .map(|u| crate::proxy::Proxy::parse(u, c.proxy_password_env.clone()))
+            .transpose()?,
     })
 }
 

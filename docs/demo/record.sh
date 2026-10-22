@@ -37,7 +37,9 @@ docker run --rm --network $net -v "$root:/vhs" -v "$bin:/usr/local/bin/fss-mqtt:
 # tape with a "# keys.py" line.
 docker run --rm -v "$root:/vhs" --entrypoint python3 ghcr.io/charmbracelet/vhs \
     docs/demo/keys.py "$tape" "$video" "$gif"
-# The theme needs few colours; fewer in the palette roughly halves the file.
+# A theme needs few colours; fewer in the palette roughly halves the file.
+# A tape showing more than one theme says how many it needs: "# colours: 64".
+colours=$(sed -n 's/^# colours: \([0-9]*\)$/\1/p' "$root/$tape")
 docker run --rm -v "$root:/vhs" alpine:3 \
-    sh -c "apk add -q gifsicle && gifsicle -b -O3 --colors 32 '/vhs/$gif'"
+    sh -c "apk add -q gifsicle && gifsicle -b -O3 --colors ${colours:-32} '/vhs/$gif'"
 ls -lh "$root/$gif"

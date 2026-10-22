@@ -6,8 +6,9 @@ that line are shown).
 Usage: keys.py <tape> <video> <gif>   (runs in the VHS image, which has
 python3, ffmpeg and the font; record.sh runs it). The GIF is made in two
 passes, its palette first, so no frame is held in memory however long the
-tape. The key caps need ffmpeg 6.1 or later (drawtext's boxw, boxh,
-text_align and y_align); the image has 7.1.
+tape. It needs ffmpeg 7.0 or later, which reads the filters from a file
+(-/filter_complex); the key caps need 6.1 (drawtext's boxw, boxh, text_align
+and y_align). The image has 7.1.
 
 When each key was pressed is worked out from the tape as VHS plays it: Type
 waits TypingSpeed (or its @time) after each character, Enter, Escape and the
@@ -61,8 +62,9 @@ def seconds(s):
 
 def presses(tape):
     """[(time, label, text, part)] for the keys after the "# keys.py" line
-    (none without one), and the tape's length: `text` numbers the Type a
-    character of text is from, `part` the comment the key comes after."""
+    (none without one), the tape's length, and whether it has that line:
+    `text` numbers the Type a character of text is from, `part` the comment
+    the key comes after."""
     speed, t, shown, on, part = 0.05, 0.0, True, False, 0
     out = []
     for n, raw in enumerate(open(tape, encoding="utf-8")):
@@ -98,7 +100,7 @@ def presses(tape):
                 if on:
                     out.append((t, NAMES[name], None, part))
                 t += wait
-    return out, t
+    return out, t, on
 
 
 def caps(keys, width):
@@ -143,8 +145,7 @@ def probe(gif, entries, stream=()):
 
 def main():
     tape, video, gif = sys.argv[1:4]
-    keys, length = presses(tape)
-    shown = any(line.startswith("# keys.py") for line in open(tape, encoding="utf-8"))
+    keys, length, shown = presses(tape)
     scale = float(probe(video, "format=duration")) / length if length else 1
     w, h = (int(v) for v in probe(video, "stream=width,height", ["-select_streams", "v:0"]).split(","))
     y = h + (STRIP - CAP_H) // 2

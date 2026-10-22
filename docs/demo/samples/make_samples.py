@@ -65,6 +65,7 @@ daylog = pa.table({
     "RotorRpm": pa.array([round(min(16.0, 8 + w * 0.7), 2) for w in wind], pa.float32()),
 }).replace_schema_metadata({b"ProviderName": b"TurbineDaylog", b"Version": b"1.0.0"})
 pq.write_table(daylog, "daylog.parquet", compression="snappy", store_schema=False)
+assert os.path.getsize("daylog.parquet") > MAX_PAYLOAD, "daylog.parquet must be bigger than --max-payload"
 
 # Avro container file: the turbine event log.
 schema = fastavro.parse_schema({

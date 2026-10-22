@@ -10,6 +10,8 @@ ln -sf "$(command -v fss-mqtt)" ~/bin/omamqtt
 export PATH="$HOME/bin:$PATH" PS1='$ '
 omamqtt() {
     # Started from a subshell, the timer is no job of this shell's to report.
+    # 15 s from here falls in omamqtt.tape's "Sleep 5s", with the chart on
+    # screen from about 13 to 18 s: change one, change the other.
     ( (sleep 15 && ln -sfn ../themes/osaka-jade ~/.config/omarchy/current/theme) >/dev/null 2>&1 & )
     command omamqtt "$@"
 }

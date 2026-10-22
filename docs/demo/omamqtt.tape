@@ -55,6 +55,7 @@ Down
 Sleep 1s
 
 # Omarchy switches to its Osaka Jade theme; OmaMQTT follows within a second.
+# (The switch is omarchy.sh's timer, 15 s after the Enter above.)
 Sleep 5s
 
 # The rest in the new colours: a day of minutes scrolled, a message in full.

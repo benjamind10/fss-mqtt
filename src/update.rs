@@ -267,6 +267,11 @@ pub fn start(how: &How, version: &str) -> Result<Job, String> {
                     .into(),
             );
         }
+        How::Package if crate::brand::oma() => {
+            return Err(format!(
+                "OmaMQTT {version} comes with Omarchy's updates: omarchy-update"
+            ));
+        }
         How::Package => {
             return Err(format!(
                 "this fss-mqtt came with a package manager: update it there, or get {version} from {}",

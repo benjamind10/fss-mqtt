@@ -26,6 +26,20 @@ scoop install fss-mqtt
 The Linux binaries are static and run on any distribution. winget isn't set up yet
 (see [RELEASING.md](RELEASING.md)).
 
+### OmaMQTT (Omarchy)
+
+Started as `omamqtt`, fss-mqtt goes by OmaMQTT and shows the current
+[Omarchy](https://omarchy.org) theme's colours, and changes with the theme while it runs.
+Otherwise it's fss-mqtt, with the same keys, connections file
+(`~/.config/fss-mqtt/connections.toml`) and session. Without Omarchy it keeps its own colours.
+What makes it OmaMQTT is the name it's started by, so a link does it:
+
+```sh
+ln -s "$(command -v fss-mqtt)" ~/.local/bin/omamqtt
+```
+
+`packaging/omarchy` has its launcher entry and icon, for a package to install.
+
 From source (Rust 1.88+):
 
 ```sh
@@ -450,6 +464,7 @@ fss-mqtt was installed, then restarts into it, continuing the session:
   `fss-mqtt --resume`.
 - **A `.deb` or `.rpm`** needs your package manager and sudo: install the new package from the
   release page.
+- **OmaMQTT installed by Omarchy** updates with Omarchy: `omarchy-update`.
 
 On Windows the restart is yours to do: fss-mqtt quits and prints the command to continue. Downloads
 go straight to GitHub over HTTPS, not through a proxy. The `SHA256SUMS` check catches a broken

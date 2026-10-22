@@ -101,11 +101,16 @@ impl Theme {
             .ok()
             .and_then(|v| v.rsplit(';').next().and_then(|b| b.parse::<u8>().ok()))
             .is_some_and(|bg| bg == 7 || bg == 15);
-        let mut th = Theme::new(light);
+        Theme::new(light).for_terminal()
+    }
+
+    /// As many colours as the terminal shows: the nearest of 256 when it has
+    /// no 24-bit colour.
+    pub fn for_terminal(mut self) -> Theme {
         if Depth::detect() == Depth::Ansi256 {
-            th.use_ansi256();
+            self.use_ansi256();
         }
-        th
+        self
     }
 
     /// Replaces every 24-bit colour with its nearest 256-palette colour.

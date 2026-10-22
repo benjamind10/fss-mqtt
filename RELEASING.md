@@ -58,6 +58,15 @@ scoop bucket add mbilling https://github.com/mbilling/scoop-bucket
 scoop install fss-mqtt
 ```
 
+### Omarchy (OmaMQTT)
+
+On [Omarchy](https://omarchy.org), fss-mqtt is packaged as `omamqtt` for Omarchy's package
+repository: the recipe is `pkgbuilds/omamqtt` in
+[omacom/omarchy-pkgs](https://github.com/omacom/omarchy-pkgs). A bot there watches this
+repository's GitHub releases and proposes each new version itself, so a release needs nothing more.
+The recipe builds the release's source and installs `packaging/omarchy/omamqtt.desktop` and
+`omamqtt.svg` from it: moving those means changing the recipe too.
+
 ### winget (Windows)
 
 winget packages live in [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) and every

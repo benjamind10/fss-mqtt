@@ -65,6 +65,8 @@ fss-mqtt -c local -c staging               # connect these saved connections
 Connects with MQTT v5 (so user properties are visible) and reconnects automatically, over TCP,
 TLS or WebSockets: `ws://` (port 80 unless given) and `wss://` (443), asking for the URL's path,
 or `/mqtt` without one. A `wss://` connection takes the same TLS options as `mqtts://`.
+Credentials in a URL (`user:password@`) aren't used to log in: give them with `-u` and
+`password_env` (or when asked).
 `FSS_MQTT_BROKER`, `FSS_MQTT_USERNAME`, `FSS_MQTT_PASSWORD`, `FSS_MQTT_CAFILE` and
 `FSS_MQTT_KEY_PASSWORD` (the `--key` passphrase) are read from the environment.
 With no saved connections and no broker given, it connects to `mqtt://localhost:1883` (not saved).

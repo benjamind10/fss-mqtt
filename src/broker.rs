@@ -40,9 +40,12 @@ pub fn parse_broker(s: &str, tls_wanted: bool) -> Result<Broker, String> {
         "wss" => (true, true),
         other => return Err(format!("broker: unsupported scheme {other:?}")),
     };
-    // Credentials off first (up to the last @ before a path), so a ? or #
-    // in an unencoded password isn't taken for a query or a fragment.
-    let auth = &rest[..rest.find('/').unwrap_or(rest.len())];
+    // Credentials (never used to log in) off first. Over TCP a URL has no
+    // query, so they run to the last @ before a path: a ? or # in an
+    // unencoded password is still the password's. A WebSocket URL's query
+    // is sent and may hold an @, so there they end where RFC 3986 ends them.
+    let stop: &[char] = if websocket { &['/', '?', '#'] } else { &['/'] };
+    let auth = &rest[..rest.find(stop).unwrap_or(rest.len())];
     let rest = auth.rfind('@').map_or(rest, |i| &rest[i + 1..]);
     let rest = rest.split('#').next().unwrap_or("");
     let (hostport, path) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
@@ -180,10 +183,19 @@ mod tests {
         assert_eq!(b.display, "wss://[::1]:8884/mqtt");
         // Not for MQTT over TCP: a path there means nothing.
         assert!(parse_broker("mqtt://host/x", false).unwrap().ws.is_none());
-        // An unencoded ? or # in a password is still the password's.
+        // Over TCP an unencoded ? or # in a password is still the password's;
+        // in a WebSocket URL an @ in the query is the query's.
         let b = parse_broker("mqtt://me:pa?ss@host", false).unwrap();
         assert!(b.host == "host" && b.port == 1883, "{}", b.url);
-        let b = parse_broker("ws://u:p#w@host:8080/ws", false).unwrap();
-        assert!(b.host == "host" && b.port == 8080 && b.ws.as_deref() == Some("/ws"));
+        let b = parse_broker("mqtts://u:p#w@host:8884", false).unwrap();
+        assert!(b.host == "host" && b.port == 8884, "{}", b.url);
+        let b = parse_broker("wss://host?token=a@b", false).unwrap();
+        assert!(
+            b.host == "host" && b.ws.as_deref() == Some("/mqtt?token=a@b"),
+            "{}",
+            b.url
+        );
+        let b = parse_broker("ws://u:p@host:8080/ws?k=v@w", false).unwrap();
+        assert!(b.host == "host" && b.port == 8080 && b.ws.as_deref() == Some("/ws?k=v@w"));
     }
 }

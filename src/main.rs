@@ -38,6 +38,7 @@ mod upgrade;
 mod values;
 mod view;
 mod viewer;
+mod ws;
 
 use std::io::stdout;
 use std::path::PathBuf;
@@ -63,7 +64,7 @@ written, use password_env in the file or type it when asked. The same goes for
 the passphrase of an encrypted --key (key_password_env).
 
 Connection flags:
-  -b, --broker string        broker URL (mqtt://, mqtts://) or host[:port]
+  -b, --broker string        broker URL (mqtt://, mqtts://, ws://, wss://) or host[:port]
   -c, --connection string    saved connection to connect (repeatable)
       --name string          name to save the broker under (default user@host:port)
       --no-save              don't add the broker to the connections file
@@ -286,7 +287,7 @@ fn cli_connection(a: &Args, b: &broker::Broker, saved: Option<&config::ConnCfg>)
             None => hp.to_string(),
         }
     });
-    c.url = b.display.clone();
+    c.url = b.url.clone();
     // File paths are saved absolute, so the entry works from any directory.
     for (field, v) in [
         (&mut c.cafile, &a.ca_file),

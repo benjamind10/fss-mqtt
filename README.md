@@ -56,13 +56,17 @@ fss-mqtt broker.example.com                # connect (and save the connection)
 fss-mqtt mqtts://broker:8883 -u me         # TLS (system trust store); asks for the password
 fss-mqtt broker:8883 --cafile ca.pem       # TLS with your own CA
 fss-mqtt broker:8883 --cafile ca.pem --cert me.pem --key me.key   # mutual TLS
+fss-mqtt wss://broker.example.com:8884/mqtt -u me   # MQTT over WebSockets, with TLS
 fss-mqtt broker -t 'v1/#' -t '$SYS/#'      # several subscriptions
 fss-mqtt                                   # connect the saved connections marked autoconnect
 fss-mqtt -c local -c staging               # connect these saved connections
 ```
 
-Connects with MQTT v5 (so user properties are visible) and reconnects automatically.
-TCP and TLS only; WebSocket brokers (`ws://`, `wss://`) are not supported.
+Connects with MQTT v5 (so user properties are visible) and reconnects automatically, over TCP,
+TLS or WebSockets: `ws://` (port 80 unless given) and `wss://` (443), asking for the URL's path,
+or `/mqtt` without one. A `wss://` connection takes the same TLS options as `mqtts://`.
+Credentials in a URL (`user:password@`) aren't used to log in: give them with `-u` and
+`password_env` (or when asked).
 `FSS_MQTT_BROKER`, `FSS_MQTT_USERNAME`, `FSS_MQTT_PASSWORD`, `FSS_MQTT_CAFILE` and
 `FSS_MQTT_KEY_PASSWORD` (the `--key` passphrase) are read from the environment.
 With no saved connections and no broker given, it connects to `mqtt://localhost:1883` (not saved).
@@ -90,6 +94,12 @@ topics       = ["devices/+/up/#", "$SYS/#"]
 paused       = ["$SYS/#"]                  # listed, but not subscribed
 capture      = ["devices/d1/#"]            # written to disk; see Capture to disk
 autoconnect  = true                        # connect when started without -c or a broker
+
+[[connection]]
+name         = "plant"
+url          = "wss://mqtt.example.com/mqtt"          # MQTT over WebSockets
+headers      = ["CF-Access-Client-Id: 1a2b.access"]   # sent with the WebSocket handshake
+headers_env  = ["CF-Access-Client-Secret: CF_SECRET"]  # its value from $CF_SECRET
 ```
 
 - **Adding:** connect from the command line (the entry is added or updated, named `user@host:port`
@@ -103,6 +113,13 @@ autoconnect  = true                        # connect when started without -c or 
   Supported: PKCS#8 `ENCRYPTED PRIVATE KEY` with PBKDF2 and AES or 3DES (what `openssl genpkey
   -aes256` and `openssl pkcs8 -topk8` write) and the older OpenSSL `Proc-Type: 4,ENCRYPTED`
   RSA/EC keys; not scrypt or PKCS#5 v1.5.
+- **Headers** go with a WebSocket connection's opening request, for a broker behind a proxy or
+  gateway that wants them (Cloudflare Access, an `Authorization: Bearer …` check, an API key).
+  `headers` are sent as written; for a secret, `headers_env` names the environment variable that
+  holds the value, so the secret stays out of the file. The handshake's own headers (`Host`,
+  `Upgrade`, `Sec-WebSocket-…`) can't be set, though a `User-Agent` of your own replaces
+  fss-mqtt's. A query in a `ws://`/`wss://` URL is sent too, and saved with the connection, but not
+  shown in the panel; a signed URL that expires (AWS SigV4, say) stops working when it does.
 - **Saving** rewrites only that connection's block, so your comments elsewhere in the file stay.
   Pausing or resuming a subscription in the panel is saved the same way.
 - **Live:** edits to the file apply while fss-mqtt runs (it checks once a second). New connections

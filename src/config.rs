@@ -12,6 +12,12 @@
 //! paused       = ["$SYS/#"]         # listed but not subscribed
 //! capture      = ["devices/d1/#"]   # written to disk (opt-in, see capture.rs)
 //! autoconnect  = true
+//!
+//! [[connection]]
+//! name         = "plant"
+//! url          = "wss://mqtt.example.com/mqtt"         # MQTT over WebSockets
+//! headers      = ["CF-Access-Client-Id: 1a2b.access"]  # sent with its handshake
+//! headers_env  = ["CF-Access-Client-Secret: CF_SECRET"] # the value from $CF_SECRET
 //! ```
 //!
 //! Passwords are never written to the file. Saving an entry rewrites only that
@@ -38,6 +44,10 @@ pub struct ConnCfg {
     pub capture: Vec<String>,
     pub capture_paused: Vec<String>,
     pub autoconnect: bool,
+    /// Sent with a WebSocket connection's handshake: "Name: value", and
+    /// "Name: VAR" for a value read from the environment variable VAR.
+    pub headers: Vec<String>,
+    pub headers_env: Vec<String>,
 }
 
 /// Default location: $XDG_CONFIG_HOME or ~/.config on Unix, %APPDATA% on Windows.
@@ -164,6 +174,12 @@ pub(crate) fn render(c: &ConnCfg) -> String {
     }
     if !c.capture_paused.is_empty() {
         kv("capture_paused", list(&c.capture_paused));
+    }
+    if !c.headers.is_empty() {
+        kv("headers", list(&c.headers));
+    }
+    if !c.headers_env.is_empty() {
+        kv("headers_env", list(&c.headers_env));
     }
     kv("autoconnect", c.autoconnect.to_string());
     s
@@ -411,6 +427,25 @@ fn set(c: &mut ConnCfg, key: &str, v: Value) -> Result<(), String> {
             Value::Int(q @ 0..=2) => c.qos = q as u8,
             _ => return Err("qos must be 0, 1 or 2".into()),
         },
+        "headers" | "headers_env" => {
+            let Value::List(l) = v else {
+                return Err(format!("{key} must be a list of strings"));
+            };
+            for h in &l {
+                let (name, value) = crate::ws::header(h).map_err(|e| format!("{key}: {e}"))?;
+                let var = |c: char| c.is_ascii_alphanumeric() || c == '_';
+                if key == "headers_env" && (value.is_empty() || !value.chars().all(var)) {
+                    return Err(format!(
+                        "{key}: {name} takes an environment variable's name, not {value:?}"
+                    ));
+                }
+            }
+            if key == "headers" {
+                c.headers = l;
+            } else {
+                c.headers_env = l;
+            }
+        }
         "topics" | "paused" | "capture" | "capture_paused" => {
             let Value::List(l) = v else {
                 return Err(format!("{key} must be a list of strings"));
@@ -494,6 +529,21 @@ topics = ["#"]
         assert!(parse("[[connection]]\nname = \"a\"").unwrap_err().contains("no url"));
         let e = parse("[[connection]]\nname = \"a\"\nurl = \"mqtt://x\"\ncapture = [\"a/#/b\"]").unwrap_err();
         assert!(e.contains("line 4") && e.contains("not a topic filter"), "{e}");
+    }
+
+    #[test]
+    fn websocket_headers() {
+        let text = "[[connection]]\nname = \"plant\"\nurl = \"wss://h/mqtt\"\n\
+                    headers = [\"CF-Access-Client-Id: 1a2b.access\"]\nheaders_env = [\"Authorization: MQTT_TOKEN\"]\n";
+        let c = parse(text).unwrap().remove(0);
+        assert_eq!(c.headers, vec!["CF-Access-Client-Id: 1a2b.access"]);
+        assert_eq!(c.headers_env, vec!["Authorization: MQTT_TOKEN"]);
+        // Saved as they were: the variable's name, never its value.
+        assert_eq!(parse(&upsert("", &c).unwrap()).unwrap(), vec![c]);
+        let bad = |l: &str| parse(&format!("[[connection]]\nname = \"a\"\nurl = \"wss://x\"\n{l}")).unwrap_err();
+        assert!(bad("headers = [\"Host: elsewhere\"]").contains("handshake itself"));
+        assert!(bad("headers_env = [\"Authorization: Bearer x\"]").contains("environment variable"));
+        assert!(bad("headers = \"X-A: y\"").contains("list of strings"));
     }
 
     #[test]

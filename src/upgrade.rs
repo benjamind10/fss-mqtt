@@ -154,7 +154,9 @@ pub(crate) fn probe(path: &Path) -> Option<String> {
     }
     let mut out = String::new();
     std::io::Read::read_to_string(&mut child.stdout.take()?, &mut out).ok()?;
-    out.trim().strip_prefix("fss-mqtt ").map(str::to_string)
+    // "fss-mqtt 0.9.1", or "omamqtt 0.9.1" as OmaMQTT.
+    let (name, v) = out.trim().split_once(' ')?;
+    matches!(name, "fss-mqtt" | "omamqtt").then(|| v.to_string())
 }
 
 /// The fss-mqtt command this process was started as: a path as given, or

@@ -1,4 +1,5 @@
-# README demo. Regenerate with docs/demo/record.sh (needs Docker).
+# README demo: navigation, charts and the payload formats. Regenerate with
+# docs/demo/record.sh <fss-mqtt linux binary> (needs Docker).
 Output docs/demo.gif
 
 Set Shell "bash"
@@ -22,7 +23,9 @@ Sleep 400ms
 Enter
 Sleep 2.5s
 
-# Open one site down to its turbines; green marks topics that just updated.
+# keys.py shows the keys pressed from here on.
+
+# The topic tree: a site down to its turbines; green marks topics that just updated.
 Down
 Right
 Sleep 400ms
@@ -34,112 +37,129 @@ Right
 Sleep 400ms
 Down
 Right
-Sleep 2.5s
+Sleep 2s
 
-# Search: every turbine's telemetry, across both brokers.
+# Typing filters: every turbine's telemetry, on both brokers.
 Type "telemetry"
-Sleep 1.5s
-Down@350ms 3
+Sleep 1.2s
+Down@400ms 2
 Sleep 1.2s
 
-# Browse the last messages; properties and payload follow the selection.
-Right
-Sleep 800ms
-Down@500ms 2
-Sleep 1s
-
-# Full screen: pretty JSON, raw, hex.
+# Its last messages, and one full screen.
+Tab
+Sleep 700ms
+Down@450ms 2
+Sleep 600ms
 Enter
-Sleep 2s
-Tab
-Sleep 1s
-Tab
-Sleep 1.5s
-Escape
-Sleep 400ms
-Escape
-Sleep 400ms
+Sleep 2.2s
 Escape
 Sleep 600ms
 
-# Binary formats are decoded on arrival: Parquet, Avro, Arrow, SQLite and its changesets,
-# Protobuf without a schema, MessagePack, CBOR, CSV, and gzip unpacked first.
-Type@50ms "fastlog"
+# The numbers its messages carry, charted live; down picks the next field.
+Tab
+Sleep 1.8s
+Down@1s 2
+Sleep 1.2s
+Escape
+Sleep 300ms
+Escape
 Sleep 500ms
+
+# A day of minutes in one Parquet message: a column charted, scrolled
+# through with left and right; down, the next column.
+Type "daylog"
+Sleep 700ms
+Tab
+Sleep 300ms
+Tab
+Sleep 1.5s
+Right@500ms 4
+Sleep 600ms
+Down
+Sleep 1.5s
+Escape
+Sleep 300ms
+Escape
+Sleep 500ms
+
+# Payloads decoded on arrival: Parquet, Avro, Arrow, SQLite and its
+# changesets, Protobuf without a schema, MessagePack, CBOR, CSV, gzip.
+Type "fastlog"
+Sleep 400ms
 Enter
-Sleep 2.5s
+Sleep 2.4s
 Escape
 Sleep 200ms
 Escape
 Sleep 300ms
-Type@50ms "events"
-Sleep 500ms
+Type "events"
+Sleep 400ms
 Enter
-Sleep 1.9s
+Sleep 1.8s
 Escape
 Sleep 200ms
 Escape
 Sleep 300ms
-Type@50ms "vibration"
-Sleep 500ms
+Type "vibration"
+Sleep 400ms
 Enter
-Sleep 2.2s
+Sleep 1.8s
 Escape
 Sleep 200ms
 Escape
 Sleep 300ms
-Type@50ms "turbines.db"
-Sleep 500ms
+Type "turbines.db"
+Sleep 400ms
 Enter
-Sleep 2.2s
+Sleep 2s
 Escape
 Sleep 200ms
 Escape
 Sleep 300ms
-Type@50ms "setpoints"
-Sleep 500ms
+Type "setpoints"
+Sleep 400ms
 Enter
-Sleep 2.2s
+Sleep 1.8s
 Escape
 Sleep 200ms
 Escape
 Sleep 300ms
-Type@50ms "reading"
-Sleep 500ms
+Type "reading"
+Sleep 400ms
 Enter
-Sleep 1.9s
+Sleep 1.8s
 Escape
 Sleep 200ms
 Escape
 Sleep 300ms
-Type@50ms "state"
-Sleep 500ms
+Type "state"
+Sleep 400ms
 Enter
-Sleep 1.9s
+Sleep 1.8s
 Escape
 Sleep 200ms
 Escape
 Sleep 300ms
-Type@50ms "cms"
-Sleep 500ms
+Type "cms"
+Sleep 400ms
 Enter
-Sleep 1.9s
+Sleep 1.8s
 Escape
 Sleep 200ms
 Escape
 Sleep 300ms
-Type@50ms "daily"
-Sleep 500ms
+Type "daily"
+Sleep 400ms
 Enter
-Sleep 1.9s
+Sleep 1.8s
 Escape
 Sleep 200ms
 Escape
 Sleep 300ms
-Type@50ms "summary"
-Sleep 500ms
+Type "summary"
+Sleep 400ms
 Enter
-Sleep 1.9s
+Sleep 1.8s
 Escape
 Sleep 200ms
 Escape
@@ -147,16 +167,10 @@ Sleep 300ms
 
 # MQTT patterns match below each broker.
 Type "site/+/grid"
-Sleep 2.5s
+Sleep 2s
 Escape
-Sleep 800ms
-
-# Connections: pause and resume a subscription.
-Shift+Tab
-Sleep 800ms
-Down@500ms 2
 Sleep 600ms
-Space
-Sleep 1.8s
-Space
-Sleep 1.5s
+
+# Quitting says how to carry on where you left off.
+Ctrl+C
+Sleep 2.5s

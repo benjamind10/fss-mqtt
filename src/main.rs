@@ -4,6 +4,7 @@ mod app;
 mod arrow;
 mod avro;
 mod base64;
+mod brand;
 mod broker;
 mod capture;
 mod changeset;
@@ -20,6 +21,7 @@ mod http;
 mod json;
 mod keys;
 mod mqtt;
+mod omarchy;
 mod parquet;
 mod pemkey;
 mod pretty;
@@ -99,6 +101,20 @@ Environment: FSS_MQTT_BROKER, FSS_MQTT_USERNAME, FSS_MQTT_PASSWORD, FSS_MQTT_CAF
 FSS_MQTT_KEY_PASSWORD (the --key passphrase), FSS_MQTT_CAPTURE_DIR, FSS_MQTT_SESSION,
 FSS_MQTT_KEYS (vim: as --vim), FSS_MQTT_UPDATE (off: no looking for new releases)";
 
+/// The usage, under the name it was started as (OmaMQTT: see brand.rs).
+fn usage() -> String {
+    if !brand::oma() {
+        return USAGE.into();
+    }
+    USAGE
+        .replacen(
+            "fss-mqtt — interactive MQTT explorer",
+            "OmaMQTT — interactive MQTT explorer (fss-mqtt)",
+            1,
+        )
+        .replace("\n  fss-mqtt ", "\n  omamqtt ")
+}
+
 struct Args {
     broker: Option<String>,
     connections: Vec<String>,
@@ -131,7 +147,7 @@ struct Args {
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("fss-mqtt: {e}");
+        eprintln!("{}: {e}", brand::command());
         std::process::exit(1);
     }
 }
@@ -181,11 +197,11 @@ fn parse_args() -> Result<Option<Args>, String> {
         };
         match name.as_str() {
             "-h" | "--help" => {
-                println!("{USAGE}");
+                println!("{}", usage());
                 return Ok(None);
             }
             "-v" | "--version" => {
-                println!("fss-mqtt {VERSION}");
+                println!("{} {VERSION}", brand::command());
                 return Ok(None);
             }
             "-b" | "--broker" => a.broker = Some(val()?),
@@ -233,7 +249,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 }
                 a.open.push(std::path::absolute(&p).unwrap_or(p));
             }
-            s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown flag {s}\n\n{USAGE}")),
+            s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown flag {s}\n\n{}", usage())),
             _ => a.broker = Some(arg),
         }
     }
@@ -609,8 +625,17 @@ fn run() -> Result<(), String> {
     let opts = app::Options {
         inline_bytes: a.inline,
         vim: a.vim,
+        oma: brand::oma(),
     };
-    let mut app = app::App::new(store, opts, theme::Theme::detect(), ctls, path, ask);
+    // OmaMQTT wears the Omarchy theme's colours, when Omarchy is here.
+    let th = match brand::oma().then(omarchy::current).flatten() {
+        Some(th) => th.for_terminal(),
+        None => theme::Theme::detect(),
+    };
+    let mut app = app::App::new(store, opts, th, ctls, path, ask);
+    if brand::oma() {
+        app.omarchy = Some(omarchy::Watch::new());
+    }
     if let Some(view) = &restored {
         app.restore_view(view);
     }
@@ -639,7 +664,7 @@ fn run() -> Result<(), String> {
     ratatui::restore();
     // What was captured reaches the disk before we exit, within a bound.
     for late in app.flush_captures(capture::QUIT_WAIT) {
-        eprintln!("fss-mqtt: capture: {late}");
+        eprintln!("{}: capture: {late}", brand::command());
     }
     if app.restart {
         return restart(&a, &app, session_path.as_deref());
@@ -652,7 +677,7 @@ fn run() -> Result<(), String> {
         match save_session(&app, p, restored.is_some()) {
             Ok(0) => {}
             Ok(_) => println!("Continue session: {}", resume_command(&a)),
-            Err(e) => eprintln!("fss-mqtt: couldn't save the session: {e}"),
+            Err(e) => eprintln!("{}: couldn't save the session: {e}", brand::command()),
         }
     }
     res.map_err(|e| e.to_string())
@@ -672,7 +697,9 @@ fn restart(a: &Args, app: &app::App, session: Option<&std::path::Path>) -> Resul
         _ => false,
     };
     let args = upgrade::restart_args(&std::env::args_os().skip(1).collect::<Vec<_>>(), resume);
-    let note = app.upgrade_note().unwrap_or_else(|| "fss-mqtt changed on disk".into());
+    let note = app
+        .upgrade_note()
+        .unwrap_or_else(|| format!("{} changed on disk", app.name()));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -718,7 +745,7 @@ fn resume_command(a: &Args) -> String {
     let prog = if arg0.contains('/') || arg0.contains(std::path::MAIN_SEPARATOR) {
         shell_quote(&arg0)
     } else {
-        "fss-mqtt".into()
+        brand::command().into()
     };
     let mut cmd = format!("{prog} --resume");
     if let Some(c) = &a.config {

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Shows the keys a tape presses in a strip below its GIF.
+"""Makes a tape's GIF from VHS's video of it, with the keys it presses in a
+strip below the terminal when the tape has a "# keys.py" line (the keys after
+that line are shown).
 
-Usage: keys.py <tape> <gif>   (rewrites the GIF; runs in the VHS image, which
-has python3, ffmpeg and the font). record.sh runs it for tapes with a
-"# keys.py" line; the keys after that line are shown. The key caps need
-ffmpeg 6.1 or later (drawtext's boxw, boxh, text_align and y_align); the
-image has 7.1.
+Usage: keys.py <tape> <video> <gif>   (runs in the VHS image, which has
+python3, ffmpeg and the font; record.sh runs it). The GIF is made in two
+passes, its palette first, so no frame is held in memory however long the
+tape. It needs ffmpeg 7.0 or later, which reads the filters from a file
+(-/filter_complex); the key caps need 6.1 (drawtext's boxw, boxh, text_align
+and y_align). The image has 7.1.
 
 When each key was pressed is worked out from the tape as VHS plays it: Type
 waits TypingSpeed (or its @time) after each character, Enter, Escape and the
 like wait too, ctrl+<key> doesn't, Sleep sleeps, and nothing counts while
-hidden. The GIF comes out a little shorter than that (VHS misses frames), so
-the times are scaled to its length.
+hidden. The video comes out a little shorter than that (VHS misses frames),
+so the times are scaled to its length.
 
 Text a Type writes at the typing speed (what goes into the filter, say) is
 one key cap that grows as it's typed; a Type@<time> presses keys, a cap each.
@@ -58,9 +61,10 @@ def seconds(s):
 
 
 def presses(tape):
-    """[(time, label, text, part)] for the keys after the "# keys.py" line,
-    and the tape's length: `text` numbers the Type a character of text is
-    from, `part` the comment the key comes after."""
+    """[(time, label, text, part)] for the keys after the "# keys.py" line
+    (none without one), the tape's length, and whether it has that line:
+    `text` numbers the Type a character of text is from, `part` the comment
+    the key comes after."""
     speed, t, shown, on, part = 0.05, 0.0, True, False, 0
     out = []
     for n, raw in enumerate(open(tape, encoding="utf-8")):
@@ -96,7 +100,7 @@ def presses(tape):
                 if on:
                     out.append((t, NAMES[name], None, part))
                 t += wait
-    return out, t
+    return out, t, on
 
 
 def caps(keys, width):
@@ -140,17 +144,19 @@ def probe(gif, entries, stream=()):
 
 
 def main():
-    tape, gif = sys.argv[1:3]
-    keys, length = presses(tape)
-    scale = float(probe(gif, "format=duration")) / length if length else 1
-    w, h = (int(v) for v in probe(gif, "stream=width,height", ["-select_streams", "v:0"]).split(","))
+    tape, video, gif = sys.argv[1:4]
+    keys, length, shown = presses(tape)
+    scale = float(probe(video, "format=duration")) / length if length else 1
+    w, h = (int(v) for v in probe(video, "stream=width,height", ["-select_streams", "v:0"]).split(","))
     y = h + (STRIP - CAP_H) // 2
     font = f"fontfile={FONT}:expansion=none:y_align=font"
-    f = [f"pad=iw:ih+{STRIP}:0:0:black", f"drawtext={font}:text=keys:fontsize=17:fontcolor=0x5a5a5a:x=18:y={y + 1}"]
-    with tempfile.TemporaryDirectory() as labels:
+    f = []
+    if shown:
+        f += [f"pad=iw:ih+{STRIP}:0:0:black", f"drawtext={font}:text=keys:fontsize=17:fontcolor=0x5a5a5a:x=18:y={y + 1}"]
+    with tempfile.TemporaryDirectory() as work:
         for i, (start, stop, x, label, newest) in enumerate(caps([(t * scale, *k) for t, *k in keys], w)):
             # From a file: the labels need no escaping that way.
-            path = os.path.join(labels, f"{i}.txt")
+            path = os.path.join(work, f"{i}.txt")
             with open(path, "w", encoding="utf-8") as out:
                 out.write(label)
             fg, bg = ("0xffffff", "0x3a3a3a") if newest else ("0xa8a8a8", "0x222222")
@@ -159,11 +165,24 @@ def main():
                 f":boxw={round(len(label) * CELL + 2 * PAD)}:boxh={CAP_H}:text_align=C+M"
                 f":x={round(x)}:y={y}:enable='between(t,{start:.3f},{stop:.3f})'"
             )
-        graph = ",".join(f) + ",split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=none"
-        out = gif + ".keys.gif"
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", gif, "-filter_complex", graph, out], check=True)
-    os.replace(out, gif)
-    print(f"keys.py: {len(keys)} keys shown on {gif} (times scaled by {scale:.3f})")
+        drawn = ",".join(f) or "null"
+        # The filters go in files: a cap each, they're more than one
+        # argument may hold. The palette comes from every pixel of every
+        # frame (a video's colours, thin text's included, don't survive one
+        # picked from changes alone).
+        def graph(name, text):
+            path = os.path.join(work, name)
+            with open(path, "w", encoding="utf-8") as out:
+                out.write(text)
+            return path
+
+        palette = os.path.join(work, "palette.png")
+        ffmpeg = ["ffmpeg", "-v", "error", "-y", "-i", video]
+        first = graph("palette.txt", f"[0:v]{drawn},palettegen=stats_mode=full")
+        subprocess.run([*ffmpeg, "-/filter_complex", first, palette], check=True)
+        second = graph("gif.txt", f"[0:v]{drawn}[v];[v][1:v]paletteuse=dither=none")
+        subprocess.run([*ffmpeg, "-i", palette, "-/filter_complex", second, gif], check=True)
+    print(f"keys.py: {gif}, {len(keys)} keys shown (times scaled by {scale:.3f})")
 
 
 if __name__ == "__main__":

@@ -73,6 +73,7 @@ fn same_link(a: &ConnCfg, b: &ConnCfg) -> bool {
 pub struct Options {
     pub inline_bytes: usize, // payloads up to this size are shown inline in the tree
     pub vim: bool,           // --vim / FSS_MQTT_KEYS=vim: letters navigate, `/` filters
+    pub oma: bool,           // started as omamqtt: OmaMQTT, in Omarchy's colours (brand.rs)
 }
 
 /// The UI's handle on one connection (same index as `Store::conns`).
@@ -189,6 +190,8 @@ pub struct App {
     pub quit: bool,
     /// Watching for a newer fss-mqtt in our place (not in tests).
     pub upgrade: Option<crate::upgrade::Watch>,
+    /// OmaMQTT follows Omarchy's theme when it's switched.
+    pub omarchy: Option<crate::omarchy::Watch>,
     /// Newer releases on GitHub, looked for now and then (not with
     /// FSS_MQTT_UPDATE=off, nor in tests).
     pub release: Option<crate::update::Checker>,
@@ -258,6 +261,7 @@ impl App {
             rate_at: Instant::now(),
             quit: false,
             upgrade: None,
+            omarchy: None,
             release: None,
             updating: None,
             restart_into: None,
@@ -366,9 +370,15 @@ impl App {
             && c.check()
             && let Some(v) = c.available().map(str::to_string)
         {
-            self.notify(format!("fss-mqtt {v} is out · ctrl+n updates"), false);
+            self.notify(format!("{} {v} is out · ctrl+n updates", self.name()), false);
         }
         self.follow_update();
+        if let Some(th) = self.omarchy.as_mut().and_then(|w| w.check()) {
+            self.th = th.for_terminal();
+            if let Some(v) = &mut self.viewer {
+                v.relayout(self.width.saturating_sub(4) as usize, &self.th);
+            }
+        }
         if self.config_checked.elapsed() >= CONFIG_EVERY {
             self.config_checked = Instant::now();
             self.check_config();
@@ -380,26 +390,27 @@ impl App {
     /// ctrl+n with a newer release out: installs it the way this copy was
     /// installed. The restart into it follows (`follow_update`).
     fn update(&mut self) {
+        let me = self.name();
         if let Some(j) = &self.updating {
-            let note = format!("already updating to fss-mqtt {}", j.version);
+            let note = format!("already updating to {me} {}", j.version);
             return self.notify(note, false);
         }
         let Some(v) = self.update_offer().map(str::to_string) else {
             let note = match (&self.release, &self.installed) {
-                (_, Some(v)) => format!("fss-mqtt {v} is installed: start it again to use it"),
-                (Some(c), _) if c.known() => format!("fss-mqtt {} is the newest", env!("CARGO_PKG_VERSION")),
-                (Some(_), _) => "no newer fss-mqtt found (yet)".into(),
-                (None, _) => "no newer fss-mqtt is installed".into(),
+                (_, Some(v)) => format!("{me} {v} is installed: start it again to use it"),
+                (Some(c), _) if c.known() => format!("{me} {} is the newest", env!("CARGO_PKG_VERSION")),
+                (Some(_), _) => format!("no newer {me} found (yet)"),
+                (None, _) => format!("no newer {me} is installed"),
             };
             return self.notify(note, false);
         };
         let how = match std::env::current_exe().and_then(std::fs::canonicalize) {
             Ok(exe) => crate::update::how(&exe),
-            Err(e) => return self.notify(format!("can't tell where fss-mqtt is: {e}"), true),
+            Err(e) => return self.notify(format!("can't tell where {me} is: {e}"), true),
         };
         match crate::update::start(&how, &v) {
             Ok(job) => {
-                self.notify(format!("updating to fss-mqtt {v}…"), false);
+                self.notify(format!("updating to {me} {v}…"), false);
                 self.updating = Some(job);
             }
             Err(e) => self.notify(e, false),
@@ -410,6 +421,7 @@ impl App {
     /// the new version is noticed in our place.
     fn follow_update(&mut self) {
         use crate::update::Step;
+        let me = self.name();
         if let Some(job) = &self.updating {
             match job.step() {
                 Step::Working(_) => {}
@@ -420,9 +432,9 @@ impl App {
                     if let Some(w) = &mut self.upgrade {
                         w.look_now();
                         self.restart_into = Some((v.clone(), Instant::now()));
-                        self.notify(format!("fss-mqtt {v} is installed · restarting into it…"), false);
+                        self.notify(format!("{me} {v} is installed · restarting into it…"), false);
                     } else {
-                        self.notify(format!("fss-mqtt {v} is installed: start it again to use it"), false);
+                        self.notify(format!("{me} {v} is installed: start it again to use it"), false);
                     }
                 }
                 Step::Failed(e) => {
@@ -441,8 +453,7 @@ impl App {
                 self.restart = true;
                 self.quit = true;
             } else if since.elapsed() > RESTART_WAIT {
-                let note =
-                    format!("fss-mqtt {v} was installed, but not where this one was started from: start it again");
+                let note = format!("{me} {v} was installed, but not where this one was started from: start it again");
                 self.restart_into = None;
                 self.notify(note, true);
             }
@@ -641,7 +652,10 @@ impl App {
                     self.restart = true;
                     self.quit = true;
                 }
-                (Some(_), false) => self.notify("fss-mqtt is changing on disk; try again in a moment", false),
+                (Some(_), false) => {
+                    let note = format!("{} is changing on disk; try again in a moment", self.name());
+                    self.notify(note, false)
+                }
                 (None, _) => self.update(),
             }
             return;
@@ -1063,10 +1077,15 @@ impl App {
     pub fn upgrade_note(&self) -> Option<String> {
         let v = self.upgrade.as_ref()?.installed()?;
         Some(if v == env!("CARGO_PKG_VERSION") {
-            "fss-mqtt was rebuilt".into()
+            format!("{} was rebuilt", self.name())
         } else {
-            format!("fss-mqtt {v} is installed")
+            format!("{} {v} is installed", self.name())
         })
+    }
+
+    /// What this one is called: fss-mqtt, or OmaMQTT (brand.rs).
+    pub fn name(&self) -> &'static str {
+        crate::brand::name(self.opts.oma)
     }
 
     // ── Sessions ───────────────────────────────────────────────────────────
@@ -1711,8 +1730,9 @@ impl App {
         if self.ctls[i].tx.send(Cmd::Publish(Box::new(d.out))).is_err() {
             // Its thread has ended, so nothing would ever report back.
             let msg = format!(
-                "not sent: {}'s connection has stopped; restart fss-mqtt to use it again",
-                d.conn
+                "not sent: {}'s connection has stopped; restart {} to use it again",
+                d.conn,
+                crate::brand::name(self.opts.oma)
             );
             return c.fail_at("connection", msg);
         }

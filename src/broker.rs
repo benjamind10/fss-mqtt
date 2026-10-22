@@ -10,11 +10,16 @@ pub struct Broker {
     pub host: String,
     pub port: u16,
     pub tls: bool,
-    pub display: String, // URL without credentials
+    /// Over WebSockets (ws://, wss://): the path to ask for, with any query.
+    pub ws: Option<String>,
+    /// The URL without credentials, as a connection keeps it.
+    pub url: String,
+    /// The URL as shown: without a query either (a signed URL's holds a signature).
+    pub display: String,
 }
 
 /// Accepts a URL or host[:port]. A bare host uses TLS when TLS options were
-/// given or the port is 8883.
+/// given or the port is 8883. A WebSocket URL without a path asks for /mqtt.
 pub fn parse_broker(s: &str, tls_wanted: bool) -> Result<Broker, String> {
     let (scheme, rest) = match s.split_once("://") {
         Some((sc, r)) => (sc.to_lowercase(), r),
@@ -28,13 +33,20 @@ pub fn parse_broker(s: &str, tls_wanted: bool) -> Result<Broker, String> {
             s,
         ),
     };
-    let tls = match scheme.as_str() {
-        "mqtt" | "tcp" => false,
-        "mqtts" | "ssl" | "tls" | "tcps" | "mqtt+ssl" => true,
-        "ws" | "wss" => return Err("WebSocket brokers (ws://, wss://) are not supported".into()),
+    let (tls, websocket) = match scheme.as_str() {
+        "mqtt" | "tcp" => (false, false),
+        "mqtts" | "ssl" | "tls" | "tcps" | "mqtt+ssl" => (true, false),
+        "ws" => (false, true),
+        "wss" => (true, true),
         other => return Err(format!("broker: unsupported scheme {other:?}")),
     };
-    let hostport = rest.split('/').next().unwrap_or("");
+    let rest = rest.split('#').next().unwrap_or("");
+    let (hostport, path) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+    let ws = websocket.then(|| match path {
+        "" => "/mqtt".to_string(),
+        p if p.starts_with('?') => format!("/mqtt{p}"),
+        p => p.to_string(),
+    });
     let hostport = hostport.rsplit_once('@').map(|(_, h)| h).unwrap_or(hostport);
     let (host, port) = if let Some(r) = hostport.strip_prefix('[') {
         // [ipv6]:port
@@ -51,6 +63,8 @@ pub fn parse_broker(s: &str, tls_wanted: bool) -> Result<Broker, String> {
     }
     let port = match port {
         Some(p) => p.parse().map_err(|_| format!("broker: bad port {p:?}"))?,
+        None if websocket && tls => 443,
+        None if websocket => 80,
         None if tls => 8883,
         None => 1883,
     };
@@ -59,11 +73,17 @@ pub fn parse_broker(s: &str, tls_wanted: bool) -> Result<Broker, String> {
     } else {
         host.clone()
     };
+    let url = match &ws {
+        Some(p) => format!("{}://{shown_host}:{port}{p}", if tls { "wss" } else { "ws" }),
+        None => format!("{}://{shown_host}:{port}", if tls { "mqtts" } else { "mqtt" }),
+    };
     Ok(Broker {
-        display: format!("{}://{shown_host}:{port}", if tls { "mqtts" } else { "mqtt" }),
+        display: url.split('?').next().unwrap_or("").to_string(),
+        url,
         host,
         port,
         tls,
+        ws,
     })
 }
 
@@ -81,6 +101,14 @@ pub fn mqtt_config(
     key_password: Option<String>,
 ) -> Result<mqtt::Config, String> {
     let b = parse_broker(&c.url, c.cafile.is_some() || c.cert.is_some())?;
+    let ws = match b.ws {
+        Some(path) => Some(crate::ws::Upgrade {
+            path,
+            headers: headers(c)?,
+        }),
+        None if c.headers.is_empty() && c.headers_env.is_empty() => None,
+        None => return Err("headers are sent with a WebSocket handshake: the url needs ws:// or wss://".into()),
+    };
     Ok(mqtt::Config {
         conn: idx,
         host: b.host,
@@ -95,7 +123,24 @@ pub fn mqtt_config(
         username: c.username.clone(),
         password,
         qos: c.qos,
+        ws,
     })
+}
+
+/// A connection's headers, with headers_env's values from the environment.
+fn headers(c: &ConnCfg) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    for h in &c.headers {
+        out.push(crate::ws::header(h)?);
+    }
+    for h in &c.headers_env {
+        let (name, var) = crate::ws::header(h)?;
+        match std::env::var(&var) {
+            Ok(v) if !v.is_empty() => out.push(crate::ws::header(&format!("{name}: {v}"))?),
+            _ => return Err(format!("headers_env: {name} is to come from ${var}, which isn't set")),
+        }
+    }
+    Ok(out)
 }
 
 /// The broker URL as shown in the UI (no credentials).
@@ -117,6 +162,27 @@ mod tests {
         assert!(!b.tls && b.port == 1883 && b.host == "host" && b.display == "mqtt://host:1883");
         let b = parse_broker("mqtts://[::1]:9000", false).unwrap();
         assert!(b.tls && b.port == 9000 && b.host == "::1");
-        assert!(parse_broker("wss://x", false).is_err());
+        assert!(parse_broker("ftp://x", false).is_err());
+    }
+
+    #[test]
+    fn websocket_urls() {
+        let b = parse_broker("wss://broker.example.com", false).unwrap();
+        assert!(b.tls && b.port == 443 && b.ws.as_deref() == Some("/mqtt"));
+        assert_eq!(b.display, "wss://broker.example.com:443/mqtt");
+        let b = parse_broker("ws://u:p@host:8080/ws", false).unwrap();
+        assert!(!b.tls && b.port == 8080 && b.host == "host" && b.ws.as_deref() == Some("/ws"));
+        let b = parse_broker("ws://host", false).unwrap();
+        assert!(b.port == 80 && b.ws.as_deref() == Some("/mqtt"));
+        // A query (a signed URL's) is sent, and not shown.
+        let b = parse_broker("wss://iot.example.com/mqtt?X-Amz-Signature=abc#frag", false).unwrap();
+        assert_eq!(b.ws.as_deref(), Some("/mqtt?X-Amz-Signature=abc"));
+        assert_eq!(b.url, "wss://iot.example.com:443/mqtt?X-Amz-Signature=abc");
+        assert_eq!(b.display, "wss://iot.example.com:443/mqtt");
+        let b = parse_broker("wss://[::1]:8884?token=t", false).unwrap();
+        assert!(b.host == "::1" && b.port == 8884 && b.ws.as_deref() == Some("/mqtt?token=t"));
+        assert_eq!(b.display, "wss://[::1]:8884/mqtt");
+        // Not for MQTT over TCP: a path there means nothing.
+        assert!(parse_broker("mqtt://host/x", false).unwrap().ws.is_none());
     }
 }

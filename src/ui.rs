@@ -387,7 +387,10 @@ fn header<'a>(app: &App, st: &Store) -> Line<'a> {
     let brokers = st.live().filter(|c| c.file.is_none()).count();
     let mut left = vec![
         Span::raw(" "),
-        Span::styled(format!("{} fss-mqtt", glyph::LOGO), th.accent_b),
+        Span::styled(
+            format!("{} {}", glyph::LOGO, crate::brand::name(app.opts.oma)),
+            th.accent_b,
+        ),
         Span::raw("  "),
         Span::styled(
             format!("{up}/{brokers} connected"),
@@ -1095,7 +1098,7 @@ fn input_box(buf: &mut Buffer, r: Rect, app: &App) {
     buf.set_string(r.right() - 1, r.y + 1, "│", bs);
     buf.set_string(r.x, r.y + 2, format!("╰{bar}╯"), bs);
     // The version sits in the bottom-right of the border.
-    let v = format!(" {} ", version());
+    let v = format!(" {} ", version(app.opts.oma));
     let vw = v.chars().count() as u16;
     if r.width > vw + 6 {
         buf.set_string(r.right() - 2 - vw, r.y + 2, v, th.faint);
@@ -1139,17 +1142,17 @@ fn hint<'a>(th: &Theme, pairs: &[(&str, &str, u8)], width: usize) -> Line<'a> {
 
 /// Columns left for hints on a bottom line that also shows the version.
 fn hint_room(app: &App) -> usize {
-    (app.width as usize).saturating_sub(fmt::str_width(&version()) + 3)
+    (app.width as usize).saturating_sub(fmt::str_width(&version(app.opts.oma)) + 3)
 }
 
-fn version() -> String {
-    format!("fss-mqtt v{}", env!("CARGO_PKG_VERSION"))
+fn version(oma: bool) -> String {
+    format!("{} v{}", crate::brand::name(oma), env!("CARGO_PKG_VERSION"))
 }
 
 /// The hint line with the version in the bottom-right corner; the version is
 /// dropped when the line is too narrow for both.
 fn with_version<'a>(app: &App, hints: Line<'a>) -> Line<'a> {
-    let v = Span::styled(format!("{} ", version()), app.th.faint);
+    let v = Span::styled(format!("{} ", version(app.opts.oma)), app.th.faint);
     join_lr(hints.spans, vec![v], app.width as usize)
 }
 
@@ -1539,6 +1542,7 @@ mod tests {
         let opts = Options {
             inline_bytes: 64,
             vim: false,
+            oma: false,
         };
         let mut app = App::new(
             Arc::new(Mutex::new(st)),
@@ -1678,13 +1682,24 @@ mod tests {
     }
 
     #[test]
+    fn omamqtt_goes_by_its_own_name() {
+        let (mut app, _rx) = sample(tmp_config("oma"));
+        app.opts.oma = true;
+        let v = frame(&app, "OmaMQTT");
+        let top = v.lines().next().unwrap();
+        assert!(top.contains("OmaMQTT") && !top.contains("fss-mqtt"), "{top}");
+        assert!(v.contains(&format!(" OmaMQTT v{} ─╯", env!("CARGO_PKG_VERSION"))));
+        assert_eq!(app.name(), "OmaMQTT");
+    }
+
+    #[test]
     fn filter_and_navigate() {
         let (mut app, _rx) = sample(tmp_config("nav"));
         let v = frame(&app, "start");
         assert!(v.contains("Connections 1/2") && v.contains("local") && v.contains("staging"));
         assert!(v.contains("v1") && v.contains("v2") && v.contains("devices"));
         assert!(
-            v.contains(&format!(" {} ─╯", super::version())),
+            v.contains(&format!(" {} ─╯", super::version(false))),
             "version in the filter box border"
         );
 
@@ -3239,6 +3254,7 @@ mod tests {
         let opts = Options {
             inline_bytes: 64,
             vim: false,
+            oma: false,
         };
         let mut app = App::new(
             Arc::new(Mutex::new(st)),

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=OmaMQTT
+GenericName=MQTT Explorer
+Comment=Browse, chart and publish MQTT messages
+Exec=xdg-terminal-exec --app-id=TUI.tile -e omamqtt
+Terminal=false
+Icon=omamqtt
+Categories=Network;
+Keywords=mqtt;iot;broker;explorer;fss-mqtt;
+StartupNotify=true

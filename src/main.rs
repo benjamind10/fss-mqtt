@@ -26,6 +26,7 @@ mod parquet;
 mod pemkey;
 mod pretty;
 mod protobuf;
+mod proxy;
 mod record;
 mod session;
 mod sparkplug;
@@ -38,6 +39,7 @@ mod upgrade;
 mod values;
 mod view;
 mod viewer;
+mod ws;
 
 use std::io::stdout;
 use std::path::PathBuf;
@@ -63,7 +65,7 @@ written, use password_env in the file or type it when asked. The same goes for
 the passphrase of an encrypted --key (key_password_env).
 
 Connection flags:
-  -b, --broker string        broker URL (mqtt://, mqtts://) or host[:port]
+  -b, --broker string        broker URL (mqtt://, mqtts://, ws://, wss://) or host[:port]
   -c, --connection string    saved connection to connect (repeatable)
       --name string          name to save the broker under (default user@host:port)
       --no-save              don't add the broker to the connections file
@@ -79,6 +81,9 @@ Connection flags:
       --insecure             skip TLS certificate verification
       --key string           client private key PEM for mutual TLS (may be encrypted)
       --max-payload string   payload bytes kept per message; the rest is discarded on arrival (default \"4KiB\")
+      --proxy string         reach the broker through a proxy: http://[user@]host:port (CONNECT)
+                             or socks5://[user@]host:port; the user's password from
+                             FSS_MQTT_PROXY_PASSWORD (saved as proxy_password_env)
   -P, --password string      password
   -q, --qos int              subscription QoS (0, 1, 2)
   -t, --topic string         topic filter to subscribe to (repeatable) (default \"#\")
@@ -98,7 +103,8 @@ written anywhere else only when you ask: --capture or ctrl+r appends the
 messages on those topics, whole, to fss-mqtt-<connection>-<time>.jsonl.
 
 Environment: FSS_MQTT_BROKER, FSS_MQTT_USERNAME, FSS_MQTT_PASSWORD, FSS_MQTT_CAFILE,
-FSS_MQTT_KEY_PASSWORD (the --key passphrase), FSS_MQTT_CAPTURE_DIR, FSS_MQTT_SESSION,
+FSS_MQTT_KEY_PASSWORD (the --key passphrase), FSS_MQTT_PROXY, FSS_MQTT_PROXY_PASSWORD,
+FSS_MQTT_CAPTURE_DIR, FSS_MQTT_SESSION,
 FSS_MQTT_KEYS (vim: as --vim), FSS_MQTT_UPDATE (off: no looking for new releases)";
 
 /// The usage, under the name it was started as (OmaMQTT: see brand.rs).
@@ -126,6 +132,8 @@ struct Args {
     password: Option<String>,
     password_from_env: bool,
     key_password: Option<String>, // from the environment only
+    proxy: Option<String>,
+    proxy_password_from_env: bool,
     client_id: Option<String>,
     qos: u8,
     history: usize,
@@ -165,6 +173,8 @@ fn parse_args() -> Result<Option<Args>, String> {
         password: env("FSS_MQTT_PASSWORD"),
         password_from_env: env("FSS_MQTT_PASSWORD").is_some(),
         key_password: env("FSS_MQTT_KEY_PASSWORD"),
+        proxy: env("FSS_MQTT_PROXY"),
+        proxy_password_from_env: env("FSS_MQTT_PROXY_PASSWORD").is_some(),
         client_id: None,
         qos: 0,
         history: 10,
@@ -228,6 +238,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--max-payload" => a.max_payload = parse_size(&val()?).map_err(|e| format!("--max-payload: {e}"))?,
             "--inline" => a.inline = num(&name, val()?)?,
             "--insecure" => a.insecure = true,
+            "--proxy" => a.proxy = Some(val()?),
             "--vim" => a.vim = true,
             "--cafile" => a.ca_file = Some(val()?),
             "--cert" => a.cert = Some(val()?),
@@ -286,7 +297,7 @@ fn cli_connection(a: &Args, b: &broker::Broker, saved: Option<&config::ConnCfg>)
             None => hp.to_string(),
         }
     });
-    c.url = b.display.clone();
+    c.url = b.url.clone();
     // File paths are saved absolute, so the entry works from any directory.
     for (field, v) in [
         (&mut c.cafile, &a.ca_file),
@@ -307,6 +318,14 @@ fn cli_connection(a: &Args, b: &broker::Broker, saved: Option<&config::ConnCfg>)
     }
     if a.key_password.is_some() {
         c.key_password_env = Some("FSS_MQTT_KEY_PASSWORD".into());
+    }
+    if a.proxy.is_some() {
+        c.proxy = a.proxy.clone();
+    }
+    // Only for a proxy with a user to log in as (the file refuses it otherwise).
+    let proxy_user = c.proxy.as_deref().and_then(|u| proxy::Proxy::parse(u, None).ok()?.user);
+    if a.proxy_password_from_env && proxy_user.is_some() {
+        c.proxy_password_env = Some("FSS_MQTT_PROXY_PASSWORD".into());
     }
     c.insecure |= a.insecure;
     if a.qos != 0 {

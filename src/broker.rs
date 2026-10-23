@@ -10,11 +10,16 @@ pub struct Broker {
     pub host: String,
     pub port: u16,
     pub tls: bool,
-    pub display: String, // URL without credentials
+    /// Over WebSockets (ws://, wss://): the path to ask for, with any query.
+    pub ws: Option<String>,
+    /// The URL without credentials, as a connection keeps it.
+    pub url: String,
+    /// The URL as shown: without a query either (a signed URL's holds a signature).
+    pub display: String,
 }
 
 /// Accepts a URL or host[:port]. A bare host uses TLS when TLS options were
-/// given or the port is 8883.
+/// given or the port is 8883. A WebSocket URL without a path asks for /mqtt.
 pub fn parse_broker(s: &str, tls_wanted: bool) -> Result<Broker, String> {
     let (scheme, rest) = match s.split_once("://") {
         Some((sc, r)) => (sc.to_lowercase(), r),
@@ -28,14 +33,27 @@ pub fn parse_broker(s: &str, tls_wanted: bool) -> Result<Broker, String> {
             s,
         ),
     };
-    let tls = match scheme.as_str() {
-        "mqtt" | "tcp" => false,
-        "mqtts" | "ssl" | "tls" | "tcps" | "mqtt+ssl" => true,
-        "ws" | "wss" => return Err("WebSocket brokers (ws://, wss://) are not supported".into()),
+    let (tls, websocket) = match scheme.as_str() {
+        "mqtt" | "tcp" => (false, false),
+        "mqtts" | "ssl" | "tls" | "tcps" | "mqtt+ssl" => (true, false),
+        "ws" => (false, true),
+        "wss" => (true, true),
         other => return Err(format!("broker: unsupported scheme {other:?}")),
     };
-    let hostport = rest.split('/').next().unwrap_or("");
-    let hostport = hostport.rsplit_once('@').map(|(_, h)| h).unwrap_or(hostport);
+    // Credentials (never used to log in) off first. Over TCP a URL has no
+    // query, so they run to the last @ before a path: a ? or # in an
+    // unencoded password is still the password's. A WebSocket URL's query
+    // is sent and may hold an @, so there they end where RFC 3986 ends them.
+    let stop: &[char] = if websocket { &['/', '?', '#'] } else { &['/'] };
+    let auth = &rest[..rest.find(stop).unwrap_or(rest.len())];
+    let rest = auth.rfind('@').map_or(rest, |i| &rest[i + 1..]);
+    let rest = rest.split('#').next().unwrap_or("");
+    let (hostport, path) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+    let ws = websocket.then(|| match path {
+        "" => "/mqtt".to_string(),
+        p if p.starts_with('?') => format!("/mqtt{p}"),
+        p => p.to_string(),
+    });
     let (host, port) = if let Some(r) = hostport.strip_prefix('[') {
         // [ipv6]:port
         let (h, p) = r.split_once(']').ok_or("broker: bad IPv6 address")?;
@@ -51,6 +69,8 @@ pub fn parse_broker(s: &str, tls_wanted: bool) -> Result<Broker, String> {
     }
     let port = match port {
         Some(p) => p.parse().map_err(|_| format!("broker: bad port {p:?}"))?,
+        None if websocket && tls => 443,
+        None if websocket => 80,
         None if tls => 8883,
         None => 1883,
     };
@@ -59,11 +79,17 @@ pub fn parse_broker(s: &str, tls_wanted: bool) -> Result<Broker, String> {
     } else {
         host.clone()
     };
+    let url = match &ws {
+        Some(p) => format!("{}://{shown_host}:{port}{p}", if tls { "wss" } else { "ws" }),
+        None => format!("{}://{shown_host}:{port}", if tls { "mqtts" } else { "mqtt" }),
+    };
     Ok(Broker {
-        display: format!("{}://{shown_host}:{port}", if tls { "mqtts" } else { "mqtt" }),
+        display: url.split('?').next().unwrap_or("").to_string(),
+        url,
         host,
         port,
         tls,
+        ws,
     })
 }
 
@@ -81,6 +107,23 @@ pub fn mqtt_config(
     key_password: Option<String>,
 ) -> Result<mqtt::Config, String> {
     let b = parse_broker(&c.url, c.cafile.is_some() || c.cert.is_some())?;
+    let ws = match b.ws {
+        Some(path) => Some(crate::ws::Upgrade {
+            path,
+            headers: c
+                .headers
+                .iter()
+                .map(|h| crate::ws::header(h))
+                .collect::<Result<_, _>>()?,
+            headers_env: c
+                .headers_env
+                .iter()
+                .map(|h| crate::ws::header(h))
+                .collect::<Result<_, _>>()?,
+        }),
+        None if c.headers.is_empty() && c.headers_env.is_empty() => None,
+        None => return Err("headers are sent with a WebSocket handshake: the url needs ws:// or wss://".into()),
+    };
     Ok(mqtt::Config {
         conn: idx,
         host: b.host,
@@ -95,6 +138,12 @@ pub fn mqtt_config(
         username: c.username.clone(),
         password,
         qos: c.qos,
+        ws,
+        proxy: c
+            .proxy
+            .as_deref()
+            .map(|u| crate::proxy::Proxy::parse(u, c.proxy_password_env.clone()))
+            .transpose()?,
     })
 }
 
@@ -117,6 +166,41 @@ mod tests {
         assert!(!b.tls && b.port == 1883 && b.host == "host" && b.display == "mqtt://host:1883");
         let b = parse_broker("mqtts://[::1]:9000", false).unwrap();
         assert!(b.tls && b.port == 9000 && b.host == "::1");
-        assert!(parse_broker("wss://x", false).is_err());
+        assert!(parse_broker("ftp://x", false).is_err());
+    }
+
+    #[test]
+    fn websocket_urls() {
+        let b = parse_broker("wss://broker.example.com", false).unwrap();
+        assert!(b.tls && b.port == 443 && b.ws.as_deref() == Some("/mqtt"));
+        assert_eq!(b.display, "wss://broker.example.com:443/mqtt");
+        let b = parse_broker("ws://u:p@host:8080/ws", false).unwrap();
+        assert!(!b.tls && b.port == 8080 && b.host == "host" && b.ws.as_deref() == Some("/ws"));
+        let b = parse_broker("ws://host", false).unwrap();
+        assert!(b.port == 80 && b.ws.as_deref() == Some("/mqtt"));
+        // A query (a signed URL's) is sent, and not shown.
+        let b = parse_broker("wss://iot.example.com/mqtt?X-Amz-Signature=abc#frag", false).unwrap();
+        assert_eq!(b.ws.as_deref(), Some("/mqtt?X-Amz-Signature=abc"));
+        assert_eq!(b.url, "wss://iot.example.com:443/mqtt?X-Amz-Signature=abc");
+        assert_eq!(b.display, "wss://iot.example.com:443/mqtt");
+        let b = parse_broker("wss://[::1]:8884?token=t", false).unwrap();
+        assert!(b.host == "::1" && b.port == 8884 && b.ws.as_deref() == Some("/mqtt?token=t"));
+        assert_eq!(b.display, "wss://[::1]:8884/mqtt");
+        // Not for MQTT over TCP: a path there means nothing.
+        assert!(parse_broker("mqtt://host/x", false).unwrap().ws.is_none());
+        // Over TCP an unencoded ? or # in a password is still the password's;
+        // in a WebSocket URL an @ in the query is the query's.
+        let b = parse_broker("mqtt://me:pa?ss@host", false).unwrap();
+        assert!(b.host == "host" && b.port == 1883, "{}", b.url);
+        let b = parse_broker("mqtts://u:p#w@host:8884", false).unwrap();
+        assert!(b.host == "host" && b.port == 8884, "{}", b.url);
+        let b = parse_broker("wss://host?token=a@b", false).unwrap();
+        assert!(
+            b.host == "host" && b.ws.as_deref() == Some("/mqtt?token=a@b"),
+            "{}",
+            b.url
+        );
+        let b = parse_broker("ws://u:p@host:8080/ws?k=v@w", false).unwrap();
+        assert!(b.host == "host" && b.port == 8080 && b.ws.as_deref() == Some("/ws?k=v@w"));
     }
 }

@@ -28,6 +28,10 @@ pub struct Config {
     pub username: Option<String>,
     pub password: Option<String>,
     pub qos: u8,
+    /// MQTT over WebSockets: what the opening handshake asks for.
+    pub ws: Option<crate::ws::Upgrade>,
+    /// A proxy to reach the broker through.
+    pub proxy: Option<crate::proxy::Proxy>,
 }
 
 impl Config {
@@ -224,9 +228,13 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 }
 
+type TlsStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+
 enum Conn {
     Plain(TcpStream),
-    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+    Tls(Box<TlsStream>),
+    Ws(Box<crate::ws::Ws<TcpStream>>),
+    Wss(Box<crate::ws::Ws<TlsStream>>),
 }
 
 impl Conn {
@@ -234,7 +242,19 @@ impl Conn {
         match self {
             Conn::Plain(s) => s,
             Conn::Tls(s) => &s.sock,
+            Conn::Ws(s) => &s.inner,
+            Conn::Wss(s) => &s.inner.sock,
         }
+    }
+
+    /// The same connection carrying a WebSocket, once its handshake is done.
+    fn upgrade(self, cfg: &Config, up: &crate::ws::Upgrade, headers: &[(String, String)]) -> Result<Conn, String> {
+        use crate::ws::handshake;
+        Ok(match self {
+            Conn::Plain(s) => Conn::Ws(Box::new(handshake(s, &cfg.host, cfg.port, false, up, headers)?)),
+            Conn::Tls(s) => Conn::Wss(Box::new(handshake(*s, &cfg.host, cfg.port, true, up, headers)?)),
+            ws => ws,
+        })
     }
 }
 
@@ -243,6 +263,8 @@ impl Read for Conn {
         match self {
             Conn::Plain(s) => s.read(b),
             Conn::Tls(s) => s.read(b),
+            Conn::Ws(s) => s.read(b),
+            Conn::Wss(s) => s.read(b),
         }
     }
 }
@@ -252,12 +274,16 @@ impl Write for Conn {
         match self {
             Conn::Plain(s) => s.write(b),
             Conn::Tls(s) => s.write(b),
+            Conn::Ws(s) => s.write(b),
+            Conn::Wss(s) => s.write(b),
         }
     }
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Conn::Plain(s) => s.flush(),
             Conn::Tls(s) => s.flush(),
+            Conn::Ws(s) => s.flush(),
+            Conn::Wss(s) => s.flush(),
         }
     }
 }
@@ -581,12 +607,26 @@ fn publish_id(o: &Outgoing, ids: &mut Ids, outbox: &Outbox, lim: &Limits) -> Res
 
 /// One connection's lifetime.
 fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut Inbox, outbox: &mut Outbox) -> End {
+    // A header or a password from an unset environment variable won't be
+    // set by retrying.
+    let ws_headers = match cfg.ws.as_ref().map(|up| up.headers()).transpose() {
+        Ok(h) => h.unwrap_or_default(),
+        Err(e) => return End::Halted(e),
+    };
+    let proxy_password = match cfg.proxy.as_ref().map(|p| p.password()).transpose() {
+        Ok(p) => p.flatten(),
+        Err(e) => return End::Halted(e),
+    };
     let tls = match tls_config(cfg) {
         Ok(t) => t,
         Err(e @ TlsError::Key(..)) => return End::Halted(e.to_string()),
         Err(e) => return End::Failed(e.to_string()),
     };
-    let tcp = match dial(&cfg.host, cfg.port) {
+    let tcp = match &cfg.proxy {
+        None => dial(&cfg.host, cfg.port),
+        Some(p) => p.connect(proxy_password.as_deref(), &cfg.host, cfg.port, dial, CONNECT_TIMEOUT),
+    };
+    let tcp = match tcp {
         Ok(s) => s,
         Err(e) => return End::Failed(e),
     };
@@ -605,6 +645,12 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut I
         }
     };
     let _ = conn.tcp().set_read_timeout(Some(CONNECT_TIMEOUT));
+    if let Some(up) = &cfg.ws {
+        conn = match conn.upgrade(cfg, up, &ws_headers) {
+            Ok(c) => c,
+            Err(e) => return End::Failed(e),
+        };
+    }
 
     if let Err(e) = conn.write_all(&connect_packet(cfg)).and_then(|_| conn.flush()) {
         return End::Failed(tidy_io(e));
@@ -1376,6 +1422,8 @@ mod tests {
             username: None,
             password: None,
             qos: 0,
+            ws: None,
+            proxy: None,
         };
         (Arc::new(Mutex::new(st)), cfg)
     }
@@ -1607,6 +1655,8 @@ mod e2e {
             username: None,
             password: None,
             qos: 2,
+            ws: None,
+            proxy: None,
         };
         (Arc::new(Mutex::new(st)), cfg)
     }
@@ -1935,6 +1985,178 @@ mod e2e {
             "-t", "e2e/mtls", "-m", "hi",
         ]);
         assert_eq!(wait_for(&st, 1), 1);
+    }
+
+    /// MQTT over WebSockets: ws:// on the plain broker (18890) and wss:// on the
+    /// TLS one (18891). What's published over TCP arrives over the WebSocket,
+    /// a large message too (its frames come in parts), and what this client
+    /// publishes goes out over it and comes back.
+    #[test]
+    #[ignore]
+    fn e2e_websockets() {
+        let ca = std::env::var("FSS_TEST_CA").expect("set FSS_TEST_CA");
+        let ws = || {
+            Some(crate::ws::Upgrade {
+                path: "/mqtt".into(),
+                headers: vec![("X-Test".into(), "fss-mqtt".into())],
+                ..Default::default()
+            })
+        };
+        for (port, tls, tcp_port) in [(18890, false, "18830"), (18891, true, "18883")] {
+            let (st, mut cfg) = setup(port, tls, tls.then_some(ca.as_str()), &["ews/#"]);
+            cfg.ws = ws();
+            cfg.client_id = format!("e2e-ws-{port}");
+            let tx = spawn(cfg, st.clone(), true);
+            let s = wait_state(&st, ConnState::Connected);
+            assert!(
+                s.state == ConnState::Connected && s.err.is_none(),
+                "{port} connect: {:?}",
+                s.err
+            );
+            let tcp = |more: &[&str]| {
+                let mut args = vec!["-p", tcp_port, "-h", "localhost"];
+                if tls {
+                    args.extend(["--cafile", ca.as_str()]);
+                }
+                args.extend(more);
+                publish(&args);
+            };
+            // (From a file: one argument can't be this long.)
+            let big = "w".repeat(300 * 1024);
+            let big_file = std::env::temp_dir().join(format!("fss-mqtt-e2e-ws-{}-{port}", std::process::id()));
+            std::fs::write(&big_file, &big).unwrap();
+            tcp(&["-q", "1", "-t", "ews/small", "-m", "hello"]);
+            tcp(&["-q", "2", "-t", "ews/big", "-f", &big_file.to_string_lossy()]);
+            let _ = std::fs::remove_file(&big_file);
+            assert_eq!(wait_for(&st, 2), 2, "{port}: over TCP, then the WebSocket");
+            assert_eq!(latest(&st, "ews/small").unwrap().payload, b"hello");
+            assert_eq!(latest(&st, "ews/big").unwrap().size, big.len());
+
+            tx.send(Cmd::Publish(Box::new(Outgoing {
+                topic: "ews/echo".into(),
+                payload: b"over the websocket".to_vec(),
+                qos: 1,
+                retain: false,
+                props: Props::default(),
+            })))
+            .unwrap();
+            assert_eq!(wait_for(&st, 3), 3, "{port}: published over the WebSocket");
+            assert_eq!(latest(&st, "ews/echo").unwrap().payload, b"over the websocket");
+            tx.send(Cmd::Disconnect).unwrap();
+        }
+    }
+
+    /// A proxy for the tests that follow: HTTP CONNECT, or SOCKS5 without a
+    /// login, relaying to wherever it's asked. Its port.
+    fn relay(socks: bool) -> u16 {
+        use std::net::{TcpListener, TcpStream};
+        fn target_http(c: &mut TcpStream) -> Option<String> {
+            let mut h = Vec::new();
+            let mut b = [0u8; 1];
+            while !h.ends_with(b"\r\n\r\n") {
+                c.read_exact(&mut b).ok()?;
+                h.push(b[0]);
+            }
+            let line = String::from_utf8(h).ok()?;
+            Some(line.strip_prefix("CONNECT ")?.split(' ').next()?.to_string())
+        }
+        fn target_socks(c: &mut TcpStream) -> Option<String> {
+            let mut b = [0u8; 2];
+            c.read_exact(&mut b).ok()?;
+            let mut m = vec![0u8; b[1] as usize];
+            c.read_exact(&mut m).ok()?;
+            c.write_all(&[5, 0]).ok()?;
+            let mut r = [0u8; 4];
+            c.read_exact(&mut r).ok()?;
+            let host = match r[3] {
+                1 => {
+                    let mut a = [0u8; 4];
+                    c.read_exact(&mut a).ok()?;
+                    std::net::Ipv4Addr::from(a).to_string()
+                }
+                3 => {
+                    let mut n = [0u8; 1];
+                    c.read_exact(&mut n).ok()?;
+                    let mut name = vec![0u8; n[0] as usize];
+                    c.read_exact(&mut name).ok()?;
+                    String::from_utf8(name).ok()?
+                }
+                _ => return None,
+            };
+            let mut p = [0u8; 2];
+            c.read_exact(&mut p).ok()?;
+            Some(format!("{host}:{}", u16::from_be_bytes(p)))
+        }
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { continue };
+                std::thread::spawn(move || {
+                    let target = if socks {
+                        target_socks(&mut c)
+                    } else {
+                        target_http(&mut c)
+                    };
+                    let Some(Ok(up)) = target.map(TcpStream::connect) else {
+                        return;
+                    };
+                    let ok: &[u8] = if socks {
+                        &[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]
+                    } else {
+                        b"HTTP/1.1 200 Connection established\r\n\r\n"
+                    };
+                    if c.write_all(ok).is_err() {
+                        return;
+                    }
+                    let (mut c2, mut up2) = (c.try_clone().unwrap(), up.try_clone().unwrap());
+                    std::thread::spawn(move || std::io::copy(&mut up2, &mut c2));
+                    let mut up = up;
+                    let _ = std::io::copy(&mut c, &mut up);
+                });
+            }
+        });
+        port
+    }
+
+    /// Through a proxy: plain MQTT through HTTP CONNECT, and MQTT over a
+    /// WebSocket over TLS through SOCKS5 (the proxy resolving "localhost").
+    #[test]
+    #[ignore]
+    fn e2e_proxies() {
+        let ca = std::env::var("FSS_TEST_CA").expect("set FSS_TEST_CA");
+        let http = relay(false);
+        let socks = relay(true);
+        for (proxy, port, tls, ws) in [
+            (format!("http://127.0.0.1:{http}"), 18830, false, false),
+            (format!("socks5://127.0.0.1:{socks}"), 18891, true, true),
+        ] {
+            let (st, mut cfg) = setup(port, tls, tls.then_some(ca.as_str()), &["eproxy/#"]);
+            cfg.client_id = format!("e2e-proxy-{port}");
+            cfg.proxy = Some(crate::proxy::Proxy::parse(&proxy, None).unwrap());
+            if ws {
+                cfg.ws = Some(crate::ws::Upgrade {
+                    path: "/mqtt".into(),
+                    ..Default::default()
+                });
+            }
+            let tx = spawn(cfg, st.clone(), true);
+            let s = wait_state(&st, ConnState::Connected);
+            assert!(
+                s.state == ConnState::Connected && s.err.is_none(),
+                "{proxy} to {port}: {:?}",
+                s.err
+            );
+            if tls {
+                #[rustfmt::skip]
+                publish(&["-p", "18883", "-h", "localhost", "--cafile", &ca, "-q", "1", "-t", "eproxy/a", "-m", "through"]);
+            } else {
+                publish(&["-p", "18830", "-q", "1", "-t", "eproxy/a", "-m", "through"]);
+            }
+            assert_eq!(wait_for(&st, 1), 1, "{proxy} to {port}");
+            assert_eq!(latest(&st, "eproxy/a").unwrap().payload, b"through");
+            tx.send(Cmd::Disconnect).unwrap();
+        }
     }
 
     #[test]

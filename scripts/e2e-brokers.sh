@@ -4,6 +4,8 @@
 #   localhost:18883  TLS (server cert for localhost, signed by $dir/ca.pem)
 #   localhost:18884  mutual TLS: requires a client cert ($dir/client.pem, with the
 #                    key $dir/client.key encrypted with the passphrase "s3cret")
+#   127.0.0.1:18890  WebSockets, on the plain broker
+#   localhost:18891  WebSockets over TLS, on the TLS broker
 # Usage: scripts/e2e-brokers.sh <dir>   then: FSS_TEST_CA=<dir>/ca.pem cargo test --release e2e -- --ignored
 set -euo pipefail
 dir=$(mkdir -p "$1" && cd "$1" && pwd)
@@ -19,12 +21,19 @@ openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out c
 openssl pkey -in client.key -passin pass:s3cret -out client-plain.key # for mosquitto_pub
 
 cat > plain.conf <<CONF
-listener 18830 127.0.0.1
 allow_anonymous true
+listener 18830 127.0.0.1
+listener 18890 127.0.0.1
+protocol websockets
 CONF
 cat > tls.conf <<CONF
-listener 18883 127.0.0.1
 allow_anonymous true
+listener 18883 127.0.0.1
+cafile $dir/ca.pem
+certfile $dir/server.pem
+keyfile $dir/server.key
+listener 18891 127.0.0.1
+protocol websockets
 cafile $dir/ca.pem
 certfile $dir/server.pem
 keyfile $dir/server.key

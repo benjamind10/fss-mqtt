@@ -2,7 +2,7 @@
 //! publish, keep alive, reconnect. One blocking thread per connection,
 //! steered by [`Cmd`]s from the UI.
 // In the browser the protocol below waits for its transport (WebSocket).
-#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+#![cfg_attr(target_arch = "wasm32", allow(unused_imports))]
 
 use std::io::{self, Read, Write};
 #[cfg(not(target_arch = "wasm32"))]

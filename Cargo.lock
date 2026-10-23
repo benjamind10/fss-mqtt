@@ -428,6 +428,7 @@ dependencies = [
  "ruzstd",
  "snap",
  "unicode-width",
+ "wasm-bindgen",
  "web-time",
  "windows-sys 0.61.2",
 ]

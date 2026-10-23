@@ -960,6 +960,9 @@ impl App {
     /// captures gets no narrower rule.
     fn capture_selected(&mut self) {
         let Some(n) = self.selected else { return };
+        if cfg!(target_arch = "wasm32") {
+            return self.notify("capture writes files: not in the web version", false);
+        }
         let (i, path) = {
             let st = self.store.lock().unwrap();
             (st.nodes[n].conn, st.nodes[n].path.clone())

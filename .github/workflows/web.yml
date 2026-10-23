@@ -1,0 +1,70 @@
+name: Web
+
+# The web version (src/web.rs) on GitHub Pages: built on pull requests that
+# touch it, published with each release (and by hand).
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "src/**"
+      - "web/**"
+      - "Cargo.*"
+      - ".github/workflows/web.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  TRUNK_VERSION: v0.22.0
+  TRUNK_SHA256: f78c1989240c56592d8cfc4df5cc27399a3ff66a3f9cc819e16f1e3d809ce7c2
+
+jobs:
+  build:
+    name: build (trunk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install trunk
+        run: |
+          curl -fsSL -o trunk.tar.gz \
+            "https://github.com/trunk-rs/trunk/releases/download/$TRUNK_VERSION/trunk-x86_64-unknown-linux-gnu.tar.gz"
+          echo "$TRUNK_SHA256  trunk.tar.gz" | sha256sum -c -
+          tar -xzf trunk.tar.gz -C "$RUNNER_TEMP"
+          rm trunk.tar.gz
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Build
+        run: trunk build web/index.html --release --locked --dist dist --public-url "/${GITHUB_REPOSITORY#*/}/"
+      - name: Report size
+        run: |
+          size=$(stat -c %s dist/*.wasm)
+          echo "Web version: $((size / 1024)) KiB of wasm" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist
+
+  deploy:
+    name: deploy
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v5

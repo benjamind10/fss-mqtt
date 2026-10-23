@@ -1,7 +1,7 @@
 //! fss-mqtt — interactive terminal MQTT explorer, and its web version.
 
-// Until the web version's entry point uses it, most of the app is unused there.
-#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused))]
+// The web version leaves out what's for the terminal and the desktop.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 mod app;
 mod arrow;
@@ -17,6 +17,8 @@ mod composer;
 mod compressed;
 mod config;
 mod crc32;
+#[cfg(any(target_arch = "wasm32", test))]
+mod demo;
 mod fmt;
 mod glyph;
 mod gzip;
@@ -47,6 +49,8 @@ mod upgrade;
 mod values;
 mod view;
 mod viewer;
+#[cfg(target_arch = "wasm32")]
+mod web;
 mod ws;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -57,6 +61,7 @@ fn main() {
     desktop::main();
 }
 
-/// The web version comes next; for now the core builds for the browser.
 #[cfg(target_arch = "wasm32")]
-fn main() {}
+fn main() {
+    web::main();
+}

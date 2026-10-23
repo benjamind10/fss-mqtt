@@ -132,6 +132,7 @@ pub fn quiet_panics() -> bool {
 
 /// Reads all of a message's rows from its whole payload, on a thread of
 /// its own. The slot gets them, or nothing when that fails, a panic included.
+#[cfg(not(target_arch = "wasm32"))]
 fn read_in_background(m: Arc<Message>, payload: Arc<Vec<u8>>, read: Reader) -> Reading {
     let slot: Reading = Arc::new(Mutex::new(None));
     let done = slot.clone();
@@ -141,6 +142,12 @@ fn read_in_background(m: Arc<Message>, payload: Arc<Vec<u8>>, read: Reader) -> R
         *done.lock().unwrap() = Some(rows.ok().flatten().unwrap_or_default());
     });
     slot
+}
+
+/// A web page has no threads: it reads the rows now.
+#[cfg(target_arch = "wasm32")]
+fn read_in_background(m: Arc<Message>, payload: Arc<Vec<u8>>, read: Reader) -> Reading {
+    Arc::new(Mutex::new(Some(read(&m, &payload).unwrap_or_default())))
 }
 
 impl State {

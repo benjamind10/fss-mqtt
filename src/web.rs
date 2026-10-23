@@ -1,6 +1,6 @@
 //! The web version: the app in a web page (ratzilla draws ratatui there),
-//! with the demo's data (demo.rs) until it connects to brokers itself.
-//! The keys, panes and views are the terminal's.
+//! with the demo's data (demo.rs) and a live broker over the page's
+//! WebSocket (mqtt/browser.rs). The keys, panes and views are the terminal's.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -13,7 +13,7 @@ use ratzilla::event::{KeyCode as WebKey, KeyEvent as WebKeyEvent};
 use ratzilla::ratatui::backend::Backend;
 use ratzilla::ratatui::layout::Rect;
 use ratzilla::ratatui::{Terminal, TerminalOptions, Viewport};
-use ratzilla::web_sys::{KeyboardEvent, console, window};
+use ratzilla::web_sys::{KeyboardEvent, UrlSearchParams, console, window};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use web_time::{Duration, Instant};
@@ -23,7 +23,7 @@ use crate::config::ConnCfg;
 use crate::input::{KeyCode, KeyEvent, KeyModifiers};
 use crate::mqtt::Cmd;
 use crate::store::Store;
-use crate::{demo, theme, ui};
+use crate::{broker, demo, mqtt, theme, ui};
 
 /// How often the app ticks, as in the terminal.
 const TICK: Duration = Duration::from_millis(66);
@@ -67,7 +67,7 @@ pub fn main() {
     let mut demo = demo::start(&mut store.lock().unwrap());
     // The demo's connections take their commands here, each frame.
     let mut inboxes = Vec::new();
-    let ctls = {
+    let mut ctls = {
         let st = store.lock().unwrap();
         st.conns
             .iter()
@@ -87,8 +87,28 @@ pub fn main() {
                     key_password: None,
                 }
             })
-            .collect()
+            .collect::<Vec<_>>()
     };
+    // Then a live broker, connected as the app connects any.
+    let live = live_broker();
+    let mut connect = vec![];
+    match broker::mqtt_config(ctls.len(), &live, None, None).and_then(|cfg| Ok((cfg, broker::display_url(&live)?))) {
+        Ok((cfg, display)) => {
+            store
+                .lock()
+                .unwrap()
+                .add_conn(&live.name, &display, None, crate::app::subs_of(&live));
+            connect.push(ctls.len());
+            ctls.push(ConnCtl {
+                tx: mqtt::spawn(cfg, store.clone(), false),
+                cfg: live,
+                saved: false,
+                password: None,
+                key_password: None,
+            });
+        }
+        Err(e) => store.lock().unwrap().notify(format!("broker: {e}"), true),
+    }
     let opts = Options {
         inline_bytes: 64,
         vim: false,
@@ -100,7 +120,7 @@ pub fn main() {
         theme::Theme::new(false),
         ctls,
         PathBuf::new(),
-        vec![],
+        connect,
     )));
 
     let backend = DomBackend::new().expect("a page to draw in");
@@ -147,6 +167,7 @@ pub fn main() {
                 }
             }
         }
+        mqtt::poll(); // not under the store's lock: it takes it
         app.resize(area.width, area.height);
         if ticked.elapsed() >= TICK {
             ticked = Instant::now();
@@ -179,6 +200,41 @@ fn on_panic() {
             let _ = body.append_child(&note);
         }
     }));
+}
+
+/// The page's live connection: the broker and topics its address asks for
+/// (`?broker=wss://…&topic=a/#&topic=b`), or else the public test broker's
+/// own statistics.
+fn live_broker() -> ConnCfg {
+    let query = window()
+        .and_then(|w| w.location().search().ok())
+        .and_then(|q| UrlSearchParams::new_with_str(&q).ok());
+    let asked = query.as_ref().and_then(|q| q.get("broker")).filter(|b| !b.is_empty());
+    let Some(url) = asked else {
+        return ConnCfg {
+            name: "mosquitto".into(),
+            url: "wss://test.mosquitto.org:8081/mqtt".into(),
+            topics: vec!["$SYS/#".into()],
+            ..Default::default()
+        };
+    };
+    let topics: Vec<String> = query
+        .iter()
+        .flat_map(|q| {
+            q.get_all("topic")
+                .iter()
+                .filter_map(|t| t.as_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|t| !t.is_empty())
+        .collect();
+    let name = broker::parse_broker(&url, false).map_or("broker".into(), |b| b.host);
+    ConnCfg {
+        name,
+        url,
+        topics: if topics.is_empty() { vec!["#".into()] } else { topics },
+        ..Default::default()
+    }
 }
 
 /// Hands the page's keys to `f`, wherever the focus is: ratzilla listens on

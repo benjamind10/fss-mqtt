@@ -1,6 +1,8 @@
 //! Broker addresses and the MQTT client settings built from a connection.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::hash_map::RandomState;
+#[cfg(not(target_arch = "wasm32"))]
 use std::hash::{BuildHasher, Hasher};
 
 use crate::config::{self, ConnCfg};
@@ -93,10 +95,17 @@ pub fn parse_broker(s: &str, tls_wanted: bool) -> Result<Broker, String> {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn random_client_id() -> String {
     let mut h = RandomState::new().build_hasher();
     h.write_u32(std::process::id());
     format!("fss-mqtt-{:08x}", h.finish() as u32)
+}
+
+/// A page has no process id, nor random hash keys.
+#[cfg(target_arch = "wasm32")]
+pub fn random_client_id() -> String {
+    format!("fss-mqtt-{:08x}", (js_sys::Math::random() * f64::from(u32::MAX)) as u32)
 }
 
 /// The MQTT client's settings for connection `idx` (its index in the store).

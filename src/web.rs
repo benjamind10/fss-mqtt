@@ -2,7 +2,7 @@
 //! with the demo's data (demo.rs) until it connects to brokers itself.
 //! The keys, panes and views are the terminal's.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -13,7 +13,7 @@ use ratzilla::event::{KeyCode as WebKey, KeyEvent as WebKeyEvent};
 use ratzilla::ratatui::backend::Backend;
 use ratzilla::ratatui::layout::Rect;
 use ratzilla::ratatui::{Terminal, TerminalOptions, Viewport};
-use ratzilla::web_sys::{KeyboardEvent, window};
+use ratzilla::web_sys::{KeyboardEvent, console, window};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use web_time::{Duration, Instant};
@@ -62,6 +62,7 @@ fn key(k: &WebKeyEvent) -> Option<KeyEvent> {
 }
 
 pub fn main() {
+    on_panic();
     let store = Arc::new(Mutex::new(Store::new(10, 4 * 1024)));
     let mut demo = demo::start(&mut store.lock().unwrap());
     // The demo's connections take their commands here, each frame.
@@ -107,12 +108,15 @@ pub fn main() {
         viewport: Viewport::Fixed(Rect::default()),
     };
     let mut terminal = Terminal::with_options(backend, fixed).expect("a terminal in the page");
-    let keys = app.clone();
+    // Drawn when something may have changed: a key, a tick, a resize.
+    let dirty = Rc::new(Cell::new(true));
+    let (keys, pressed) = (app.clone(), dirty.clone());
     on_keys(move |k| {
         let Some(k) = key(&k) else { return false };
         let mut app = keys.borrow_mut();
         app.key(k);
         app.quit = false; // a page isn't quit
+        pressed.set(true);
         true
     });
     let (mut ticked, mut second) = (Instant::now(), Instant::now());
@@ -125,6 +129,7 @@ pub fn main() {
             if now != area {
                 area = now;
                 let _ = terminal.resize(area);
+                dirty.set(true);
             }
         }
         let mut app = app.borrow_mut();
@@ -146,9 +151,34 @@ pub fn main() {
         if ticked.elapsed() >= TICK {
             ticked = Instant::now();
             app.tick();
+            dirty.set(true);
         }
-        let _ = terminal.draw(|f| ui::draw(f, &app));
+        if dirty.replace(false) {
+            let _ = terminal.draw(|f| ui::draw(f, &app));
+        }
     });
+}
+
+/// A panic can't be caught in a page, and ends the app: it says so on the
+/// page, and in the console.
+fn on_panic() {
+    std::panic::set_hook(Box::new(|info| {
+        let msg = info.to_string();
+        console::error_1(&msg.as_str().into());
+        let doc = window().and_then(|w| w.document());
+        if let Some(doc) = doc
+            && let Some(body) = doc.body()
+            && let Ok(note) = doc.create_element("div")
+        {
+            let style = "position:fixed;left:0;right:0;bottom:0;padding:12px 16px;\
+                         background:#b3261e;color:#fff;white-space:pre-wrap";
+            let _ = note.set_attribute("style", style);
+            note.set_text_content(Some(&format!(
+                "fss-mqtt stopped: {msg}\nReload the page to start again."
+            )));
+            let _ = body.append_child(&note);
+        }
+    }));
 }
 
 /// Hands the page's keys to `f`, wherever the focus is: ratzilla listens on

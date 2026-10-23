@@ -100,7 +100,6 @@ pub struct Demo {
     conns: Vec<usize>,
     step: u64,
     seed: u64,
-    scada: Vec<u8>,
 }
 
 /// The two sites' connections, connected, with their retained messages.
@@ -109,7 +108,6 @@ pub fn start(st: &mut Store) -> Demo {
         conns: Vec::new(),
         step: 0,
         seed: 0x9e37_79b9_7f4a_7c15,
-        scada: Vec::new(),
     };
     for site in SITES {
         let sub = Sub {
@@ -121,7 +119,6 @@ pub fn start(st: &mut Store) -> Demo {
         st.conns[c].status.state = ConnState::Connected;
         d.conns.push(c);
     }
-    d.scada = d.scada_xml();
     for (i, site) in SITES.iter().enumerate() {
         let c = d.conns[i];
         add(st, c, &format!("site/{site}/online"), b"true", true, None, &[]);
@@ -132,17 +129,7 @@ pub fn start(st: &mut Store) -> Demo {
         for (topic, bytes, ct, k, v) in SAMPLES {
             add(st, c, &format!("site/{site}/{topic}"), bytes, true, Some(ct), &[(k, v)]);
         }
-        let scada = d.scada.clone();
-        let props = [("ProviderName", "OnlineData"), ("Quality", "Good")];
-        add(
-            st,
-            c,
-            &format!("site/{site}/scada/online/data"),
-            &scada,
-            true,
-            Some("application/xml"),
-            &props,
-        );
+        d.scada(st, c, site);
     }
     d
 }
@@ -157,8 +144,9 @@ impl Demo {
         format!("{:.places$}", lo + r * (hi - lo))
     }
 
-    fn scada_xml(&mut self) -> Vec<u8> {
-        let mut x = String::from("<?xml version=\"1.0\"?><DataStatus><StationStatus site=\"oslo\">");
+    /// A site's SCADA snapshot: 400 points, fresh values each time.
+    fn scada(&mut self, st: &mut Store, conn: usize, site: &str) {
+        let mut x = format!("<?xml version=\"1.0\"?><DataStatus><StationStatus site=\"{site}\">");
         for i in 1..=400 {
             let v = self.num(0.0, 100.0, 2);
             x += &format!(
@@ -167,7 +155,9 @@ impl Demo {
             );
         }
         x += "</StationStatus></DataStatus>";
-        x.into_bytes()
+        let topic = format!("site/{site}/scada/online/data");
+        let props = [("ProviderName", "OnlineData"), ("Quality", "Good")];
+        add(st, conn, &topic, x.as_bytes(), true, Some("application/xml"), &props);
     }
 
     /// One second's traffic, as the publisher sends it.
@@ -256,6 +246,9 @@ impl Demo {
                     &[],
                 );
             }
+            if i.is_multiple_of(15) {
+                self.scada(st, c, site);
+            }
         }
     }
 }
@@ -328,6 +321,10 @@ mod tests {
         for _ in 0..13 {
             d.second(&mut st);
         }
+        // Each site's SCADA snapshot names the site.
+        let n = st.find(1, "site/bergen/scada/online/data").unwrap();
+        let xml = String::from_utf8_lossy(&st.nodes[n].latest().unwrap().payload).into_owned();
+        assert!(xml.contains("site=\"bergen\""), "{}", &xml[..80]);
         // Telemetry and grid every second; alarm, fast log and status now and then.
         let per_second = 2 * (TURBINES + 2) as u64;
         assert_eq!(st.total(), first + 13 * per_second + 2 * 3);

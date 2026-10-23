@@ -51,6 +51,7 @@ jobs:
           size=$(stat -c %s dist/*.wasm)
           echo "Web version: $((size / 1024)) KiB of wasm" | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request' # nothing deploys a PR's
         with:
           path: dist
 

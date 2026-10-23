@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>fss-mqtt — the MQTT explorer, in your browser</title>
+  <meta name="description" content="fss-mqtt, a fast keyboard-driven MQTT explorer for the terminal, running in the browser with demo data.">
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      color: #e8e6e3;
+      /* The system's monospace font: it's there when the grid is measured. */
+      font-family: ui-monospace, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+      font-size: 15px;
+    }
+    pre {
+      margin: 0;
+      font-family: inherit;
+    }
+  </style>
+  <link data-trunk rel="rust" href="../Cargo.toml" data-bin="fss-mqtt" data-type="main" data-wasm-opt="z" data-wasm-opt-params="--all-features" />
+</head>
+<body></body>
+</html>

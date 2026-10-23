@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use web_time::{Duration, Instant, SystemTime};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::input::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::broker;
 use crate::clipboard;
@@ -32,7 +32,7 @@ pub const PANEL_ROWS: u16 = 10;
 const RESTART_WAIT: Duration = Duration::from_secs(30);
 
 /// The connections file's modified time and size, to notice edits.
-type Stamp = Option<(SystemTime, u64)>;
+type Stamp = Option<(std::time::SystemTime, u64)>; // the file system's times
 
 fn stamp(path: &Path) -> Stamp {
     let m = std::fs::metadata(path).ok()?;

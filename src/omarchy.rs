@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use web_time::{Duration, Instant};
 
 use ratatui::style::{Color, Style};
 
@@ -100,7 +100,7 @@ pub fn current() -> Option<Theme> {
 /// Notices when Omarchy switches to another theme (or the colours change).
 pub struct Watch {
     places: Vec<PathBuf>,
-    seen: Option<(PathBuf, SystemTime)>,
+    seen: Option<(PathBuf, std::time::SystemTime)>, // the file system's times
     checked: Instant,
 }
 
@@ -136,7 +136,7 @@ impl Watch {
 
 /// Which colours file is in place (through the link to the current theme),
 /// and when it was written.
-fn stamp(file: &Path) -> Option<(PathBuf, SystemTime)> {
+fn stamp(file: &Path) -> Option<(PathBuf, std::time::SystemTime)> {
     let real = std::fs::canonicalize(file).ok()?;
     let modified = std::fs::metadata(&real).ok()?.modified().ok()?;
     Some((real, modified))

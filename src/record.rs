@@ -12,7 +12,7 @@
 //! connection it came from (`conn`) and, for payloads cut on arrival, the
 //! view that was decoded from the whole payload (`decoded`).
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use web_time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::json::{self, Json};
 use crate::store::Props;

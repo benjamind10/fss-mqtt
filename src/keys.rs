@@ -9,7 +9,7 @@
 //! Nobody types Esc, `[`, `B` that fast.
 
 use std::io;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 

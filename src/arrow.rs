@@ -1961,10 +1961,10 @@ mod tests {
         refused(vec![-128, 127, -128], "listed twice");
         refused(vec![5, 300], "out of range");
         // A long hostile list is turned down at once, not compared pairwise.
-        let start = std::time::Instant::now();
+        let start = web_time::Instant::now();
         refused((0..100_000).collect(), "out of range");
         refused((0..100_000).map(|i| i % 100).collect(), "listed twice");
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(start.elapsed() < web_time::Duration::from_secs(1));
         // No fields: only with a content type.
         let empty = schema_stream(vec![]);
         assert!(sniff("", &empty).is_none());

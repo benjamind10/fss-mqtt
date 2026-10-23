@@ -5,14 +5,14 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use web_time::{Duration, Instant};
 
 const CHECK_EVERY: Duration = Duration::from_secs(5);
 /// How long the new binary may take to say its version.
 const PROBE_WAIT: Duration = Duration::from_secs(2);
 
 /// What a path points at: (resolved path, modified, size).
-type Stamp = (PathBuf, SystemTime, u64);
+type Stamp = (PathBuf, std::time::SystemTime, u64); // the file system's times
 
 fn stamp(p: &Path) -> Option<Stamp> {
     let m = std::fs::metadata(p).ok()?;

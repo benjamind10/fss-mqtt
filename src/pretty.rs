@@ -1036,7 +1036,7 @@ pub(crate) mod binval {
 mod tests {
     use super::*;
     use crate::store::Props;
-    use std::time::SystemTime;
+    use web_time::SystemTime;
 
     /// A stored message: `payload` is the kept prefix of a `size`-byte payload.
     fn msg(payload: &[u8], size: usize, ct: Option<&str>) -> Message {

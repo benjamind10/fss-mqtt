@@ -5,7 +5,7 @@
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use web_time::Duration;
 
 use rustls::pki_types::ServerName;
 

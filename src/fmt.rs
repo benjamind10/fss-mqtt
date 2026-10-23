@@ -1,6 +1,6 @@
 //! Text helpers: sizes, times, payload sanitising, JSON and hex rendering.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
@@ -90,6 +90,20 @@ fn local_parts(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
         tm.tm_hour as u32,
         tm.tm_min as u32,
         tm.tm_sec as u32,
+    )
+}
+
+/// In the browser, its time zone.
+#[cfg(target_arch = "wasm32")]
+fn local_parts(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
+    let d = js_sys::Date::new(&(secs as f64 * 1000.0).into());
+    (
+        d.get_full_year() as i32,
+        d.get_month() + 1,
+        d.get_date(),
+        d.get_hours(),
+        d.get_minutes(),
+        d.get_seconds(),
     )
 }
 

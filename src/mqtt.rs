@@ -317,7 +317,7 @@ enum End {
 }
 
 /// In the browser, until its WebSocket transport comes: the connection
-/// says it can't connect yet, and keeps its commands.
+/// says it can't connect yet, and drops its commands.
 #[cfg(target_arch = "wasm32")]
 pub fn spawn(cfg: Config, store: Arc<Mutex<Store>>, _start: bool) -> Sender<Cmd> {
     // Nothing reads the commands: sends fail, and none pile up.

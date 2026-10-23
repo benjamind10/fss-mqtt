@@ -5,6 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>fss-mqtt — the MQTT explorer, in your browser</title>
   <meta name="description" content="fss-mqtt, a fast keyboard-driven MQTT explorer for the terminal, running in the browser with demo data and a live public broker.">
+  <meta property="og:title" content="fss-mqtt — the MQTT explorer, in your browser">
+  <meta property="og:description" content="A fast, keyboard-driven MQTT v5 explorer for the terminal. Try it here, with demo data and a live public broker.">
+  <meta property="og:image" content="https://raw.githubusercontent.com/mbilling/fss-mqtt/main/docs/demo.gif">
+  <meta property="og:url" content="https://mbilling.github.io/fss-mqtt/">
+  <link data-trunk rel="icon" href="icon.svg" type="image/svg+xml">
   <style>
     html, body {
       margin: 0;
@@ -16,12 +21,51 @@
       font-family: ui-monospace, Menlo, Consolas, "DejaVu Sans Mono", monospace;
       font-size: 15px;
     }
+    body {
+      display: flex;
+      flex-direction: column;
+    }
+    /* The app's grid fills what the footer leaves. */
+    #app {
+      flex: 1;
+      min-height: 0;
+      overflow: hidden;
+    }
     pre {
       margin: 0;
       font-family: inherit;
     }
+    #loading {
+      padding: 1em;
+      color: #888;
+    }
+    footer {
+      flex: none;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0 1.5em;
+      padding: 4px 1ch;
+      border-top: 1px solid #333;
+      color: #888;
+      font-size: 13px;
+    }
+    footer b {
+      color: #d77757;
+    }
+    footer a {
+      color: #e8e6e3;
+    }
+    footer .end {
+      margin-left: auto;
+    }
   </style>
   <link data-trunk rel="rust" href="../Cargo.toml" data-bin="fss-mqtt" data-type="main" data-wasm-opt="z" data-wasm-opt-params="--all-features" />
 </head>
-<body></body>
+<body>
+  <div id="app"><div id="loading">Loading fss-mqtt…</div></div>
+  <footer>
+    <span><b>fss-mqtt</b> — the MQTT explorer for your terminal, here in the browser</span>
+    <span class="end"><a href="https://github.com/mbilling/fss-mqtt#install">Install</a> · <a href="https://github.com/mbilling/fss-mqtt">GitHub</a> · <a href="https://github.com/mbilling/fss-mqtt#web-version">Your broker</a></span>
+  </footer>
+</body>
 </html>

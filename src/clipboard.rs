@@ -106,7 +106,18 @@ fn methods(os: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<Vec<Method>
     }
 }
 
+/// Copies `text` to the browser's clipboard, which a key press may write
+/// to (on an https page). The browser answers later; a refusal shows in its
+/// console.
+#[cfg(target_arch = "wasm32")]
+pub fn copy(text: &str) -> Result<&'static str, String> {
+    let window = web_sys::window().ok_or("no window")?;
+    let _ = window.navigator().clipboard().write_text(text);
+    Ok("browser clipboard")
+}
+
 /// Copies `text` to the system clipboard; returns how.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn copy(text: &str) -> Result<&'static str, String> {
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let deadline = Instant::now() + TOOL_WAIT;

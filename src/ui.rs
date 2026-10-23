@@ -1254,7 +1254,9 @@ fn hints<'a>(app: &App) -> Line<'a> {
     } else if app.updating.is_none() && app.update_offer().is_some() {
         keys.push(("^n", "update", 0));
     }
-    if !app.opts.vim {
+    if cfg!(target_arch = "wasm32") {
+        // A web page isn't quit.
+    } else if !app.opts.vim {
         keys.push(("^c", "quit", 0));
     } else if !app.filtering {
         keys.push(("q", "quit", 0));

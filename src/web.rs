@@ -48,11 +48,14 @@ fn key(k: &WebKeyEvent) -> Option<KeyEvent> {
         WebKey::Esc => KeyCode::Esc,
         _ => return None,
     };
+    // Chrome on Windows and Linux keeps Ctrl+T and Ctrl+W (a new tab, close
+    // it) from the page: Alt+T and Alt+W stand in for them.
+    let stand_in = k.alt && !k.ctrl && matches!(code, KeyCode::Char('t' | 'w'));
     let mut m = KeyModifiers::NONE;
     for (on, flag) in [
         (k.shift, KeyModifiers::SHIFT),
-        (k.ctrl, KeyModifiers::CONTROL),
-        (k.alt, KeyModifiers::ALT),
+        (k.ctrl || stand_in, KeyModifiers::CONTROL),
+        (k.alt && !stand_in, KeyModifiers::ALT),
     ] {
         if on {
             m = m | flag;
@@ -123,7 +126,14 @@ pub fn main() {
         connect,
     )));
 
-    let backend = DomBackend::new().expect("a page to draw in");
+    // The page's #app, which says it's loading until now.
+    if let Some(loading) = window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("loading"))
+    {
+        loading.remove();
+    }
+    let backend = DomBackend::new_by_id("app").expect("a page to draw in");
     let fixed = TerminalOptions {
         viewport: Viewport::Fixed(Rect::default()),
     };

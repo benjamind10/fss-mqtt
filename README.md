@@ -540,6 +540,8 @@ https://mbilling.github.io/fss-mqtt/?broker=wss://broker.example.com:8884/mqtt&t
 `topic` can be repeated (`#` is `%23` in an address) and defaults to `#`. A page can only reach
 brokers over WebSockets, and from an https page only `wss://` ones; it can't send headers, use a
 proxy or certificate files of its own, or write to disk (capture, sessions). Nothing is saved.
+Copies go to the browser's clipboard. Chrome on Windows and Linux keeps Ctrl+T and Ctrl+W for its
+tabs, so the page also takes Alt+T (copy the topic) and Alt+W (filter: back a level).
 
 ## Development
 

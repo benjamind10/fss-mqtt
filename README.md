@@ -5,7 +5,8 @@ live topic tree you narrow down just by typing; edit any message and publish it 
 
 ![fss-mqtt: browsing two brokers and filtering them; a topic's messages, one full screen; the numbers in its messages charted live, and a day of minutes in one Parquet message charted and scrolled through; Parquet, Avro, Arrow, SQLite, SQLite changeset, Protobuf, MessagePack, CBOR, CSV and gzip payloads decoded; the keys pressed show below](docs/demo.gif)
 
-Vim user? See [`--vim`](#vim-keys---vim).
+Vim user? See [`--vim`](#vim-keys---vim). Or [try it in your browser](https://mbilling.github.io/fss-mqtt/):
+the same app, with demo data and a live public broker ([web version](#web-version)).
 
 ## Install
 
@@ -59,6 +60,7 @@ fss-mqtt broker:8883 --cafile ca.pem --cert me.pem --key me.key   # mutual TLS
 fss-mqtt wss://broker.example.com:8884/mqtt -u me   # MQTT over WebSockets, with TLS
 fss-mqtt broker:8883 --proxy http://proxy.corp:8080   # through an HTTP proxy (or socks5://)
 fss-mqtt broker -t 'v1/#' -t '$SYS/#'      # several subscriptions
+fss-mqtt wss://test.mosquitto.org:8081/mqtt -t '$SYS/#'   # a public test broker's own statistics
 fss-mqtt                                   # connect the saved connections marked autoconnect
 fss-mqtt -c local -c staging               # connect these saved connections
 ```
@@ -522,11 +524,30 @@ ones kept longest making room. Filtering 100k topics takes a few milliseconds.
 The MQTT client (`src/mqtt.rs`) is a small MQTT v5 client on blocking I/O with one thread per
 connection and no async runtime, which keeps the binary around 1 MB. TLS uses rustls.
 
+## Web version
+
+The web version at <https://mbilling.github.io/fss-mqtt/> is the same app built for the browser
+(WebAssembly), with the same keys, panes, viewer and charts. It starts with two demo connections,
+whose wind-farm data is made in the page, and a live one to the public test broker
+`wss://test.mosquitto.org:8081/mqtt`, subscribed to its `$SYS/#` statistics.
+
+Point it at your own broker with the page's address:
+
+```
+https://mbilling.github.io/fss-mqtt/?broker=wss://broker.example.com:8884/mqtt&topic=v1/%23&topic=alerts
+```
+
+`topic` can be repeated (`#` is `%23` in an address) and defaults to `#`. A page can only reach
+brokers over WebSockets, and from an https page only `wss://` ones; it can't send headers, use a
+proxy or certificate files of its own, or write to disk (capture, sessions). Nothing is saved.
+
 ## Development
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux, macOS and Windows, checks the
 minimum Rust version, runs the end-to-end test against mosquitto (plain, TLS and mutual TLS, and capture to disk), and guards the
-release binary size.
+release binary size. `.github/workflows/web.yml` builds the web version with
+[trunk](https://trunkrs.dev) and publishes it to GitHub Pages with each release; locally,
+`rustup target add wasm32-unknown-unknown`, then `trunk serve web/index.html`.
 
 ```sh
 cargo test

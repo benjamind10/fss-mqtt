@@ -316,6 +316,7 @@ format comes from the `content-type` property when there is one, otherwise from 
 | Protobuf (by content-type) | raw field numbers and values, nested messages indented; no schema needed |
 | Sparkplug B (on `spBv1.0/…` topics) | message type, seq and timestamp; the metrics as a table with names, types and values; data sets and templates as tables |
 | SQLite changeset / patchset | per table, the inserts, updates (old → new) and deletes |
+| Elspec PQZip | the recording's start and end, the analyser (names, model, firmware, MAC) and its channels' nominal values |
 | other text / binary | text / hex dump |
 
 Binary formats are decoded when the message arrives, while the whole payload is still there; what's
@@ -350,6 +351,9 @@ like one of these formats but can't be read, the reason is shown above a hex dum
 - **SQLite changesets / patchsets** (from the session extension): recognised by a `content-type`
   containing `changeset` or `patchset`, or without one when the whole payload reads as one; the
   format doesn't carry column names, so columns are numbered (`pk c0`, `c1`, …).
+- **Elspec PQZip** (the files Elspec's BLACKBOX power quality analysers record): recognised by its
+  header. The measurements after the header, the per-cycle voltages, currents and harmonics, are
+  in a layout not worked out yet; their size is shown. Times are the analyser's clock.
 
 ## Charts
 

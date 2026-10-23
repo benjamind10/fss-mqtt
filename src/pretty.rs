@@ -11,6 +11,7 @@ use crate::changeset;
 use crate::compressed;
 use crate::fmt;
 use crate::parquet;
+use crate::pqzip;
 use crate::protobuf;
 use crate::sqlite;
 use crate::store::Message;
@@ -37,6 +38,7 @@ const DECODERS: &[(&str, Decoder)] = &[
     ("Avro", avro::sniff),
     ("Arrow", arrow::sniff),
     ("SQLite", sqlite::sniff),
+    ("Elspec PQZip", pqzip::sniff),
     // A heuristic without magic bytes: last, so it never shadows the others.
     ("SQLite changeset", changeset::sniff),
 ];

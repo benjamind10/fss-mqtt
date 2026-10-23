@@ -39,13 +39,21 @@ fn u64_at(b: &[u8], at: usize) -> Option<u64> {
 }
 
 /// A time in the header: the pair at `at`, as the device's clock has it.
-fn time_at(b: &[u8], at: usize) -> Option<u64> {
-    u64_at(b, at)?.checked_add(u64_at(b, at + 8)?)
+fn time_at(b: &[u8], at: usize) -> Result<u64, String> {
+    let (t, off) = (u64_at(b, at), u64_at(b, at + 8));
+    let (Some(t), Some(off)) = (t, off) else {
+        return Err("the header is cut short".into());
+    };
+    t.checked_add(off)
+        .ok_or_else(|| "a time in the header is out of range".into())
 }
 
+/// A time as shown; one too far out for a date shows as its ticks.
 fn shown(ticks: u64) -> String {
-    let ms = (ticks as i64 - UNIX_TICKS as i64) / 10_000;
-    crate::values::timestamp(ms, 3, false)
+    match i64::try_from((ticks as i128 - UNIX_TICKS as i128) / 10_000) {
+        Ok(ms) if ms.unsigned_abs() < 1 << 50 => crate::values::timestamp(ms, 3, false),
+        _ => format!("{ticks} ticks"),
+    }
 }
 
 /// Length-prefixed strings from `from`: where the first one starts (a run of
@@ -54,30 +62,38 @@ fn strings(b: &[u8], from: usize) -> (usize, Vec<String>) {
     let text = |at: usize| -> Option<(String, usize)> {
         let n = u16::from_be_bytes([*b.get(at)?, *b.get(at + 1)?]) as usize;
         let s = b.get(at + 2..at + 2 + n)?;
-        (n > 0 && n <= 128 && s.iter().all(|c| (0x20..0x7f).contains(c)))
+        (n <= 128 && s.iter().all(|c| (0x20..0x7f).contains(c)))
             .then(|| (String::from_utf8_lossy(s).into_owned(), at + 2 + n))
     };
+    // The run starts with a string that has text; after that an empty one
+    // (no operator set, say) keeps its place, up to as many as there are.
     for start in from..(from + 64).min(b.len()) {
+        if text(start).is_none_or(|(s, _)| s.is_empty()) {
+            continue;
+        }
         let mut out = Vec::new();
         let mut at = start;
-        while let Some((s, next)) = text(at) {
+        while out.len() < FIELDS.len()
+            && let Some((s, next)) = text(at)
+        {
             out.push(s);
             at = next;
         }
-        if out.len() >= 3 {
+        if out.iter().filter(|s| !s.is_empty()).count() >= 3 {
             return (at, out);
         }
     }
     (from, Vec::new())
 }
 
-/// The channels after the strings: (id, nominal), as many as follow one another.
-fn channels(b: &[u8], from: usize) -> Vec<(u16, f32)> {
+/// The channels after the strings: (id, nominal), as many as follow one
+/// another, and where they end (`from` without any).
+fn channels(b: &[u8], from: usize) -> (Vec<(u16, f32)>, usize) {
     let Some(first) = b[from..b.len().min(from + 256)]
         .windows(4)
         .position(|w| w[0] == 1 && w[1] == 0x23 && w[3] == 0x0d)
     else {
-        return Vec::new();
+        return (Vec::new(), from);
     };
     let mut out = Vec::new();
     let mut at = from + first;
@@ -89,7 +105,7 @@ fn channels(b: &[u8], from: usize) -> Vec<(u16, f32)> {
         out.push((id, f32::from_be_bytes([r[5], r[6], r[7], r[8]])));
         at += 17;
     }
-    out
+    (out, at)
 }
 
 /// A channel's name and unit, by the ids two analysers' files share.
@@ -105,8 +121,8 @@ fn channel(id: u16) -> (String, &'static str) {
 }
 
 pub fn decode(b: &[u8]) -> Result<DocView, String> {
-    let start = time_at(b, 0x0c).ok_or("the header is cut short")?;
-    let end = time_at(b, 0x1d).ok_or("the header is cut short")?;
+    let start = time_at(b, 0x0c)?;
+    let end = time_at(b, 0x1d)?;
     let mut v = DocView::new("Elspec PQZip");
     let (after, fields) = strings(b, 0x2f + MARK.len());
     let field = |name: &str| FIELDS.iter().position(|f| *f == name).and_then(|i| fields.get(i));
@@ -139,7 +155,7 @@ pub fn decode(b: &[u8]) -> Result<DocView, String> {
         },
     });
 
-    let ch = channels(b, after);
+    let (ch, after) = channels(b, after);
     if !ch.is_empty() {
         let rows = ch
             .iter()
@@ -170,7 +186,20 @@ mod tests {
 
     /// A header as an analyser writes it (made up: a test's own names).
     fn header() -> Vec<u8> {
-        let start: u64 = 0x01a3_0b30_69a2_42fd;
+        let strings = [
+            "Test01",
+            "TESTSITE",
+            "BLACKBOX",
+            "3x5x2",
+            "0.4.10.23",
+            "00-60-35-00-00-01",
+            "OPS",
+            "ACME",
+        ];
+        header_with(&strings, 0x01a3_0b30_69a2_42fd)
+    }
+
+    fn header_with(strings: &[&str], start: u64) -> Vec<u8> {
         let end: u64 = 0x01a3_0b31_2ca3_499b;
         let off: u64 = 0x0039_9ab0_e3d4_be16;
         let mut b = MAGIC.to_vec();
@@ -183,16 +212,7 @@ mod tests {
         b.extend_from_slice(&(MARK.len() as u16).to_be_bytes());
         b.extend_from_slice(MARK);
         b.extend_from_slice(&[1, 0, 0, 1, 0x3a, 3, 2, 1, 0x2c, 0x11, 0x4e, 0, 0x62]);
-        for s in [
-            "Test01",
-            "TESTSITE",
-            "BLACKBOX",
-            "3x5x2",
-            "0.4.10.23",
-            "00-60-35-00-00-01",
-            "OPS",
-            "ACME",
-        ] {
+        for s in strings {
             b.extend_from_slice(&(s.len() as u16).to_be_bytes());
             b.extend_from_slice(s.as_bytes());
         }
@@ -240,13 +260,55 @@ mod tests {
                 ("Frequency".into(), "50 Hz".into()),
             ]
         );
-        assert!(v.notes[0].contains("not decoded yet"));
+        // What follows the channels, not the channels too.
+        assert!(
+            v.notes[0].contains("(104 B)") && v.notes[0].contains("not decoded yet"),
+            "{}",
+            v.notes[0]
+        );
+    }
+
+    #[test]
+    fn an_empty_string_keeps_its_place() {
+        let strings = [
+            "Test01",
+            "TESTSITE",
+            "BLACKBOX",
+            "3x5x2",
+            "0.4.10.23",
+            "00-60-35-00-00-01",
+            "",
+            "ACME",
+        ];
+        let rec = table(
+            &sniff("", &header_with(&strings, 0x01a3_0b30_69a2_42fd))
+                .unwrap()
+                .unwrap(),
+            0,
+        );
+        assert!(rec.contains(&("Operator".into(), "".into())));
+        assert!(rec.contains(&("Company".into(), "ACME".into())), "{rec:?}");
+    }
+
+    #[test]
+    fn times_out_of_range() {
+        let strings = ["Test01", "TESTSITE", "BLACKBOX"];
+        let e = sniff("", &header_with(&strings, u64::MAX)).unwrap().err().unwrap();
+        assert!(e.contains("out of range"), "{e}");
+        // Far out but adding up: shown as ticks rather than a date.
+        let v = sniff("", &header_with(&strings, u64::MAX - 0x0039_9ab0_e3d4_be16))
+            .unwrap()
+            .unwrap();
+        assert!(table(&v, 0)[0].1.ends_with(" ticks"), "{:?}", table(&v, 0)[0]);
     }
 
     #[test]
     fn not_pqzip() {
         assert!(sniff("", b"\x97\x24\x00\x03 something else entirely, long enough to look").is_none());
         assert!(sniff("application/x-pqzip", b"nope").unwrap().is_err());
+        // Content types reach the decoders lowercased.
+        let v = crate::pretty::decode_on_arrival(Some("application/x-PQZip"), b"nope").unwrap();
+        assert_eq!(v.format, "Elspec PQZip");
         assert!(sniff("", &header()[..20]).is_none());
     }
 }

@@ -6,7 +6,7 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use crate::fmt::human_bytes;
 

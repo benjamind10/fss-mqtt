@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::input::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 

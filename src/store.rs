@@ -8,7 +8,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use web_time::SystemTime;
 
 use crate::capture::{Capture, Target};
 
@@ -955,7 +955,7 @@ mod tests {
         s.sort_children();
         for f in ["", "v1/+/dev12/te", "temp"] {
             let iters = 50;
-            let t = std::time::Instant::now();
+            let t = web_time::Instant::now();
             for _ in 0..iters {
                 let (marks, matched) = Filter::compile(f).visibility(&s);
                 let rows = flatten(&s, marks.as_deref(), &|_, m| m & INSIDE == 0 || matched <= 300);

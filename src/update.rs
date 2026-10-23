@@ -7,8 +7,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use web_time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::http;
 
 const REPO: &str = "mbilling/fss-mqtt";
@@ -57,6 +58,18 @@ fn tag_version(location: &str) -> Option<String> {
 
 /// The newest release: where GitHub's …/releases/latest sends you. No API,
 /// no token, nothing but the request.
+/// A web page doesn't update itself.
+#[cfg(target_arch = "wasm32")]
+fn latest() -> Result<String, String> {
+    Err("not in the web version".into())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn replace(_exe: &Path, _version: &str, _say: &dyn Fn(String)) -> Result<(), String> {
+    Err("not in the web version".into())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn latest() -> Result<String, String> {
     let url = format!("https://github.com/{REPO}/releases/latest");
     let r = http::get(&url, false, 1 << 20, &mut |_, _| {})?;
@@ -340,6 +353,7 @@ fn asset(v: &str) -> Option<String> {
 
 /// Downloads the release archive, checks it against the release's
 /// SHA256SUMS, takes the program out and puts it in place of `exe`.
+#[cfg(not(target_arch = "wasm32"))]
 fn replace(exe: &Path, version: &str, say: &dyn Fn(String)) -> Result<(), String> {
     let name = asset(version).ok_or("there's no release build for this platform")?;
     let base = format!("https://github.com/{REPO}/releases/download/v{version}");
@@ -371,6 +385,7 @@ fn replace(exe: &Path, version: &str, say: &dyn Fn(String)) -> Result<(), String
     install(exe, &program, version)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn sha256(b: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, b)
         .as_ref()

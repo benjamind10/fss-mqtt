@@ -1,16 +1,22 @@
 //! A minimal MQTT v5 client: connect (TCP or TLS), subscribe, receive,
 //! publish, keep alive, reconnect. One blocking thread per connection,
 //! steered by [`Cmd`]s from the UI.
+// In the browser the protocol below waits for its transport (WebSocket).
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 
 use std::io::{self, Read, Write};
+#[cfg(not(target_arch = "wasm32"))]
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
+#[cfg(not(target_arch = "wasm32"))]
 use rustls::pki_types::pem::PemObject;
+#[cfg(not(target_arch = "wasm32"))]
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::pemkey::{self, KeyError};
 use crate::store::{ConnState, Props, Status, Store};
 
@@ -98,6 +104,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a QoS 1 or 2 publish may wait for the broker's acknowledgement.
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Why TLS couldn't be set up. Key problems are told apart because retrying
 /// won't help them: the connection stops (and the UI asks for the passphrase
 /// when that's what's missing).
@@ -107,6 +114,7 @@ pub enum TlsError {
     Other(String),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl std::fmt::Display for TlsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -116,12 +124,14 @@ impl std::fmt::Display for TlsError {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl From<String> for TlsError {
     fn from(e: String) -> TlsError {
         TlsError::Other(e)
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Whether the key at `path` is encrypted and `passphrase` doesn't open it.
 /// False for every other problem, where no passphrase helps: an unreadable
 /// file (connecting retries) or an unsupported or damaged key (connecting
@@ -133,12 +143,14 @@ pub fn key_needs_passphrase(path: &str, passphrase: Option<&str>) -> bool {
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Reads the private key at `path`, decrypting it with `passphrase` if needed.
 pub fn load_key(path: &str, passphrase: Option<&str>) -> Result<PrivateKeyDer<'static>, TlsError> {
     let pem = std::fs::read(path).map_err(|e| TlsError::Other(format!("key {path}: {e}")))?;
     pemkey::load(&pem, passphrase).map_err(|e| TlsError::Key(path.into(), e))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn tls_config(cfg: &Config) -> Result<Option<Arc<rustls::ClientConfig>>, TlsError> {
     if !cfg.tls {
         return Ok(None);
@@ -194,8 +206,10 @@ pub fn tls_config(cfg: &Config) -> Result<Option<Arc<rustls::ClientConfig>>, Tls
 }
 
 #[derive(Debug)]
+#[cfg(not(target_arch = "wasm32"))]
 struct NoVerify(Arc<rustls::crypto::CryptoProvider>);
 
+#[cfg(not(target_arch = "wasm32"))]
 impl rustls::client::danger::ServerCertVerifier for NoVerify {
     fn verify_server_cert(
         &self,
@@ -228,8 +242,10 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 type TlsStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 
+#[cfg(not(target_arch = "wasm32"))]
 enum Conn {
     Plain(TcpStream),
     Tls(Box<TlsStream>),
@@ -237,6 +253,7 @@ enum Conn {
     Wss(Box<crate::ws::Ws<TlsStream>>),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Conn {
     fn tcp(&self) -> &TcpStream {
         match self {
@@ -258,6 +275,7 @@ impl Conn {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Read for Conn {
     fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -269,6 +287,7 @@ impl Read for Conn {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Write for Conn {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
         match self {
@@ -297,6 +316,28 @@ enum End {
     Reconfigured(Box<Config>, bool), // new settings; connect with them?
 }
 
+/// In the browser, until its WebSocket transport comes: the connection
+/// says it can't connect yet, and keeps its commands.
+#[cfg(target_arch = "wasm32")]
+pub fn spawn(cfg: Config, store: Arc<Mutex<Store>>, _start: bool) -> Sender<Cmd> {
+    let (tx, rx) = mpsc::channel();
+    std::mem::forget(rx);
+    set_status(
+        &store,
+        cfg.conn,
+        ConnState::Disconnected,
+        Some("not in the web version yet".into()),
+    );
+    tx
+}
+
+/// No key files in the browser.
+#[cfg(target_arch = "wasm32")]
+pub fn key_needs_passphrase(_path: &str, _passphrase: Option<&str>) -> bool {
+    false
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 /// Starts the connection's thread. It connects now if `start`, then follows
 /// commands; after a failure it retries every few seconds until told to stop.
 pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<Cmd> {
@@ -400,6 +441,7 @@ fn set_sub_err(store: &Mutex<Store>, conn: usize, topic: &str, err: Option<Strin
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn dial(host: &str, port: u16) -> Result<TcpStream, String> {
     let addrs = (host, port)
         .to_socket_addrs()
@@ -606,6 +648,7 @@ fn publish_id(o: &Outgoing, ids: &mut Ids, outbox: &Outbox, lim: &Limits) -> Res
 }
 
 /// One connection's lifetime.
+#[cfg(not(target_arch = "wasm32"))]
 fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut Inbox, outbox: &mut Outbox) -> End {
     // A header or a password from an unset environment variable won't be
     // set by retrying.

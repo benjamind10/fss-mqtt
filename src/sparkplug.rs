@@ -15,7 +15,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::time::{Duration, UNIX_EPOCH};
+use web_time::{Duration, UNIX_EPOCH};
 
 use crate::fmt::{clock, commas, human_bytes, plural};
 use crate::protobuf::{take, varint};

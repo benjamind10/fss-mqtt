@@ -1,6 +1,6 @@
 //! Rendering. Everything is drawn straight into the frame buffer.
 
-use std::time::Duration;
+use web_time::Duration;
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -1396,9 +1396,9 @@ mod tests {
     use std::sync::mpsc::{self, Receiver};
     use std::sync::{Arc, Mutex};
 
+    use crate::input::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use crate::app::{App, Ask, ConnCtl, Focus, Options, PanelRow};
     use crate::config::{self, ConnCfg};
@@ -1863,7 +1863,7 @@ mod tests {
         // The rate's last sample saw every message, so the removal makes
         // the total smaller than it; the next rate must not underflow.
         app.rate_total = total;
-        app.rate_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.rate_at = web_time::Instant::now() - web_time::Duration::from_secs(2);
         app.apply_config(vec![edited.clone(), lab]);
         app.tick();
         assert_eq!(app.rate, 0.0);
@@ -2353,7 +2353,7 @@ mod tests {
 
         // A write that fails (the capture dir can't be made) stops capture
         // and says so, in the panel and the status line.
-        let wait = std::time::Duration::from_secs(5);
+        let wait = web_time::Duration::from_secs(5);
         let blocker = dir.with_extension("blocker");
         std::fs::write(&blocker, "x").unwrap();
         app.store.lock().unwrap().capture_dir = blocker.join("captures");
@@ -2404,9 +2404,9 @@ mod tests {
             .expect("captured");
         let go_on = app.store.lock().unwrap().conns[0].capture.writer().unwrap().stall();
         target.record("v2/fleet", b"2", 0, false, &Props::default());
-        let start = std::time::Instant::now();
-        let late = app.flush_captures(std::time::Duration::from_millis(100));
-        assert!(start.elapsed() < std::time::Duration::from_secs(1), "bounded");
+        let start = web_time::Instant::now();
+        let late = app.flush_captures(web_time::Duration::from_millis(100));
+        assert!(start.elapsed() < web_time::Duration::from_secs(1), "bounded");
         assert!(
             late.len() == 1 && late[0].starts_with("local: ") && late[0].ends_with("the disk is too slow"),
             "{late:?}"
@@ -2429,7 +2429,7 @@ mod tests {
         let (mut app, rx) = sample(tmp_config("open"));
         // A capture file, as the capture writer makes it.
         let path = std::env::temp_dir().join(format!("fss-mqtt-test-{}-open.jsonl", std::process::id()));
-        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let t = web_time::SystemTime::now() - web_time::Duration::from_secs(3600);
         let props = Props {
             content_type: Some("application/json".into()),
             ..Props::default()
@@ -2579,7 +2579,7 @@ mod tests {
             st.all_messages()
                 .into_iter()
                 .map(|(c, t, m)| {
-                    let ms = m.time.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+                    let ms = m.time.duration_since(web_time::UNIX_EPOCH).unwrap().as_millis();
                     (c, t.to_string(), m.payload.clone(), m.size, m.qos, ms)
                 })
                 .collect()
@@ -2602,7 +2602,7 @@ mod tests {
             app.composer.as_ref().unwrap().ed.text()
         );
         // No message rate from the restored messages.
-        back.rate_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        back.rate_at = web_time::Instant::now() - web_time::Duration::from_secs(2);
         back.tick();
         assert_eq!(back.rate, 0.0);
         let _ = std::fs::remove_file(&path);
@@ -2628,7 +2628,7 @@ mod tests {
             "{v}"
         );
         // Changing again since it said its version: not now.
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(web_time::Duration::from_millis(20));
         std::fs::write(&bin, "v10, being written").unwrap();
         app.key(ctrl_n);
         assert!(!app.quit && app.notice.as_ref().unwrap().0.contains("changing on disk"));
@@ -3128,10 +3128,10 @@ mod tests {
         if app.chart.reading() {
             assert!(frame(&app, "reading").contains("reading all rows…"));
         }
-        let start = std::time::Instant::now();
+        let start = web_time::Instant::now();
         while app.chart.reading() {
-            assert!(start.elapsed() < std::time::Duration::from_secs(10), "never read");
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            assert!(start.elapsed() < web_time::Duration::from_secs(10), "never read");
+            std::thread::sleep(web_time::Duration::from_millis(2));
             app.tick();
         }
         let v = frame(&app, "500 rows, the first in view");
@@ -3177,10 +3177,10 @@ mod tests {
         let (mut app, _rx) = app_with(table_topic(crate::store::WHOLE_BUDGET), tmp_config("chart-kept"));
         typ(&mut app, "fastlog");
         press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
-        let start = std::time::Instant::now();
+        let start = web_time::Instant::now();
         while app.chart.reading() {
-            assert!(start.elapsed() < std::time::Duration::from_secs(10), "never read");
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            assert!(start.elapsed() < web_time::Duration::from_secs(10), "never read");
+            std::thread::sleep(web_time::Duration::from_millis(2));
             app.tick();
         }
         let v = frame(&app, "the newest kept whole");

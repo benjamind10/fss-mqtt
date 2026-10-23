@@ -56,8 +56,6 @@ fn tag_version(location: &str) -> Option<String> {
     Some(v.to_string())
 }
 
-/// The newest release: where GitHub's …/releases/latest sends you. No API,
-/// no token, nothing but the request.
 /// A web page doesn't update itself.
 #[cfg(target_arch = "wasm32")]
 fn latest() -> Result<String, String> {
@@ -69,6 +67,8 @@ fn replace(_exe: &Path, _version: &str, _say: &dyn Fn(String)) -> Result<(), Str
     Err("not in the web version".into())
 }
 
+/// The newest release: where GitHub's …/releases/latest sends you. No API,
+/// no token, nothing but the request.
 #[cfg(not(target_arch = "wasm32"))]
 fn latest() -> Result<String, String> {
     let url = format!("https://github.com/{REPO}/releases/latest");

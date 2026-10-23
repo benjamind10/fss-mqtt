@@ -320,8 +320,8 @@ enum End {
 /// says it can't connect yet, and keeps its commands.
 #[cfg(target_arch = "wasm32")]
 pub fn spawn(cfg: Config, store: Arc<Mutex<Store>>, _start: bool) -> Sender<Cmd> {
-    let (tx, rx) = mpsc::channel();
-    std::mem::forget(rx);
+    // Nothing reads the commands: sends fail, and none pile up.
+    let (tx, _) = mpsc::channel();
     set_status(
         &store,
         cfg.conn,

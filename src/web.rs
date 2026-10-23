@@ -141,6 +141,10 @@ pub fn main() {
     });
     let (mut ticked, mut second) = (Instant::now(), Instant::now());
     let mut area = Rect::default();
+    // A hidden tab gets no frames: the connections are also polled on a
+    // timer, which browsers slow down there but keep running, so pings go
+    // out and what arrives is taken in.
+    every(250, mqtt::poll);
     every_frame(move || {
         // The grid is as many cells as the page measured; ratzilla's own size
         // assumes 10×19 pixel cells, and the frame would miss the page's edges.
@@ -250,6 +254,14 @@ fn on_keys(mut f: impl FnMut(WebKeyEvent) -> bool + 'static) {
     let window = window().expect("a window");
     let _ = window.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
     cb.forget(); // for as long as the page is open
+}
+
+/// Runs `f` every `ms` milliseconds, for as long as the page is open.
+fn every(ms: i32, f: fn()) {
+    let cb = Closure::<dyn FnMut()>::new(f);
+    let window = window().expect("a window");
+    let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(cb.as_ref().unchecked_ref(), ms);
+    cb.forget();
 }
 
 /// Runs `f` before every frame the browser paints.

@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 
 use wasm_bindgen::closure::Closure;
@@ -45,12 +45,19 @@ pub fn spawn(cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<Cmd> 
 /// holding the store's lock.
 pub fn poll() {
     CONNS.with(|cs| {
-        for c in cs.borrow_mut().iter_mut() {
-            while let Ok(cmd) = c.rx.try_recv() {
-                c.command(cmd);
+        cs.borrow_mut().retain_mut(|c| {
+            loop {
+                match c.rx.try_recv() {
+                    Ok(cmd) => c.command(cmd),
+                    Err(TryRecvError::Empty) => break,
+                    // The UI let go of it: it ends, and its socket closes,
+                    // without touching a connection that may be gone.
+                    Err(TryRecvError::Disconnected) => return false,
+                }
             }
             c.step();
-        }
+            true
+        })
     });
 }
 
@@ -124,7 +131,8 @@ impl Conn {
         set_status(&self.store, self.cfg.conn, ConnState::Connecting, None);
         match Socket::open(&self.url()) {
             Ok(s) => State::Opening(s, Instant::now() + CONNECT_TIMEOUT),
-            Err(e) => self.end(End::Failed(e)),
+            // A bad URL, a port the browser won't use: retrying won't help.
+            Err(e) => self.end(End::Halted(format!("{}: {e}", self.url()))),
         }
     }
 
@@ -336,7 +344,10 @@ impl Socket {
         let on_open = note(&notes, |_| Note::Open);
         let on_message = note(&notes, |e| {
             let data = e.unchecked_ref::<MessageEvent>().data();
-            Note::Data(js_sys::Uint8Array::new(&data).to_vec())
+            match data.dyn_ref::<js_sys::ArrayBuffer>() {
+                Some(b) => Note::Data(js_sys::Uint8Array::new(b).to_vec()),
+                None => Note::Closed(Some("the broker sent text: MQTT over WebSockets is binary".into())),
+            }
         });
         let on_close = note(&notes, |e| {
             let e = e.unchecked_ref::<CloseEvent>();

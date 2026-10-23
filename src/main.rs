@@ -24,6 +24,7 @@ mod mqtt;
 mod omarchy;
 mod parquet;
 mod pemkey;
+mod pqzip;
 mod pretty;
 mod protobuf;
 mod proxy;

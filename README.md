@@ -202,7 +202,7 @@ clears. Clearing keeps the tree open at the topic you were on.
 | full screen | `↑ ↓ pgup pgdn` | scroll |
 | full screen | `← →` | older / newer message |
 | full screen | `shift ←→` `<` `>` | pan wide tables (CSV, Parquet) |
-| full screen | `tab` | cycle formatted / raw / hex |
+| full screen | `tab` | cycle formatted / chart (when it has numbers) / raw / hex |
 | full screen | `esc q ⏎` | close |
 | tree, messages | `ctrl+e` | publish: edit a copy of the selected message (or a new one on the topic) and send it |
 | full screen | `e` | publish: edit a copy of this message and send it |
@@ -360,7 +360,9 @@ like one of these formats but can't be read, the reason is shown above a hex dum
 ## Charts
 
 A topic with numbers gets a chart in the lower half of its details, when the window has room for
-both. `tab` goes to it from the message list, and `↑ ↓` pick what it shows:
+both. `tab` goes to it from the message list, and `↑ ↓` pick what it shows. Full screen, `tab`
+shows a message's chart over the whole screen, after its formatted view (which is how to see it on
+a short window or a phone); there `shift ←→` pans it:
 
 ![fss-mqtt charts: a turbine's telemetry fields over the messages kept, live, and on the next turbine the same field; the columns of a Parquet fast log and of a CSV report; the keys pressed show below](docs/chart.gif)
 

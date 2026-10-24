@@ -614,8 +614,8 @@ impl App {
         let mut order = vec![Focus::Conns, Focus::Tree];
         if has_msgs {
             order.push(Focus::Msgs);
-            if !self.chart.series.is_empty() {
-                order.push(Focus::Chart);
+            if self.chart_shown() {
+                order.push(Focus::Chart); // (full screen, tab shows it on a short one)
             }
         }
         let i = order.iter().position(|&f| f == self.focus).unwrap_or(1);
@@ -1520,16 +1520,8 @@ impl App {
             KeyCode::Down => self.chart.step(1),
             KeyCode::Home | KeyCode::PageUp => self.chart.pick(0),
             KeyCode::End | KeyCode::PageDown => self.chart.pick(usize::MAX),
-            KeyCode::Left | KeyCode::Right if !self.chart.scrollable() => self.why_no_scroll(),
             KeyCode::Left | KeyCode::Right => {
-                // A quarter of what's in view, or (with shift) all of it.
-                let room = self.chart.room.get().max(2) as isize;
-                let by = if k.modifiers.contains(KeyModifiers::SHIFT) {
-                    room
-                } else {
-                    (room / 4).max(1)
-                };
-                self.chart.scroll(if k.code == KeyCode::Left { -by } else { by });
+                self.chart_pan(k.code == KeyCode::Left, k.modifiers.contains(KeyModifiers::SHIFT));
             }
             KeyCode::Esc => {
                 self.focus = Focus::Tree;
@@ -1542,6 +1534,16 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Scrolls the chart a quarter of what's in view, or `all` of it.
+    fn chart_pan(&mut self, left: bool, all: bool) {
+        if !self.chart.scrollable() {
+            return self.why_no_scroll();
+        }
+        let room = self.chart.room.get().max(2) as isize;
+        let by = if all { room } else { (room / 4).max(1) };
+        self.chart.scroll(if left { -by } else { by });
     }
 
     /// ← → with all of the chart in view: why there's nothing to scroll to.
@@ -1571,10 +1573,17 @@ impl App {
     pub fn update_chart(&mut self) {
         // All of a big table's rows, read meanwhile.
         self.chart.poll();
-        let picked = matches!(self.focus, Focus::Msgs | Focus::Chart)
-            .then_some(self.msg_sel)
-            .flatten();
-        let found = self.selected.and_then(|n| {
+        // Full screen, the message shown; else the one picked in the list.
+        let (node, picked) = match &self.viewer {
+            Some(v) => (Some(v.node), v.msgs.get(v.idx).map(|m| m.seq)),
+            None => (
+                self.selected,
+                matches!(self.focus, Focus::Msgs | Focus::Chart)
+                    .then_some(self.msg_sel)
+                    .flatten(),
+            ),
+        };
+        let found = node.and_then(|n| {
             let st = self.store.lock().unwrap();
             let node = &st.nodes[n];
             let newest = node.latest()?.seq;
@@ -1593,10 +1602,26 @@ impl App {
             }
             None => self.chart.clear(),
         }
-        if self.focus == Focus::Chart && self.chart.series.is_empty() {
+        if self.focus == Focus::Chart && self.viewer.is_none() && !self.chart_shown() {
             self.focus = Focus::Tree;
             self.msg_sel = None;
         }
+        // A message without numbers (←→ went to one) has no chart to show.
+        if let Some(v) = &mut self.viewer
+            && v.mode == crate::viewer::Mode::Chart
+            && self.chart.series.is_empty()
+        {
+            v.set_mode(crate::viewer::Mode::Pretty, &self.th);
+        }
+    }
+
+    /// Whether the main screen gives the chart a pane: the selected topic
+    /// has numbers, and the details pane room for both.
+    pub fn chart_shown(&self) -> bool {
+        self.selected.is_some()
+            && self.chart.topic() == self.selected
+            && self.chart.current().is_some()
+            && self.layout().det_h >= 2 * crate::ui::CHART_MIN_H
     }
 
     fn open_viewer(&mut self, n: usize, sel: Option<u64>) {
@@ -1799,7 +1824,31 @@ impl App {
         match k.code {
             KeyCode::Char('t') => return self.copy_topic(),
             KeyCode::Char('y') => return self.copy_message(),
+            KeyCode::Tab | KeyCode::Char('m') => {
+                let chart = !self.chart.series.is_empty();
+                let v = self.viewer.as_mut().unwrap();
+                return v.set_mode(v.next_mode(chart), &self.th);
+            }
             _ => {}
+        }
+        // Charted: ↑↓ pick what to chart, and shift ←→ (< >) pan it.
+        if self
+            .viewer
+            .as_ref()
+            .is_some_and(|v| v.mode == crate::viewer::Mode::Chart)
+        {
+            let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+            match k.code {
+                KeyCode::Up => return self.chart.step(-1),
+                KeyCode::Down => return self.chart.step(1),
+                KeyCode::Home | KeyCode::PageUp => return self.chart.pick(0),
+                KeyCode::End | KeyCode::PageDown => return self.chart.pick(usize::MAX),
+                KeyCode::Left if shift => return self.chart_pan(true, false),
+                KeyCode::Right if shift => return self.chart_pan(false, false),
+                KeyCode::Char('<') => return self.chart_pan(true, false),
+                KeyCode::Char('>') => return self.chart_pan(false, false),
+                _ => {}
+            }
         }
         let body_h = self.viewer_body_h();
         let v = self.viewer.as_mut().unwrap();

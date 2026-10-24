@@ -584,7 +584,7 @@ fn node_name<'a>(app: &App, name: &str, mark: u8, sel: bool) -> Vec<Span<'a>> {
 }
 
 /// Rows a chart needs to be worth drawing: its box, a heading, the plot.
-const CHART_MIN_H: u16 = 8;
+pub(crate) const CHART_MIN_H: u16 = 8;
 
 fn detail_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
     let Some(n) = app.selected else {
@@ -610,7 +610,7 @@ fn detail_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
         (r, None)
     };
     if let Some(c) = chart {
-        chart_box(buf, c, app);
+        chart_box(buf, c, app, app.focus == Focus::Chart);
     }
     let (iw, ih) = (r.width.saturating_sub(4) as usize, r.height.saturating_sub(2) as usize);
     let (mut lines, sel) = if node.is_conn() {
@@ -743,11 +743,11 @@ fn topic_detail<'a>(app: &App, st: &Store, n: usize, w: usize, h: usize) -> (Vec
 /// The selected topic's numbers: the one picked (`↑↓` with the chart in
 /// focus), where it comes from and its range, the list to pick from, and
 /// the plot.
-fn chart_box(buf: &mut Buffer, r: Rect, app: &App) {
+fn chart_box(buf: &mut Buffer, r: Rect, app: &App, focused: bool) {
     let th = &app.th;
     let ch = &app.chart;
     let Some(s) = ch.current() else { return };
-    draw_box(buf, r, "Chart", vec![], app.focus == Focus::Chart, None, th);
+    draw_box(buf, r, "Chart", vec![], focused, None, th);
     let inner =
         Rect::new(r.x + 2, r.y + 1, r.width.saturating_sub(4), r.height.saturating_sub(2)).intersection(buf.area);
     if inner.width < 16 || inner.height < 4 {
@@ -1278,11 +1278,33 @@ fn viewer(buf: &mut Buffer, area: Rect, app: &App) {
         }
     }));
     let r = Rect::new(0, 0, area.width, area.height - 1);
-    draw_box(buf, r, &v.path, lines, true, None, th);
+    let charted = v.mode == crate::viewer::Mode::Chart;
+    if charted {
+        // The message's head, then its chart in the rest.
+        draw_box(buf, r, &v.path, v.head.clone(), true, None, th);
+        let top = 1 + v.head.len() as u16;
+        let c = Rect::new(
+            r.x + 1,
+            r.y + top,
+            r.width.saturating_sub(2),
+            r.height.saturating_sub(top + 1),
+        );
+        chart_box(buf, c, app, true);
+    } else {
+        draw_box(buf, r, &v.path, lines, true, None, th);
+    }
 
     let mode = format!("view: {}", v.mode_name());
-    let mut keys = vec![("↑↓ pgup pgdn", "scroll", 3), ("←→", "older/newer", 2)];
-    if v.max_width > v.width_now() {
+    let mut keys = if charted {
+        let mut k = vec![("↑↓", "series", 3), ("←→", "older/newer", 2)];
+        if app.chart.scrollable() {
+            k.push(("shift ←→", "pan", 1));
+        }
+        k
+    } else {
+        vec![("↑↓ pgup pgdn", "scroll", 3), ("←→", "older/newer", 2)]
+    };
+    if !charted && v.max_width > v.width_now() {
         keys.push(("shift ←→", "pan", 1));
     }
     keys.extend([
@@ -1291,7 +1313,7 @@ fn viewer(buf: &mut Buffer, area: Rect, app: &App) {
         ("t y", "copy", 1),
         ("esc", "back", 0),
     ]);
-    let lines = (v.lines.len() > body_h && app.notice.is_none())
+    let lines = (!charted && v.lines.len() > body_h && app.notice.is_none())
         .then(|| format!("  {}–{} of {} lines", v.scroll + 1, end, v.lines.len()));
     let room = hint_room(app).saturating_sub(lines.as_deref().map_or(0, fmt::str_width));
     let mut h = notice_line(app).unwrap_or_else(|| hint(th, &keys, room));
@@ -2225,6 +2247,10 @@ mod tests {
         );
         let v = frame(&app, "copied full screen");
         assert!(v.contains("copied formatted JSON, "), "notice full screen");
+        // Its number charted: a copy there is the formatted message.
+        press(&mut app, &[KeyCode::Tab]);
+        typ(&mut app, "y");
+        assert_eq!(last(&app), pretty, "chart");
         press(&mut app, &[KeyCode::Tab]);
         typ(&mut app, "y");
         assert_eq!(last(&app), payload.replace("22.5", "20.5"), "raw");
@@ -3039,6 +3065,49 @@ mod tests {
         press(&mut app, &[KeyCode::Right]);
         let v = frame(&app, "vim msgs hints");
         assert!(v.contains("j k messages") && v.contains("h esc back"), "{v}");
+    }
+
+    #[test]
+    fn tab_full_screen_goes_to_the_chart_when_there_are_numbers() {
+        use crate::viewer::Mode;
+        let (mut app, _rx) = sample(tmp_config("chart-view"));
+        let mode = |app: &App| app.viewer.as_ref().map(|v| v.mode);
+
+        // A day of minutes in a Parquet message: table, chart, raw, hex.
+        typ(&mut app, "v2/turbine/T01/fastlog");
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(mode(&app) == Some(Mode::Pretty));
+        press(&mut app, &[KeyCode::Tab]);
+        assert!(mode(&app) == Some(Mode::Chart));
+        let v = frame(&app, "full screen chart");
+        assert!(v.contains("╭─ Chart ─") && v.contains("view: chart"), "{v}");
+        let first = app.chart.sel;
+        press(&mut app, &[KeyCode::Down]);
+        assert_eq!(app.chart.sel, first + 1, "↓ picks the next series");
+        press(&mut app, &[KeyCode::Tab]);
+        assert!(mode(&app) == Some(Mode::Raw));
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+        assert!(mode(&app) == Some(Mode::Pretty));
+
+        // Text without numbers: no chart to tab to.
+        press(&mut app, &[KeyCode::Esc, KeyCode::Esc]);
+        typ(&mut app, "v1/plant/line1/status");
+        press(&mut app, &[KeyCode::Enter, KeyCode::Tab]);
+        assert!(mode(&app) == Some(Mode::Raw));
+    }
+
+    #[test]
+    fn tab_passes_over_a_chart_with_no_room() {
+        let (mut app, _rx) = sample(tmp_config("chart-hidden"));
+        typ(&mut app, "v1/plant/line1/temp");
+        assert!(app.chart_shown());
+        // Too short for the details and the chart: tab never lands on it.
+        app.resize(110, 24);
+        assert!(!app.chart_shown() && !frame(&app, "short").contains("Chart"));
+        for _ in 0..4 {
+            press(&mut app, &[KeyCode::Tab]);
+            assert!(app.focus != Focus::Chart);
+        }
     }
 
     #[test]

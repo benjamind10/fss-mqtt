@@ -100,7 +100,7 @@ impl ConnCtl {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
     Conns,
     Tree,
@@ -870,6 +870,49 @@ impl App {
             self.panel_offset = self.panel_cursor + 1 - rows;
         }
         self.panel_offset = self.panel_offset.min(self.panel.len().saturating_sub(rows));
+    }
+
+    /// A tap (or click) on cell `x`, `y` of the main screen: on a row of
+    /// the connections panel or the topic tree it moves the cursor there,
+    /// and on the cursor's own row it does what Enter does. Elsewhere, and
+    /// on screens that cover the main one, it does nothing.
+    /// (The web version's: a terminal would have to capture the mouse,
+    /// which takes selecting text away.)
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub fn tap(&mut self, x: u16, y: u16) {
+        if self.composer.is_some() || self.viewer.is_some() || self.prompt.is_some() {
+            return;
+        }
+        let l = self.layout();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        // Inside the panel's border: rows 2 to panel_h - 1.
+        if (2..l.panel_h).contains(&y) {
+            let i = self.panel_offset + (y - 2) as usize;
+            if i < self.panel.len() {
+                let again = self.focus == Focus::Conns && self.panel_cursor == i;
+                self.focus = Focus::Conns;
+                self.panel_cursor = i;
+                if again {
+                    self.key(enter);
+                }
+            }
+            return;
+        }
+        let top = 1 + l.panel_h; // the tree's top border
+        if x < l.tree_w && y > top && y + 1 < top + l.tree_h {
+            let i = self.offset + (y - top - 1) as usize;
+            if i < self.rows.len() {
+                let again = self.focus == Focus::Tree && self.cursor == i;
+                self.focus = Focus::Tree;
+                self.cursor = i;
+                self.clamp_cursor();
+                if again {
+                    self.key(enter);
+                } else {
+                    self.update_chart();
+                }
+            }
+        }
     }
 
     /// Handles a key in the panel; false lets it fall through (e.g. typing).

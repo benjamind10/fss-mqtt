@@ -25,6 +25,8 @@ use crate::mqtt::Cmd;
 use crate::store::Store;
 use crate::{broker, demo, mqtt, theme, ui};
 
+mod touch;
+
 /// How often the app ticks, as in the terminal.
 const TICK: Duration = Duration::from_millis(66);
 
@@ -140,15 +142,25 @@ pub fn main() {
     let mut terminal = Terminal::with_options(backend, fixed).expect("a terminal in the page");
     // Drawn when something may have changed: a key, a tick, a resize.
     let dirty = Rc::new(Cell::new(true));
-    let (keys, pressed) = (app.clone(), dirty.clone());
+    let feed: touch::Feed = {
+        let (app, dirty) = (app.clone(), dirty.clone());
+        Rc::new(move |act| {
+            let mut app = app.borrow_mut();
+            match act {
+                touch::Act::Key(k) => app.key(k),
+                touch::Act::Tap(x, y) => app.tap(x, y),
+            }
+            app.quit = false; // a page isn't quit
+            dirty.set(true);
+        })
+    };
+    let keys = feed.clone();
     on_keys(move |k| {
         let Some(k) = key(&k) else { return false };
-        let mut app = keys.borrow_mut();
-        app.key(k);
-        app.quit = false; // a page isn't quit
-        pressed.set(true);
+        keys(touch::Act::Key(k));
         true
     });
+    touch::start(feed);
     let (mut ticked, mut second) = (Instant::now(), Instant::now());
     let mut area = Rect::default();
     // A hidden tab gets no frames: the connections are also polled on a

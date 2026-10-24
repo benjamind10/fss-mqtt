@@ -27,6 +27,8 @@
     body {
       display: flex;
       flex-direction: column;
+      /* Taps are the app's: no double-tap zoom. */
+      touch-action: manipulation;
     }
     /* The app's grid fills what the footer leaves. */
     #app {
@@ -61,14 +63,86 @@
     footer .end {
       margin-left: auto;
     }
+    /* The keys a phone lacks, on touch screens. */
+    #keys {
+      display: none;
+      flex: none;
+      gap: 4px;
+      padding: 4px;
+      border-top: 1px solid #333;
+    }
+    #keys button {
+      flex: 1;
+      min-width: 0;
+      min-height: 40px;
+      padding: 0;
+      border: 1px solid #333;
+      border-radius: 6px;
+      background: #161616;
+      color: #e8e6e3;
+      font: inherit;
+      touch-action: manipulation;
+    }
+    #keys button:active {
+      background: #333;
+    }
+    /* Where the phone's keyboard types: out of sight. 16px, or iOS zooms. */
+    #kbd {
+      position: fixed;
+      left: 0;
+      bottom: 0;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      font-size: 16px;
+      pointer-events: none;
+    }
+    @media (pointer: coarse) {
+      #keys {
+        display: flex;
+      }
+    }
+    @media (max-width: 640px) {
+      html, body {
+        font-size: 12px;
+      }
+      footer .about {
+        display: none;
+      }
+    }
   </style>
   <link data-trunk rel="rust" href="../Cargo.toml" data-bin="fss-mqtt" data-type="main" data-wasm-opt="z" data-wasm-opt-params="--all-features" />
 </head>
 <body>
   <div id="app"><div id="loading">Loading fss-mqtt…</div></div>
+  <div id="keys">
+    <button data-key="esc" tabindex="-1">esc</button>
+    <button data-key="tab" tabindex="-1">tab</button>
+    <button data-key="left" tabindex="-1">←</button>
+    <button data-key="up" tabindex="-1">↑</button>
+    <button data-key="down" tabindex="-1">↓</button>
+    <button data-key="right" tabindex="-1">→</button>
+    <button data-key="enter" tabindex="-1">⏎</button>
+    <button data-key="bs" tabindex="-1">⌫</button>
+    <button data-key="^e" tabindex="-1">^e</button>
+    <button data-key="^s" tabindex="-1">^s</button>
+    <button data-key="^y" tabindex="-1">^y</button>
+    <button data-key="kbd" tabindex="-1">abc</button>
+  </div>
+  <input id="kbd" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="go" aria-label="Type to the app">
   <footer>
-    <span><b>fss-mqtt</b> — the MQTT explorer for your terminal, here in the browser</span>
+    <span class="about"><b>fss-mqtt</b> — the MQTT explorer for your terminal, here in the browser</span>
     <span class="end"><a href="https://github.com/mbilling/fss-mqtt#install">Install</a> · <a href="https://github.com/mbilling/fss-mqtt">GitHub</a> · <a href="https://github.com/mbilling/fss-mqtt#web-version">Your broker</a></span>
   </footer>
+  <script>
+    // With the phone's keyboard up, the page is what's still in view.
+    if (window.visualViewport) {
+      visualViewport.addEventListener("resize", () => {
+        document.body.style.height = visualViewport.height + "px";
+        window.scrollTo(0, 0);
+        window.dispatchEvent(new Event("resize"));
+      });
+    }
+  </script>
 </body>
 </html>

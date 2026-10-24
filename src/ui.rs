@@ -1559,6 +1559,29 @@ mod tests {
         (app, rxs)
     }
 
+    #[test]
+    fn a_tap_moves_the_cursor_and_a_second_one_enters() {
+        let (mut app, _rx) = sample(PathBuf::new());
+        let l = app.layout();
+        let top = 1 + l.panel_h;
+        // The tree's second row: the cursor goes there.
+        app.tap(3, top + 2);
+        assert_eq!((app.focus, app.cursor), (Focus::Tree, 1));
+        let row = &app.rows[1];
+        let (expanded, kids) = (row.expanded, app.store.lock().unwrap().nodes[row.node].has_children());
+        assert!(kids, "{}", frame(&app, "tapped"));
+        // Again: Enter, which opens or closes it.
+        app.tap(3, top + 2);
+        assert!(app.viewer.is_some() || app.rows[1].expanded != expanded);
+        // The panel's second row (local's first subscription).
+        app.viewer = None;
+        app.tap(5, 3);
+        assert_eq!((app.focus, app.panel_cursor), (Focus::Conns, 1));
+        // A border does nothing.
+        app.tap(0, top);
+        assert_eq!(app.focus, Focus::Conns);
+    }
+
     fn typ(app: &mut App, s: &str) {
         for c in s.chars() {
             app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));

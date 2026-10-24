@@ -1591,12 +1591,10 @@ impl App {
                     self.msg_sel = None;
                 }
             }
-            KeyCode::Enter => {
-                // The topic's own enter still opens the message. Here it
-                // toggles the chart over the whole screen.
-                if self.chart.current().is_some() {
-                    self.chart_full = !self.chart_full;
-                }
+            // The topic's own enter still opens the message. Here it
+            // toggles the chart over the whole screen.
+            KeyCode::Enter if self.chart.current().is_some() => {
+                self.chart_full = !self.chart_full;
             }
             _ => {}
         }

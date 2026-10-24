@@ -197,12 +197,12 @@ clears. Clearing keeps the tree open at the topic you were on.
 | messages | `← esc` | back to the tree |
 | chart | `↑ ↓ home end pgup pgdn` | pick the column or field to chart (see [Charts](#charts)) |
 | chart | `← →` (`shift`: a page) | scroll through the rows (or messages) when there are more than fit |
-| chart | `⏎` | open the message full screen |
+| chart | `⏎` | open the message full screen, as its chart |
 | chart | `esc` | back to the tree |
 | full screen | `↑ ↓ pgup pgdn` | scroll |
 | full screen | `← →` | older / newer message |
 | full screen | `shift ←→` `<` `>` | pan wide tables (CSV, Parquet) |
-| full screen | `tab` | cycle formatted / raw / hex |
+| full screen | `tab` | cycle formatted / chart (when it has numbers) / raw / hex |
 | full screen | `esc q ⏎` | close |
 | tree, messages | `ctrl+e` | publish: edit a copy of the selected message (or a new one on the topic) and send it |
 | full screen | `e` | publish: edit a copy of this message and send it |
@@ -360,7 +360,11 @@ like one of these formats but can't be read, the reason is shown above a hex dum
 ## Charts
 
 A topic with numbers gets a chart in the lower half of its details, when the window has room for
-both. `tab` goes to it from the message list, and `↑ ↓` pick what it shows:
+both. On a narrow screen the panes stack: the connections panel stays short, and a topic with a
+chart is given the rows for a shorter one, so it still shows on a phone-sized window. `tab` goes
+to the chart from the message list, and `↑ ↓` pick what it shows. Full screen, `tab` shows a
+message's chart over the whole screen, after its formatted view, and `⏎` on the chart opens it
+there; `shift ←→` pans it:
 
 ![fss-mqtt charts: a turbine's telemetry fields over the messages kept, live, and on the next turbine the same field; the columns of a Parquet fast log and of a CSV report; the keys pressed show below](docs/chart.gif)
 
@@ -542,6 +546,8 @@ brokers over WebSockets, and from an https page only `wss://` ones; it can't sen
 proxy or certificate files of its own, or write to disk (capture, sessions). Nothing is saved.
 On a phone or tablet, tap a row to select it and again to open it, swipe to move, and use the
 key bar for the keys a phone has none of; tap the filter line (or abc) for the keyboard.
+For a chart full screen, open the message (tap it twice) and tab to its chart, or tab to the chart
+pane and press enter; esc goes back. The key bar's esc, enter and tab are those keys.
 Copies go to the browser's clipboard. Chrome on Windows and Linux keeps Ctrl+T and Ctrl+W for its
 tabs, so the page also takes Alt+T (copy the topic) and Alt+W (filter: back a level).
 

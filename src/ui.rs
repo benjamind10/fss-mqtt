@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Chart, Dataset, GraphType, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Ask, Focus, PanelRow, msg_index, node_title};
+use crate::app::{App, Ask, CHART_MIN_H, CHART_MIN_H_STACKED, Focus, PanelRow, msg_index, node_title};
 use crate::composer::{self, Editor};
 use crate::fmt::{self, ago, commas, human_bytes, human_count, msg_count, plural};
 use crate::glyph;
@@ -82,7 +82,7 @@ fn draw_all(f: &mut Frame, app: &App) {
         Rect::new(l.tree_w, top, l.det_w, l.det_h)
     };
     tree_box(buf, tree_area, app, &st);
-    detail_box(buf, det_area, app, &st);
+    detail_box(buf, det_area, app, &st, l.stacked);
     let y = det_area.bottom();
     input_box(buf, Rect::new(0, y, area.width, 3), app);
     put(buf, 0, y + 3, hints(app), area.width);
@@ -470,9 +470,17 @@ fn tree_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
             ]));
         }
     }
-    let end = (app.offset + ih).min(app.rows.len());
+    // Where the list was scrolled to, unless this frame is shorter than
+    // the app last clamped for (a chart just took the rows, or the window
+    // changed): then wherever shows the cursor.
+    let offset = if (app.offset..app.offset + ih).contains(&app.cursor) {
+        app.offset
+    } else {
+        app.cursor.saturating_sub(ih.saturating_sub(1))
+    };
+    let end = (offset + ih).min(app.rows.len());
     let mut sel_line = None;
-    for i in app.offset..end {
+    for i in offset..end {
         if i == app.cursor {
             sel_line = Some(lines.len());
         }
@@ -583,17 +591,16 @@ fn node_name<'a>(app: &App, name: &str, mark: u8, sel: bool) -> Vec<Span<'a>> {
     out
 }
 
-/// Rows a chart needs to be worth drawing: its box, a heading, the plot.
-pub(crate) const CHART_MIN_H: u16 = 8;
-
-fn detail_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
+fn detail_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store, stacked: bool) {
     let Some(n) = app.selected else {
         draw_box(buf, r, "", vec![], false, None, &app.th);
         return;
     };
     let node = &st.nodes[n];
-    // A topic with numbers gives the lower half to their chart.
-    let (r, chart) = if app.chart.topic() == Some(n) && app.chart.current().is_some() && r.height >= 2 * CHART_MIN_H {
+    // A topic with numbers gives the lower half to their chart, when the
+    // pane is tall enough for both. A stacked screen accepts a shorter one.
+    let min_h = if stacked { CHART_MIN_H_STACKED } else { CHART_MIN_H };
+    let (r, chart) = if app.chart.topic() == Some(n) && app.chart.current().is_some() && r.height >= 2 * min_h {
         let h = r.height / 2;
         (
             Rect {
@@ -1193,7 +1200,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
         (true, false, Focus::Chart) => vec![
             ("j k", "column / field", 3),
             ("h l", "scroll", 2),
-            (glyph::ENTER, "open", 2),
+            (glyph::ENTER, "full", 1),
             ("e", "publish", 1),
             ("t y", "copy", 1),
             ("esc", "back", 2),
@@ -1228,7 +1235,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
         (false, _, Focus::Chart) => vec![
             ("↑↓", "column / field", 3),
             ("←→", "scroll", 2),
-            (glyph::ENTER, "open", 2),
+            (glyph::ENTER, "full", 1),
             ("^e", "publish", 1),
             ("^t ^y", "copy", 1),
             ("esc", "back", 2),
@@ -2757,7 +2764,17 @@ mod tests {
             let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
             t.draw(|f| super::draw(f, app)).unwrap();
         };
-        let sizes = [(184, 55), (184, 57), (110, 36), (79, 40), (60, 20), (20, 9), (10, 8)];
+        let sizes = [
+            (184, 55),
+            (184, 57),
+            (110, 36),
+            (79, 40),
+            (60, 20),
+            (54, 40),
+            (52, 35),
+            (20, 9),
+            (10, 8),
+        ];
         let check = |app: &mut App, what: &str| {
             for &(aw, ah) in &sizes {
                 app.resize(aw, ah);
@@ -2778,8 +2795,18 @@ mod tests {
         check(&mut app, "prompt");
         press(&mut app, &[KeyCode::Esc, KeyCode::Esc, KeyCode::Esc, KeyCode::Tab]);
         app.prompt = None;
-        // Full screen, and the publish editor.
+        // The chart full screen, the message full screen, and the publish editor.
+        app.resize(110, 36); // with room for the chart pane, to tab to
         typ(&mut app, "v1/plant/line1/temp");
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab, KeyCode::Enter]);
+        assert!(
+            app.viewer
+                .as_ref()
+                .is_some_and(|v| v.mode == crate::viewer::Mode::Chart)
+        );
+        check(&mut app, "chart full screen");
+        press(&mut app, &[KeyCode::Esc, KeyCode::Esc]);
+        assert!(app.viewer.is_none() && app.focus == Focus::Tree);
         press(&mut app, &[KeyCode::Enter]);
         assert!(app.viewer.is_some());
         check(&mut app, "viewer");
@@ -3180,6 +3207,180 @@ mod tests {
         // Too little room for both halves: the details only.
         app.resize(110, 24);
         assert!(!frame(&app, "short window").contains("Chart"));
+    }
+
+    #[test]
+    fn a_phone_shows_the_chart_without_moving_the_desktop_layout() {
+        let (mut app, _rx) = sample(tmp_config("phone-chart"));
+        typ(&mut app, "v1/plant/line1/temp");
+
+        // A phone (about 52–54×35–40) used to leave the detail pane ~13 rows,
+        // short of the 16 a wide chart and its messages each need.
+        for &(w, h) in &[(54u16, 40u16), (52, 35), (53, 38)] {
+            app.resize(w, h);
+            let l = app.layout();
+            assert!(l.stacked, "{w}x{h}");
+            assert_eq!(l.panel_h, 6, "connections stay capped at {w}x{h}");
+            assert!(
+                l.det_h >= 2 * crate::app::CHART_MIN_H_STACKED,
+                "detail {} at {w}x{h}",
+                l.det_h
+            );
+            assert!(l.tree_h >= 6, "topic list {} at {w}x{h}", l.tree_h);
+            let v = frame(&app, &format!("phone {w}x{h}"));
+            assert!(
+                v.contains("╭─ Chart ─") && v.contains("min 20.5") && v.contains("Messages"),
+                "chart under the messages at {w}x{h}:\n{v}"
+            );
+        }
+
+        // The topic's enter still opens the message, on a phone too.
+        app.resize(54, 40);
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(
+            app.viewer
+                .as_ref()
+                .is_some_and(|v| v.mode == crate::viewer::Mode::Pretty)
+        );
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.focus == Focus::Tree && app.viewer.is_none());
+
+        // Wide layout is unchanged, including a short window with no chart.
+        app.resize(110, 36);
+        let l = app.layout();
+        assert!(!l.stacked);
+        assert_eq!((l.panel_h, l.tree_w, l.tree_h, l.det_w, l.det_h), (7, 49, 24, 61, 24));
+        assert!(frame(&app, "desktop").contains("╭─ Chart ─"));
+        app.resize(80, 40);
+        let l = app.layout();
+        assert!(
+            !l.stacked && l.panel_h == 7 && l.tree_h == 28,
+            "panel {} tree {}",
+            l.panel_h,
+            l.tree_h
+        );
+        app.resize(110, 24);
+        assert!(!frame(&app, "short desktop").contains("Chart"));
+
+        // No numbers: no chart, and the topic list keeps its 55%.
+        app.resize(54, 40);
+        press(&mut app, &[KeyCode::Esc]);
+        typ(&mut app, "v1/plant/line1/status");
+        let l = app.layout();
+        let body = 40 - 5 - l.panel_h;
+        assert_eq!(l.tree_h, body * 55 / 100);
+        assert!(!frame(&app, "no numbers on a phone").contains("Chart"));
+    }
+
+    #[test]
+    fn the_topic_list_stays_on_the_cursor_when_a_chart_shortens_it() {
+        let mut st = Store::new(10, 64 * 1024);
+        let c = st.add_conn("local", "mqtt://x", None, vec![sub("#")]);
+        for i in 0..40 {
+            st.add(c, &format!("n{i:02}"), b"RUNNING", 0, false, Props::default());
+        }
+        // Two values: a chart needs more than one point.
+        st.add(c, "temp", b"21.5", 0, false, Props::default());
+        st.add(c, "temp", b"22.0", 0, false, Props::default());
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            Arc::new(Mutex::new(st)),
+            Options {
+                inline_bytes: 64,
+                vim: false,
+                oma: false,
+            },
+            Theme::new(false),
+            vec![ConnCtl {
+                cfg: ConnCfg {
+                    name: "local".into(),
+                    url: "mqtt://x:1883".into(),
+                    topics: vec!["#".into()],
+                    ..Default::default()
+                },
+                saved: true,
+                tx,
+                password: None,
+                key_password: None,
+            }],
+            tmp_config("chart-scroll-tree"),
+            vec![],
+        );
+        app.resize(54, 40);
+        app.tick();
+        let tall = app.tree_height();
+        assert!(app.rows.len() > tall + 5, "the list has to scroll");
+        press(&mut app, &[KeyCode::End]);
+        assert_eq!(sel_path(&app), "temp");
+        let h = app.tree_height();
+        assert!(h < tall, "the chart takes rows from the list");
+        assert!(
+            app.offset <= app.cursor && app.cursor < app.offset + h,
+            "cursor {} offset {} window {h}",
+            app.cursor,
+            app.offset
+        );
+        let v = frame(&app, "chart shortened the list");
+        assert!(v.contains("╭─ Chart ─") && v.contains("min 21.5"), "{v}");
+        let l = app.layout();
+        let lines: Vec<_> = v.lines().collect();
+        let top = (1 + l.panel_h) as usize;
+        let shown = lines
+            .iter()
+            .skip(top + 1)
+            .take(h)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            shown.contains(glyph::CURSOR) && shown.contains("temp"),
+            "cursor row not in the list:\n{v}"
+        );
+    }
+
+    #[test]
+    fn enter_on_the_chart_opens_the_message_as_its_chart() {
+        use crate::viewer::Mode;
+        let (mut app, _rx) = sample(tmp_config("chart-full"));
+        let mode = |app: &App| app.viewer.as_ref().map(|v| v.mode);
+        typ(&mut app, "v1/plant/line1/temp");
+        // The topic's enter is still the message, formatted.
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(mode(&app) == Some(Mode::Pretty));
+        press(&mut app, &[KeyCode::Esc]);
+
+        // Tab to the chart, then enter: the message full screen, charted.
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+        assert!(app.focus == Focus::Chart);
+        assert!(frame(&app, "chart pane").contains(&format!("{} full", glyph::ENTER)));
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(mode(&app) == Some(Mode::Chart));
+        let v = frame(&app, "chart full screen");
+        assert!(
+            v.contains("╭─ Chart ─") && !v.contains("Topics") && v.contains("esc back"),
+            "{v}"
+        );
+        // Esc: back to the panes, on the chart.
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.viewer.is_none() && app.focus == Focus::Chart);
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.focus == Focus::Tree);
+
+        // A Parquet table: ↑↓ pick a column there, on a phone too.
+        press(&mut app, &[KeyCode::Esc]);
+        typ(&mut app, "fastlog");
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab, KeyCode::Enter]);
+        assert!(mode(&app) == Some(Mode::Chart));
+        let first = app.chart.current().unwrap().name.clone();
+        press(&mut app, &[KeyCode::Down]);
+        assert_ne!(app.chart.current().unwrap().name, first);
+        app.resize(52, 35);
+        app.notice = None;
+        let v = frame(&app, "phone full screen");
+        assert!(
+            v.contains("╭─ Chart ─") && v.contains("esc back") && !v.contains("Topics"),
+            "{v}"
+        );
     }
 
     #[test]

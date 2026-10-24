@@ -28,6 +28,15 @@ const CLIP_HEX_WIDTH: usize = 80;
 /// The most rows the connections panel shows: five connections with a
 /// subscription each. More scroll.
 pub const PANEL_ROWS: u16 = 10;
+/// Stacked screens cap the connections panel here, borders included:
+/// four rows, then it scrolls, rather than the desktop's ten.
+const STACKED_PANEL_MAX: u16 = 6;
+/// Rows a chart needs to be worth drawing on a wide screen: its box, a
+/// heading, the plot. The detail pane splits one off at twice this.
+pub(crate) const CHART_MIN_H: u16 = 8;
+/// A stacked screen may draw a shorter chart: the plot needs four rows
+/// inside the box. Twice this is what the detail pane must hold.
+pub(crate) const CHART_MIN_H_STACKED: u16 = 6;
 /// How long the new version may take to be noticed after an update.
 const RESTART_WAIT: Duration = Duration::from_secs(30);
 
@@ -178,6 +187,9 @@ pub struct App {
     pub msg_sel: Option<u64>, // seq of the selected message in the list
     /// The numbers to chart for the selected topic.
     pub chart: crate::chart::State,
+    /// The chart drawn over the whole screen. Enter with the chart pane
+    /// focused opens it; esc or enter closes it.
+    pub chart_full: bool,
 
     pub viewer: Option<Viewer>,
     pub clipboard: clipboard::Sink,
@@ -204,6 +216,26 @@ pub struct App {
     installed: Option<String>,
     /// Quit to restart into it (ctrl+n), continuing the session.
     pub restart: bool,
+}
+
+/// Topic-list and detail heights for a stacked body.
+///
+/// Without a chart the list keeps 55%. With one, the detail pane gets at
+/// least `2 * CHART_MIN_H_STACKED` (the messages, and a short chart under
+/// them) and two thirds of whatever is left after a small list; the list
+/// keeps the rest. A 35–40 row phone then shows the chart: a 55% list used
+/// to leave the detail pane a row or two short of `2 * CHART_MIN_H`.
+fn stacked_split(body_h: u16, has_chart: bool) -> (u16, u16) {
+    const TREE_MIN: u16 = 6;
+    let chart_block = 2 * CHART_MIN_H_STACKED;
+    if has_chart && body_h >= chart_block + 4 {
+        let tree_min = TREE_MIN.min(body_h - chart_block);
+        let spare = body_h - chart_block - tree_min;
+        let tree_h = tree_min + spare / 3;
+        return (tree_h, body_h - tree_h);
+    }
+    let tree_h = body_h * 55 / 100;
+    (tree_h, body_h - tree_h)
 }
 
 impl App {
@@ -252,6 +284,7 @@ impl App {
             focus: Focus::Tree,
             msg_sel: None,
             chart: Default::default(),
+            chart_full: false,
             viewer: None,
             clipboard: clipboard::Sink::default(),
             composer: None,
@@ -285,19 +318,25 @@ impl App {
     /// of the frame it draws, which can be newer than the last resize the
     /// app has seen (the window shrank just before the frame).
     pub fn layout_for(&self, width: u16, height: u16) -> Layout {
+        let stacked = width < 80;
         // The connections panel takes what it needs, up to a third of the
-        // screen and `PANEL_ROWS` rows; more scroll.
-        let max_panel = (height / 3).clamp(3, PANEL_ROWS + 2);
+        // screen and `PANEL_ROWS` rows; more scroll. Stacked, it stays
+        // shorter so a phone still has room under it.
+        let max_panel = if stacked {
+            (height / 5).clamp(3, STACKED_PANEL_MAX)
+        } else {
+            (height / 3).clamp(3, PANEL_ROWS + 2)
+        };
         let panel_h = (self.panel.len() as u16 + 2).clamp(3, max_panel);
         let body_h = height.saturating_sub(5 + panel_h).max(4); // header + input box (3) + hints
-        if width < 80 {
-            let th = body_h * 55 / 100;
+        if stacked {
+            let (tree_h, det_h) = stacked_split(body_h, self.has_chart());
             return Layout {
                 panel_h,
                 tree_w: width,
-                tree_h: th,
+                tree_h,
                 det_w: width,
-                det_h: body_h - th,
+                det_h,
                 stacked: true,
             };
         }
@@ -310,6 +349,16 @@ impl App {
             det_h: body_h,
             stacked: false,
         }
+    }
+
+    /// The selected topic has numbers to plot.
+    fn has_chart(&self) -> bool {
+        self.chart.topic() == self.selected && self.chart.current().is_some()
+    }
+
+    /// The chart covers the screen: the pane is focused and still has a series.
+    pub fn chart_open(&self) -> bool {
+        self.chart_full && self.focus == Focus::Chart && self.has_chart()
     }
 
     pub fn tree_height(&self) -> usize {
@@ -548,6 +597,8 @@ impl App {
         self.selected = self.rows.get(self.cursor).map(|r| r.node);
         if self.selected != prev {
             self.msg_sel = None;
+            // The full-screen chart is of this topic; another one closes it.
+            self.chart_full = false;
             if matches!(self.focus, Focus::Msgs | Focus::Chart) {
                 self.focus = Focus::Tree;
             }
@@ -880,7 +931,7 @@ impl App {
     /// which takes selecting text away.)
     #[cfg(any(target_arch = "wasm32", test))]
     pub fn tap(&mut self, x: u16, y: u16) {
-        if self.composer.is_some() || self.viewer.is_some() || self.prompt.is_some() {
+        if self.composer.is_some() || self.viewer.is_some() || self.prompt.is_some() || self.chart_open() {
             return;
         }
         let l = self.layout();
@@ -1513,7 +1564,8 @@ impl App {
     }
 
     /// Keys in the chart: through its columns and fields, and along the
-    /// rows (or messages) when there are more than fit.
+    /// rows (or messages) when there are more than fit. Enter opens it
+    /// over the whole screen; enter or esc closes that.
     fn chart_key(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Up => self.chart.step(-1),
@@ -1532,12 +1584,18 @@ impl App {
                 self.chart.scroll(if k.code == KeyCode::Left { -by } else { by });
             }
             KeyCode::Esc => {
-                self.focus = Focus::Tree;
-                self.msg_sel = None;
+                if self.chart_full {
+                    self.chart_full = false;
+                } else {
+                    self.focus = Focus::Tree;
+                    self.msg_sel = None;
+                }
             }
             KeyCode::Enter => {
-                if let Some(n) = self.selected {
-                    self.open_viewer(n, self.msg_sel);
+                // The topic's own enter still opens the message. Here it
+                // toggles the chart over the whole screen.
+                if self.chart.current().is_some() {
+                    self.chart_full = !self.chart_full;
                 }
             }
             _ => {}
@@ -1596,6 +1654,14 @@ impl App {
         if self.focus == Focus::Chart && self.chart.series.is_empty() {
             self.focus = Focus::Tree;
             self.msg_sel = None;
+        }
+        // A chart changes how tall the topic list is; keep its scroll on
+        // the cursor for that height (the frame draws the same layout).
+        self.clamp_cursor();
+        // Full screen only while this pane is focused on a topic that still
+        // has a series. Another topic, or none, closes it.
+        if self.focus != Focus::Chart || self.chart.topic() != self.selected || self.chart.current().is_none() {
+            self.chart_full = false;
         }
     }
 

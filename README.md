@@ -177,6 +177,7 @@ Just type — the tree updates on every keystroke and the cursor jumps to the fi
   everything below a match is included.
 - **Search** (anything else): case-insensitive substring over the full topic path; matches are
   underlined.
+- **`!`** alone: the topics with an [anomaly](#anomalies) flagged.
 
 `backspace` deletes a character, `ctrl+w` deletes back to the previous level, `esc`/`ctrl+u`
 clears. Clearing keeps the tree open at the topic you were on.
@@ -390,6 +391,23 @@ of them, one to a dot, and `← →` scroll through (a quarter of the view at a 
 view); the bottom border says which are in view (`rows 1,201–1,400`). A message's rows start at
 the first; the numbers each message carries start at the newest, and keep following them until
 you scroll back. With all of it in view, `← →` say so, and what would keep more.
+
+## Anomalies
+
+fss-mqtt watches every topic as its messages arrive and flags what doesn't look usual:
+
+- **spike**: a number far outside its usual range (6 standard deviations), e.g.
+  `power_kw 9800 (usual 900–3600)`. Flagged for 5 minutes.
+- **stuck**: a number that usually changes has repeated one value 20 times (a frozen sensor).
+- **silent**: a topic that publishes regularly has said nothing for 4 of its usual intervals (and
+  at least 5 seconds) while its connection is up.
+
+The numbers are those a chart would show: JSON fields, a number payload, Sparkplug metrics. Each
+check waits for 20 messages to learn what's usual first, and keeps a running mean and spread
+weighted to about the last 30, so it costs a few numbers per field and nothing per message worth
+noticing. A flagged topic says why in red in the tree (`! spike`), a collapsed branch how many it
+hides (`!2`), the header the total (`! 2 anomalies`), and its details the reason and since when.
+Type `!` to see only the flagged topics.
 
 ## Capture to disk
 

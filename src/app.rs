@@ -196,6 +196,8 @@ pub struct App {
     pub rate: f64,
     pub(crate) rate_total: u64,
     pub(crate) rate_at: Instant,
+    /// When the topics' watches were last looked at (for silence).
+    watched_at: Instant,
     pub quit: bool,
     /// Watching for a newer fss-mqtt in our place (not in tests).
     pub upgrade: Option<crate::upgrade::Watch>,
@@ -288,6 +290,7 @@ impl App {
             // The rate counts what arrives from now on.
             rate_total: store_total,
             rate_at: Instant::now(),
+            watched_at: Instant::now(),
             quit: false,
             upgrade: None,
             omarchy: None,
@@ -376,6 +379,10 @@ impl App {
         self.now = SystemTime::now();
         let (total, notices) = {
             let mut st = self.store.lock().unwrap();
+            if self.watched_at.elapsed() >= Duration::from_secs(1) {
+                self.watched_at = Instant::now();
+                st.check_watches(self.now);
+            }
             if st.struct_ver != self.struct_ver {
                 self.need_rebuild = true;
             }

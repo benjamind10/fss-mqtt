@@ -403,6 +403,10 @@ fn header<'a>(app: &App, st: &Store) -> Line<'a> {
     if st.live().any(|c| c.capture.active()) {
         left.push(Span::styled("  ● capturing", th.red));
     }
+    if st.flagged > 0 {
+        let n = plural(st.flagged, "anomaly", "anomalies");
+        left.push(Span::styled(format!("  ! {n}"), th.red));
+    }
     if let Some(v) = app.upgrade.as_ref().and_then(|w| w.offering()) {
         let v = if v == env!("CARGO_PKG_VERSION") { "new build" } else { v };
         left.push(Span::styled(format!("  ↑ {v} · ^n restart"), th.accent_b));
@@ -515,6 +519,9 @@ fn tree_line<'a>(app: &App, st: &Store, r: &Row, sel: bool, w: usize) -> Line<'a
         }
         if !r.expanded {
             spans.push(Span::styled(format!(" ({})", n.topics), th.faint));
+            if n.flagged_below > 0 {
+                spans.push(Span::styled(format!(" !{}", n.flagged_below), th.red));
+            }
         }
         return join_lr(spans, vec![Span::styled(human_count(n.sub_msgs), th.faint)], w);
     }
@@ -536,6 +543,9 @@ fn tree_line<'a>(app: &App, st: &Store, r: &Row, sel: bool, w: usize) -> Line<'a
         gs,
     ));
     spans.extend(node_name(app, &n.name, r.mark, sel));
+    if let Some(f) = n.watch.as_ref().and_then(|w| w.flag(app.now)) {
+        spans.push(Span::styled(format!(" ! {}", f.kind.name()), th.red));
+    }
     if st.conns[n.conn].capture.captures(&n.path) {
         spans.push(Span::styled(" ●", th.red)); // written to disk
     }
@@ -553,6 +563,9 @@ fn tree_line<'a>(app: &App, st: &Store, r: &Row, sel: bool, w: usize) -> Line<'a
     }
     if n.has_children() && !r.expanded {
         spans.push(Span::styled(format!(" ({})", n.topics), th.faint));
+        if n.flagged_below > 0 {
+            spans.push(Span::styled(format!(" !{}", n.flagged_below), th.red));
+        }
     }
     join_lr(spans, vec![Span::styled(human_count(n.sub_msgs), th.faint)], w)
 }
@@ -665,6 +678,14 @@ fn topic_detail<'a>(app: &App, st: &Store, n: usize, w: usize, h: usize) -> (Vec
         ));
     }
     out.push(Line::from(meta));
+    // What its watch flags, and since when.
+    if let Some(f) = node.watch.as_ref().and_then(|w| w.flag(app.now)) {
+        out.push(Line::from(vec![
+            Span::styled(format!("! {} ", f.kind.name()), th.red),
+            Span::styled(f.what.clone(), th.text),
+            Span::styled(format!(" · {}", ago(app.now, f.at)), th.dim),
+        ]));
+    }
     out.push(Line::default());
 
     // Messages
@@ -1072,6 +1093,10 @@ fn input_box(buf: &mut Buffer, r: Rect, app: &App) {
         ],
         FilterMode::Search => vec![
             Span::styled("search · ", th.dim),
+            Span::styled(plural(app.matched as usize, "topic", "topics"), th.text),
+        ],
+        FilterMode::Flagged => vec![
+            Span::styled("flagged · ", th.dim),
             Span::styled(plural(app.matched as usize, "topic", "topics"), th.text),
         ],
         FilterMode::None => vec![],
@@ -3092,6 +3117,41 @@ mod tests {
         press(&mut app, &[KeyCode::Right]);
         let v = frame(&app, "vim msgs hints");
         assert!(v.contains("j k messages") && v.contains("h esc back"), "{v}");
+    }
+
+    #[test]
+    fn anomalies_show_in_the_header_the_tree_and_with_the_bang_filter() {
+        let (mut app, _rx) = sample(tmp_config("anomaly"));
+        {
+            let mut st = app.store.lock().unwrap();
+            for i in 0..40 {
+                let p = format!("{{\"t\":{}}}", 20.0 + (i % 7) as f64 * 0.3);
+                st.add_decoded(0, "v1/plant/line9/temp", p.as_bytes(), 0, false, Props::default(), None);
+            }
+            assert_eq!(st.flagged, 0);
+            st.add_decoded(
+                0,
+                "v1/plant/line9/temp",
+                b"{\"t\":99}",
+                0,
+                false,
+                Props::default(),
+                None,
+            );
+            assert_eq!(st.flagged, 1);
+        }
+        app.tick();
+        let v = frame(&app, "flagged");
+        assert!(v.contains("! 1 anomaly"), "{v}");
+        // Collapsed, its connection says how many are below.
+        assert!(v.contains("!1"), "{v}");
+
+        typ(&mut app, "!");
+        let v = frame(&app, "the ! filter");
+        assert!(v.contains("flagged · 1 topic"), "{v}");
+        assert!(v.contains("temp ! spike"), "{v}");
+        assert!(v.contains("! spike t 99 (usual "), "the reason in the details: {v}");
+        assert!(!v.contains("line1"), "only flagged topics: {v}");
     }
 
     #[test]

@@ -3,8 +3,9 @@
 //! by a broker. Each site's connection has one retained sample of every
 //! binary format the viewer decodes, then turbine telemetry every second,
 //! grid values, and now and then an alarm, a status change, a fresh fast
-//! log and the SCADA snapshot. Messages go through the same decoding on
-//! arrival as a broker's.
+//! log and the SCADA snapshot; every two minutes, a spike, a stuck sensor
+//! and a silent turbine for the watch to flag. Messages go through the same
+//! decoding on arrival as a broker's.
 
 use crate::capture::matches;
 use crate::mqtt::Outgoing;
@@ -169,14 +170,28 @@ impl Demo {
             .unwrap_or_default()
             .as_secs();
         let ts = crate::values::timestamp(now as i64, 0, true).replace(' ', "T");
+        // Something to flag (watch.rs) every two minutes: a power spike at
+        // oslo's T03, a wind sensor stuck at bergen's T04, and bergen's T05
+        // going quiet for half a minute.
+        let cycle = i % 120;
         for (s, site) in SITES.iter().enumerate() {
             let c = self.conns[s];
             for t in 1..=TURBINES {
+                let (oslo, bergen) = (*site == "oslo", *site == "bergen");
+                if bergen && t == 5 && (90..120).contains(&cycle) {
+                    continue;
+                }
                 let id = format!("T{t:02}");
+                let mut power = self.num(900.0, 3600.0, 1);
+                let mut wind = self.num(4.0, 14.0, 1);
+                if oslo && t == 3 && cycle == 25 {
+                    power = "9800.0".into();
+                }
+                if bergen && t == 4 && (30..80).contains(&cycle) {
+                    wind = "8.4".into();
+                }
                 let p = format!(
-                    "{{\"ts\":\"{ts}\",\"power_kw\":{},\"wind_ms\":{},\"rpm\":{},\"pitch_deg\":{}}}",
-                    self.num(900.0, 3600.0, 1),
-                    self.num(4.0, 14.0, 1),
+                    "{{\"ts\":\"{ts}\",\"power_kw\":{power},\"wind_ms\":{wind},\"rpm\":{},\"pitch_deg\":{}}}",
                     self.num(9.0, 16.0, 1),
                     self.num(0.0, 6.0, 1),
                 );
@@ -290,6 +305,7 @@ fn add(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::watch::Kind;
 
     #[test]
     fn two_sites_with_every_format_then_traffic() {
@@ -328,6 +344,22 @@ mod tests {
         // Telemetry and grid every second; alarm, fast log and status now and then.
         let per_second = 2 * (TURBINES + 2) as u64;
         assert_eq!(st.total(), first + 13 * per_second + 2 * 3);
+
+        // Then a spike, a stuck sensor and a silent turbine, each flagged.
+        let flags = |st: &Store, topic: &str| {
+            let n = st.find(if topic.contains("oslo") { 0 } else { 1 }, topic).unwrap();
+            let w = st.nodes[n].watch.as_ref().unwrap();
+            w.flag(SystemTime::now()).map(|f| f.kind)
+        };
+        while d.step < 26 {
+            d.second(&mut st);
+        }
+        assert_eq!(flags(&st, "site/oslo/turbine/T03/telemetry"), Some(Kind::Spike));
+        while d.step < 60 {
+            d.second(&mut st);
+        }
+        assert_eq!(flags(&st, "site/bergen/turbine/T04/telemetry"), Some(Kind::Stuck));
+        assert_eq!(st.flagged, 2);
     }
 
     #[test]

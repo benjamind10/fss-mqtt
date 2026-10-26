@@ -185,15 +185,23 @@ pub fn main() {
     every_frame(move || {
         // The grid is as many cells as the page measured; ratzilla's own size
         // assumes 10×19 pixel cells, and the frame would miss the page's edges.
-        if resized.replace(false) {
-            let _ = terminal.clear();
-            dirty.set(true);
+        // ratzilla makes its grid anew on its next draw after a resize, maybe
+        // smaller: an empty draw lets it, then the frame takes the new grid's
+        // size, and only then is anything drawn or cleared there (a cell past
+        // its end is out of bounds).
+        let anew = resized.replace(false);
+        if anew {
+            let _ = terminal.backend_mut().draw(std::iter::empty());
         }
         if let Ok(w) = terminal.backend_mut().window_size() {
             let now = Rect::new(0, 0, w.columns_rows.width, w.columns_rows.height);
             if now != area {
                 area = now;
-                let _ = terminal.resize(area);
+                let _ = terminal.resize(area); // clears it too
+                dirty.set(true);
+            } else if anew {
+                // The same size, but blank: all of it is drawn again.
+                let _ = terminal.clear();
                 dirty.set(true);
             }
         }

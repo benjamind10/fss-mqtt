@@ -551,7 +551,10 @@ connection and no async runtime, which keeps the binary around 1 MB. TLS uses ru
 The web version at <https://mbilling.github.io/fss-mqtt/> is the same app built for the browser
 (WebAssembly), with the same keys, panes, viewer and charts. It starts with two demo connections,
 whose wind-farm data is made in the page, and a live one to the public test broker
-`wss://test.mosquitto.org:8081/mqtt`, subscribed to its `$SYS/#` statistics.
+`wss://test.mosquitto.org:8081/mqtt`, subscribed to its `$SYS/#` statistics. That broker comes
+and goes: when it hasn't answered in 10 seconds, the page connects to EMQX's public broker
+(`wss://broker.emqx.io:8084/mqtt`) instead, subscribed to `fss-mqtt/#`, where what you publish
+comes back.
 
 Point it at your own broker with the page's address:
 

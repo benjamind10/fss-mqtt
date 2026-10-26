@@ -1340,6 +1340,22 @@ impl App {
         self.store.lock().unwrap().conns[i].removed
     }
 
+    /// The web version's: a connection of its own, which isn't saved
+    /// (there's no file); connected now if `autoconnect`.
+    #[cfg(target_arch = "wasm32")]
+    pub fn add_unsaved(&mut self, c: ConnCfg) -> Result<(), String> {
+        self.add_conn(c)?;
+        if let Some(ctl) = self.ctls.last_mut() {
+            ctl.saved = false;
+        }
+        // As a reloaded connections file adds one.
+        self.refresh_panel();
+        self.need_rebuild = true;
+        self.rebuild(false);
+        self.next_prompt();
+        Ok(())
+    }
+
     fn add_conn(&mut self, c: ConnCfg) -> Result<(), String> {
         let i = self.ctls.len();
         let password = env_secret(c.password_env.as_deref());

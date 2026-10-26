@@ -22,7 +22,7 @@ use crate::app::{App, ConnCtl, Options};
 use crate::config::ConnCfg;
 use crate::input::{KeyCode, KeyEvent, KeyModifiers};
 use crate::mqtt::Cmd;
-use crate::store::Store;
+use crate::store::{ConnState, Store};
 use crate::{broker, demo, mqtt, theme, ui};
 
 mod touch;
@@ -95,7 +95,12 @@ pub fn main() {
             .collect::<Vec<_>>()
     };
     // Then a live broker, connected as the app connects any.
-    let live = live_broker();
+    let (live, asked) = live_broker();
+    // The public test broker comes and goes: if it doesn't answer, EMQX's.
+    let mut fallback = (!asked).then(|| Fallback {
+        conn: ctls.len(),
+        since: Instant::now(),
+    });
     let mut connect = vec![];
     match broker::mqtt_config(ctls.len(), &live, None, None).and_then(|cfg| Ok((cfg, broker::display_url(&live)?))) {
         Ok((cfg, display)) => {
@@ -208,6 +213,9 @@ pub fn main() {
             }
         }
         mqtt::poll(); // not under the store's lock: it takes it
+        if let Some(f) = fallback.take_if(|f| f.due(&store)) {
+            fall_back(&mut app, f.conn);
+        }
         app.resize(area.width, area.height);
         if ticked.elapsed() >= TICK {
             ticked = Instant::now();
@@ -245,18 +253,19 @@ fn on_panic() {
 /// The page's live connection: the broker and topics its address asks for
 /// (`?broker=wss://…&topic=a/#&topic=b`), or else the public test broker's
 /// own statistics.
-fn live_broker() -> ConnCfg {
+fn live_broker() -> (ConnCfg, bool) {
     let query = window()
         .and_then(|w| w.location().search().ok())
         .and_then(|q| UrlSearchParams::new_with_str(&q).ok());
     let asked = query.as_ref().and_then(|q| q.get("broker")).filter(|b| !b.is_empty());
     let Some(url) = asked else {
-        return ConnCfg {
+        let mosquitto = ConnCfg {
             name: "mosquitto".into(),
             url: "wss://test.mosquitto.org:8081/mqtt".into(),
             topics: vec!["$SYS/#".into()],
             ..Default::default()
         };
+        return (mosquitto, false);
     };
     let topics: Vec<String> = query
         .iter()
@@ -269,11 +278,54 @@ fn live_broker() -> ConnCfg {
         .filter(|t| !t.is_empty())
         .collect();
     let name = broker::parse_broker(&url, false).map_or("broker".into(), |b| b.host);
-    ConnCfg {
+    let cfg = ConnCfg {
         name,
         url,
         topics: if topics.is_empty() { vec!["#".into()] } else { topics },
         ..Default::default()
+    };
+    (cfg, true)
+}
+
+/// How long the public test broker gets to answer before the page turns to
+/// EMQX's.
+const FALLBACK_AFTER: Duration = Duration::from_secs(10);
+
+/// The default live connection, watched until it has connected.
+struct Fallback {
+    conn: usize,
+    since: Instant,
+}
+
+impl Fallback {
+    /// Never connected, failing, and given long enough.
+    fn due(&self, store: &Mutex<Store>) -> bool {
+        let st = store.lock().unwrap();
+        let s = &st.conns[self.conn].status;
+        s.state != ConnState::Connected && s.err.is_some() && self.since.elapsed() >= FALLBACK_AFTER
+    }
+}
+
+/// Stops the test broker's connection and connects to EMQX's public broker
+/// instead (HiveMQ's doesn't speak MQTT 5 over WebSockets). It shares no
+/// statistics and takes no `#`, so it's subscribed to fss-mqtt/#: what's
+/// published there comes back.
+fn fall_back(app: &mut App, test_broker: usize) {
+    let _ = app.ctls[test_broker].tx.send(Cmd::Disconnect);
+    let emqx = ConnCfg {
+        name: "emqx".into(),
+        url: "wss://broker.emqx.io:8084/mqtt".into(),
+        topics: vec!["fss-mqtt/#".into()],
+        autoconnect: true,
+        ..Default::default()
+    };
+    match app.add_unsaved(emqx) {
+        Ok(()) => app.notify(
+            "test.mosquitto.org isn't answering: connected to broker.emqx.io instead \
+             (^e publishes to fss-mqtt/…, and it comes back)",
+            false,
+        ),
+        Err(e) => app.notify(format!("emqx: {e}"), true),
     }
 }
 

@@ -39,12 +39,28 @@ sample config/setpoints setpoints.changeset application/vnd.sqlite3.changeset -D
 sample export/daily.csv daily.csv text/csv -D publish user-property Date 2026-10-07
 sample scada/summary summary.json.gz application/gzip -D publish user-property ProviderName SiteSummary
 
+# Something for the anomaly watch to flag by the time the tape types "!",
+# counted from when the recording starts (record.sh drops /demo/.recording
+# then; the app starts a few seconds later and needs about 20 s of messages
+# to know what's usual): bergen's T04 wind sensor sticks from 38 s, oslo's
+# T03 power spikes at 35 s, and bergen's T05 goes quiet from 45 s.
+start=
+spiked=
 i=0
 while true; do
     i=$((i + 1))
+    [ -z "$start" ] && [ -f /demo/.recording ] && start=$(date +%s)
+    el=-1
+    [ -n "$start" ] && el=$(($(date +%s) - start))
     for t in $turbines; do
+        power=$(num 900 3600) wind=$(num 4 14)
+        if [ "$site/$t" = oslo/T03 ] && [ "$el" -ge 35 ] && [ -z "$spiked" ]; then
+            power=9800.0 spiked=1
+        fi
+        [ "$site/$t" = bergen/T04 ] && [ "$el" -ge 38 ] && wind=8.4
+        [ "$site/$t" = bergen/T05 ] && [ "$el" -ge 45 ] && continue
         pub -t "site/$site/turbine/$t/telemetry" \
-            -m "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"power_kw\":$(num 900 3600),\"wind_ms\":$(num 4 14),\"rpm\":$(num 9 16),\"pitch_deg\":$(num 0 6)}" \
+            -m "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"power_kw\":$power,\"wind_ms\":$wind,\"rpm\":$(num 9 16),\"pitch_deg\":$(num 0 6)}" \
             -D publish content-type application/json \
             -D publish user-property TurbineId "$t" \
             -D publish user-property Quality Good \

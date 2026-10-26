@@ -41,6 +41,17 @@ pub fn start(feed: Feed) -> Option<()> {
     Some(())
 }
 
+/// Brings up the phone's keyboard (the hidden field takes the focus).
+pub fn keyboard() {
+    let field = window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("kbd"))
+        .and_then(|e| e.dyn_into::<HtmlInputElement>().ok());
+    if let Some(f) = field {
+        let _ = f.focus();
+    }
+}
+
 /// Calls `f` on the target's `kind` events for as long as the page is
 /// open; `f` may cancel them (the listener isn't passive).
 fn listen(target: &EventTarget, kind: &str, f: impl FnMut(Event) + 'static) {

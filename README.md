@@ -80,6 +80,10 @@ Several brokers can be connected at once. Each is a top-level branch in the topi
 own topics and history while you connect, disconnect or pause its subscriptions. Filters match
 below the broker level, so `devices/#` shows matches from every broker.
 
+In the connections panel (`tab` to it), `+` subscribes a connection to another topic filter and
+`⏎` on a subscription edits its filter (emptied, the subscription is removed). A connected broker
+subscribes and unsubscribes at once, and the connections file keeps the change.
+
 Connections are kept in a small file you can edit:
 `~/.config/fss-mqtt/connections.toml` (Linux, macOS; `$XDG_CONFIG_HOME` is honoured) or
 `%APPDATA%\fss-mqtt\connections.toml` (Windows); `--config` picks another file.
@@ -188,7 +192,9 @@ clears. Clearing keeps the tree open at the topic you were on.
 |---|---|---|
 | anywhere | `tab` / `shift+tab` | next / previous pane: connections, topics, messages, chart |
 | connections | `↑ ↓ pgup pgdn home end` | move |
-| connections | `space` `⏎` | connect / disconnect, or subscription / capture rule on / off |
+| connections | `space` | connect / disconnect, or subscription / capture rule on / off |
+| connections | `⏎` | on a connection or capture rule as `space`; on a subscription, edit its topic filter (emptied, it's removed) |
+| connections | `+` | subscribe the connection to another topic filter |
 | tree | `↑ ↓ pgup pgdn home end` | move |
 | tree | `→` | expand; on a topic with messages, enter its message list |
 | tree | `←` | collapse, or jump to parent |

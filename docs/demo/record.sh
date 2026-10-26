@@ -16,7 +16,7 @@ net=fss-demo
 cleanup() {
     docker rm -f fss-demo-oslo fss-demo-bergen fss-demo-pub-oslo fss-demo-pub-bergen >/dev/null 2>&1 || true
     docker network rm $net >/dev/null 2>&1 || true
-    rm -f "$root/$rec" "$root/$video"
+    rm -f "$root/$rec" "$root/$video" "$root/docs/demo/.recording"
 }
 trap cleanup EXIT
 cleanup
@@ -31,6 +31,8 @@ docker run -d --name fss-demo-pub-bergen --network $net -v "$root/docs/demo:/dem
     eclipse-mosquitto:2 sh /demo/publish.sh fss-demo-bergen bergen 5 >/dev/null
 sleep 12 # let a few large payloads and alarms arrive first
 sed "s|^Output .*|Output $video|" "$root/$tape" >"$root/$rec"
+# The publishers time what the app is to flag from here (see publish.sh).
+: >"$root/docs/demo/.recording"
 docker run --rm --network $net -v "$root:/vhs" -v "$bin:/usr/local/bin/fss-mqtt:ro" \
     ghcr.io/charmbracelet/vhs "$rec"
 # The GIF from the video, with the keys pressed below the terminal for a

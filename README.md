@@ -1,9 +1,10 @@
 # fss-mqtt
 
 A fast, keyboard-driven MQTT explorer for the terminal. Subscribe to a broker and get a
-live topic tree you narrow down just by typing; edit any message and publish it again.
+live topic tree you narrow down just by typing; see payloads decoded, their numbers charted and
+anomalies flagged as they arrive; edit any message and publish it again.
 
-![fss-mqtt: browsing two brokers and filtering them; a topic's messages, one full screen; the numbers in its messages charted live, and a day of minutes in one Parquet message charted and scrolled through; Parquet, Avro, Arrow, SQLite, SQLite changeset, Protobuf, MessagePack, CBOR, CSV and gzip payloads decoded; the keys pressed show below](docs/demo.gif)
+![fss-mqtt: browsing two brokers and filtering them; a topic's messages, one full screen; the numbers in its messages charted live, and a day of minutes in one Parquet message charted, scrolled through and shown full screen; Parquet, Avro, Arrow, SQLite, SQLite changeset, Protobuf, MessagePack, CBOR, CSV and gzip payloads decoded; a power spike, a stuck wind sensor and a silent turbine flagged as anomalies and listed with !; a new subscription added from the connections panel with +; the keys pressed show below](docs/demo.gif)
 
 Vim user? See [`--vim`](#vim-keys---vim). Or [try it in your browser](https://mbilling.github.io/fss-mqtt/):
 the same app, with demo data and a live public broker ([web version](#web-version)).

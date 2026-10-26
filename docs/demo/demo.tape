@@ -1,4 +1,4 @@
-# README demo: navigation, charts and the payload formats. Regenerate with
+# README demo: navigation, charts, anomalies, subscribing and the payload formats. Regenerate with
 # docs/demo/record.sh <fss-mqtt linux binary> (needs Docker).
 Output docs/demo.gif
 
@@ -66,7 +66,8 @@ Escape
 Sleep 500ms
 
 # A day of minutes in one Parquet message: a column charted, scrolled
-# through with left and right; down, the next column.
+# through with left and right; down, the next column; enter, the chart
+# over the whole screen, and down the next column there.
 Type "daylog"
 Sleep 700ms
 Tab
@@ -76,7 +77,13 @@ Sleep 1.5s
 Right@500ms 4
 Sleep 600ms
 Down
-Sleep 1.5s
+Sleep 1.2s
+Enter
+Sleep 2s
+Down
+Sleep 1.8s
+Escape
+Sleep 300ms
 Escape
 Sleep 300ms
 Escape
@@ -164,6 +171,35 @@ Escape
 Sleep 200ms
 Escape
 Sleep 300ms
+
+# Anomalies flagged as they happen: a power spike, a wind sensor stuck at
+# one value, a turbine gone quiet. "!" lists them, each with its reason.
+Type "!"
+Sleep 2.5s
+Down@700ms 2
+Sleep 2s
+Down@300ms 6
+Sleep 2.2s
+Escape
+Sleep 500ms
+
+# Subscribe to more from the connections panel: + and a topic filter.
+Shift+Tab
+Sleep 600ms
+Down@300ms 3
+Sleep 400ms
+Type "+"
+Sleep 700ms
+Type "$SYS/broker/clients/#"
+Sleep 500ms
+Enter
+Sleep 1.5s
+Escape
+Sleep 300ms
+Type "clients"
+Sleep 2s
+Escape
+Sleep 500ms
 
 # MQTT patterns match below each broker.
 Type "site/+/grid"

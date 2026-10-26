@@ -96,6 +96,10 @@ def presses(tape):
         elif name.startswith("Ctrl+"):
             if on:
                 out.append((t, "ctrl+" + name[5:].lower(), None, part))
+        elif name.startswith("Shift+") and name[6:] in NAMES:
+            if on:
+                out.append((t, "shift+" + NAMES[name[6:]], None, part))
+            t += wait
         elif name in NAMES:
             for _ in range(int(rest or 1)):
                 if on:

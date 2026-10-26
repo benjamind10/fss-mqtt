@@ -161,6 +161,16 @@ pub fn main() {
         true
     });
     touch::start(feed);
+    // On a resize ratzilla makes its grid anew and blank, the same size
+    // or not (the page's font arriving, a phone's keyboard): all of it is
+    // drawn again.
+    let resized = Rc::new(Cell::new(false));
+    let on_resize = resized.clone();
+    let cb = Closure::<dyn FnMut()>::new(move || on_resize.set(true));
+    let _ = window()
+        .expect("a window")
+        .add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
+    cb.forget();
     let (mut ticked, mut second) = (Instant::now(), Instant::now());
     let mut area = Rect::default();
     // A hidden tab gets no frames: the connections are also polled on a
@@ -170,6 +180,10 @@ pub fn main() {
     every_frame(move || {
         // The grid is as many cells as the page measured; ratzilla's own size
         // assumes 10×19 pixel cells, and the frame would miss the page's edges.
+        if resized.replace(false) {
+            let _ = terminal.clear();
+            dirty.set(true);
+        }
         if let Ok(w) = terminal.backend_mut().window_size() {
             let now = Rect::new(0, 0, w.columns_rows.width, w.columns_rows.height);
             if now != area {

@@ -129,6 +129,10 @@ pub enum PanelRow {
 pub enum Ask {
     Password,
     KeyPassphrase,
+    /// A topic filter to subscribe to.
+    Subscribe,
+    /// A subscription's filter, edited (`Prompt::was`); empty removes it.
+    EditSub,
 }
 
 pub struct Prompt {
@@ -136,6 +140,8 @@ pub struct Prompt {
     pub ask: Ask,
     pub input: String,
     pub err: Option<&'static str>,
+    /// The filter being edited.
+    pub was: String,
 }
 
 pub struct Layout {
@@ -973,10 +979,17 @@ impl App {
             KeyCode::PageDown => self.panel_cursor = (self.panel_cursor + page).min(last),
             KeyCode::Home => self.panel_cursor = 0,
             KeyCode::End => self.panel_cursor = last,
+            // Space switches on and off; enter edits a subscription.
             KeyCode::Char(' ') | KeyCode::Enter => match self.panel.get(self.panel_cursor).copied() {
                 Some(PanelRow::Conn(i)) => self.toggle_conn(i),
+                Some(PanelRow::Sub(i, j)) if k.code == KeyCode::Enter => self.ask_sub(i, Some(j)),
                 Some(PanelRow::Sub(i, j)) => self.toggle_sub(i, j),
                 Some(PanelRow::Capture(i, j)) => self.toggle_capture(i, j),
+                None => {}
+            },
+            // A new subscription, on the connection the cursor is in.
+            KeyCode::Char('+') => match self.panel.get(self.panel_cursor).copied() {
+                Some(PanelRow::Conn(i) | PanelRow::Sub(i, _) | PanelRow::Capture(i, _)) => self.ask_sub(i, None),
                 None => {}
             },
             KeyCode::Esc => self.focus = Focus::Tree,
@@ -1029,6 +1042,78 @@ impl App {
             ctl.cfg.paused.push(topic);
         }
         self.save_conn(i);
+    }
+
+    /// Asks for a topic filter to subscribe connection `i` to, or for
+    /// subscription `j`'s edited.
+    fn ask_sub(&mut self, i: usize, j: Option<usize>) {
+        if let Some(name) = self.file_name(i) {
+            return self.notify(format!("{name} is a file: it has no subscriptions"), false);
+        }
+        let was = j
+            .and_then(|j| self.store.lock().unwrap().conns[i].subs.get(j).map(|s| s.topic.clone()))
+            .unwrap_or_default();
+        self.prompt = Some(Prompt {
+            conn: i,
+            ask: if j.is_some() { Ask::EditSub } else { Ask::Subscribe },
+            input: was.clone(),
+            err: None,
+            was,
+        });
+    }
+
+    /// Subscribes connection `i` to `filter`, or (`was` not empty) puts it
+    /// in that subscription's place, or with `filter` empty removes that
+    /// one. A live connection subscribes and unsubscribes now; the
+    /// connections file keeps it.
+    fn edit_subs(&mut self, i: usize, was: &str, filter: &str) -> Result<(), &'static str> {
+        let filter = filter.trim();
+        if filter.is_empty() && was.is_empty() {
+            return Ok(()); // nothing to add
+        }
+        if !filter.is_empty() && !crate::capture::valid_filter(filter) {
+            return Err("not a topic filter: + and # stand for whole levels, # last");
+        }
+        // Apply pending edits to the file first, as toggle_sub does.
+        self.check_config();
+        if self.is_removed(i) {
+            return Ok(());
+        }
+        let mut new = self.ctls[i].cfg.clone();
+        if filter != was && new.topics.iter().any(|t| t == filter) {
+            return Err("it's subscribed to that already");
+        }
+        let name = new.name.clone();
+        let note = if filter.is_empty() {
+            new.topics.retain(|t| t != was);
+            new.paused.retain(|t| t != was);
+            format!("{name}: unsubscribed from {was}, and removed it")
+        } else if was.is_empty() {
+            new.topics.push(filter.to_string());
+            format!("{name}: subscribed to {filter}")
+        } else {
+            // In its place, on or off as it was.
+            for t in new.topics.iter_mut().chain(new.paused.iter_mut()) {
+                if t == was {
+                    *t = filter.to_string();
+                }
+            }
+            format!("{name}: {was} is now {filter}")
+        };
+        if new.topics == self.ctls[i].cfg.topics {
+            return Ok(()); // unchanged
+        }
+        match self.update_conn(i, new) {
+            Ok(()) => {
+                self.save_conn(i);
+                self.refresh_panel();
+                let up = self.store.lock().unwrap().conns[i].status.state == ConnState::Connected;
+                let when = if up { "" } else { " (when it connects)" };
+                self.notify(format!("{note}{when}"), false);
+            }
+            Err(e) => self.notify(format!("{name}: {e}"), true),
+        }
+        Ok(())
     }
 
     /// Writes connection `i`'s entry back to the connections file, if it
@@ -1482,6 +1567,7 @@ impl App {
                     ask,
                     input: String::new(),
                     err: None,
+                    was: String::new(),
                 })
             }
             None => {
@@ -1508,6 +1594,20 @@ impl App {
             KeyCode::Backspace => {
                 p.input.pop();
             }
+            KeyCode::Enter if matches!(p.ask, Ask::Subscribe | Ask::EditSub) => {
+                let (conn, was, input) = (p.conn, p.was.clone(), p.input.clone());
+                match self.edit_subs(conn, &was, &input) {
+                    Ok(()) => {
+                        self.prompt = None;
+                        self.next_prompt();
+                    }
+                    Err(e) => {
+                        if let Some(p) = &mut self.prompt {
+                            p.err = Some(e);
+                        }
+                    }
+                }
+            }
             KeyCode::Enter => {
                 let ctl = &mut self.ctls[p.conn];
                 match p.ask {
@@ -1520,6 +1620,7 @@ impl App {
                             return;
                         }
                     }
+                    Ask::Subscribe | Ask::EditSub => unreachable!("handled above"),
                 }
                 let conn = p.conn;
                 self.prompt = None;

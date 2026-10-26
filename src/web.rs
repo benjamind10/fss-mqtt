@@ -157,6 +157,11 @@ pub fn main() {
             }
             app.quit = false; // a page isn't quit
             dirty.set(true);
+            // Something to type into: the phone's keyboard comes up (a tap
+            // or a key may bring it up, nothing else).
+            if app.prompt.is_some() || app.composer.is_some() {
+                touch::keyboard();
+            }
         })
     };
     let keys = feed.clone();

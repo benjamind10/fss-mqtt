@@ -296,22 +296,49 @@ fn prompt_box(buf: &mut Buffer, area: Rect, app: &App, st: &Store) {
             buf[(x, y)].reset();
         }
     }
+    let err = match p.err {
+        Some(e) => Line::styled(e, th.red),
+        None => Line::default(),
+    };
+    if matches!(p.ask, Ask::Subscribe | Ask::EditSub) {
+        let (title, keys) = if p.ask == Ask::Subscribe {
+            (
+                format!("Subscribe {}", c.name),
+                format!("{} subscribe  ·  esc cancel", glyph::ENTER),
+            )
+        } else {
+            (
+                format!("Subscription of {}", c.name),
+                format!("{} save (empty: remove it)  ·  esc cancel", glyph::ENTER),
+            )
+        };
+        let room = (w as usize).saturating_sub(4 + 14);
+        let lines = vec![
+            Line::styled(fmt::trunc_left(&c.url, w as usize - 4), th.dim),
+            err,
+            Line::from(vec![
+                Span::styled("Topic filter ", th.text),
+                Span::styled(fmt::trunc_left(&p.input, room), th.text),
+                Span::styled(" ", th.cursor),
+            ]),
+            Line::default(),
+            Line::styled(keys, th.faint),
+        ];
+        return draw_box(buf, r, &title, lines, true, None, th);
+    }
     let (who, label) = match p.ask {
         Ask::Password => (
             format!("{}@{}", c.username.as_deref().unwrap_or(""), c.url),
             "Password ",
         ),
-        Ask::KeyPassphrase => {
+        Ask::KeyPassphrase | Ask::Subscribe | Ask::EditSub => {
             let key = app.ctls[p.conn].cfg.key.clone().unwrap_or_default();
             (format!("client key {key}"), "Key passphrase ")
         }
     };
     let lines = vec![
         Line::styled(fmt::trunc_left(&who, w as usize - 4), th.dim),
-        match p.err {
-            Some(e) => Line::styled(e, th.red),
-            None => Line::default(),
-        },
+        err,
         Line::from(vec![
             Span::styled(label, th.text),
             Span::styled("•".repeat(p.input.chars().count()), th.text),
@@ -1210,6 +1237,8 @@ fn hints<'a>(app: &App) -> Line<'a> {
         (true, false, Focus::Conns) => vec![
             ("j k", "move", 3),
             (&space, "connect / on-off", 1),
+            ("+", "subscribe", 1),
+            (glyph::ENTER, "edit", 1),
             ("tab", "pane", 2),
             ("/", "filter", 1),
         ],
@@ -1245,6 +1274,8 @@ fn hints<'a>(app: &App) -> Line<'a> {
         (false, _, Focus::Conns) => vec![
             ("↑↓", "move", 3),
             (&space, "connect / on-off", 1),
+            ("+", "subscribe", 1),
+            (glyph::ENTER, "edit", 1),
             ("tab", "pane", 2),
             ("type", "filter", 2),
         ],
@@ -2859,8 +2890,8 @@ mod tests {
         assert_eq!(saved[0].paused, vec!["v1/#"]);
         let v = frame(&app, "v1 paused");
         assert!(v.contains(&format!("{}v1/#", glyph::OFF)));
-        // And back on.
-        press(&mut app, &[KeyCode::Enter]);
+        // And back on (space: enter edits a subscription).
+        press(&mut app, &[KeyCode::Char(' ')]);
         assert!(matches!(rx[0].try_recv(), Ok(Cmd::Subscribe(t)) if t == "v1/#"));
         assert!(config::load(&cfg).unwrap()[0].paused.is_empty());
 
@@ -3117,6 +3148,89 @@ mod tests {
         press(&mut app, &[KeyCode::Right]);
         let v = frame(&app, "vim msgs hints");
         assert!(v.contains("j k messages") && v.contains("h esc back"), "{v}");
+    }
+
+    #[test]
+    fn subscribe_edit_and_remove_from_the_connections_panel() {
+        let cfg = tmp_config("edit-subs");
+        let (mut app, rxs) = sample(cfg.clone());
+        let sent = |rx: &Receiver<Cmd>| -> Vec<String> {
+            rx.try_iter()
+                .filter_map(|c| match c {
+                    Cmd::Subscribe(t) => Some(format!("+{t}")),
+                    Cmd::Unsubscribe(t) => Some(format!("-{t}")),
+                    _ => None,
+                })
+                .collect()
+        };
+        let topics = |app: &App| app.ctls[0].cfg.topics.clone();
+        app.focus = Focus::Conns;
+        app.panel_cursor = 0; // local, connected
+
+        // + asks for a filter; enter subscribes, now and in the file.
+        typ(&mut app, "+");
+        assert!(app.prompt.as_ref().is_some_and(|p| p.ask == Ask::Subscribe));
+        assert!(frame(&app, "subscribe prompt").contains("Subscribe local"));
+        typ(&mut app, "v3/#");
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(app.prompt.is_none());
+        assert_eq!(topics(&app), ["v1/#", "v2/#", "v3/#"]);
+        assert_eq!(sent(&rxs[0]), ["+v3/#"]);
+        assert!(std::fs::read_to_string(&cfg).unwrap().contains("v3/#"));
+        assert!(app.notice.as_ref().unwrap().0.contains("local: subscribed to v3/#"));
+
+        // Not a filter, or one it has: said in the prompt, which stays.
+        typ(&mut app, "+");
+        typ(&mut app, "a/b#");
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(
+            app.prompt
+                .as_ref()
+                .unwrap()
+                .err
+                .unwrap()
+                .starts_with("not a topic filter")
+        );
+        for _ in 0..4 {
+            press(&mut app, &[KeyCode::Backspace]);
+        }
+        typ(&mut app, "v1/#");
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(
+            app.prompt.as_ref().unwrap().err,
+            Some("it's subscribed to that already")
+        );
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.prompt.is_none() && sent(&rxs[0]).is_empty());
+
+        // Enter on a subscription edits it: the old one goes, the new one comes.
+        app.panel_cursor = 3; // v3/#
+        press(&mut app, &[KeyCode::Enter]);
+        let p = app.prompt.as_ref().unwrap();
+        assert_eq!((p.ask, p.input.as_str()), (Ask::EditSub, "v3/#"));
+        press(&mut app, &[KeyCode::Backspace]);
+        typ(&mut app, "temp");
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(topics(&app), ["v1/#", "v2/#", "v3/temp"]);
+        let mut s = sent(&rxs[0]);
+        s.sort();
+        assert_eq!(s, ["+v3/temp", "-v3/#"]);
+
+        // Emptied, it's removed.
+        press(&mut app, &[KeyCode::Enter]);
+        for _ in 0..7 {
+            press(&mut app, &[KeyCode::Backspace]);
+        }
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(topics(&app), ["v1/#", "v2/#"]);
+        assert_eq!(sent(&rxs[0]), ["-v3/temp"]);
+        assert!(!std::fs::read_to_string(&cfg).unwrap().contains("v3/"));
+
+        // Space still switches one off and on.
+        app.panel_cursor = 1;
+        typ(&mut app, " ");
+        assert_eq!(sent(&rxs[0]), ["-v1/#"]);
+        assert!(app.prompt.is_none());
     }
 
     #[test]

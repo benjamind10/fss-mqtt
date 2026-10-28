@@ -1,16 +1,24 @@
 //! A minimal MQTT v5 client: connect (TCP or TLS), subscribe, receive,
 //! publish, keep alive, reconnect. One blocking thread per connection,
-//! steered by [`Cmd`]s from the UI.
+//! steered by [`Cmd`]s from the UI; in the browser, the page's WebSocket
+//! and a poll each frame (browser.rs).
 
-use std::io::{self, Read, Write};
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::Write;
+use std::io::{self, Read};
+#[cfg(not(target_arch = "wasm32"))]
 use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
+#[cfg(not(target_arch = "wasm32"))]
 use rustls::pki_types::pem::PemObject;
+#[cfg(not(target_arch = "wasm32"))]
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::pemkey::{self, KeyError};
 use crate::store::{ConnState, Props, Status, Store};
 
@@ -98,6 +106,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a QoS 1 or 2 publish may wait for the broker's acknowledgement.
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Why TLS couldn't be set up. Key problems are told apart because retrying
 /// won't help them: the connection stops (and the UI asks for the passphrase
 /// when that's what's missing).
@@ -107,6 +116,7 @@ pub enum TlsError {
     Other(String),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl std::fmt::Display for TlsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -116,12 +126,14 @@ impl std::fmt::Display for TlsError {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl From<String> for TlsError {
     fn from(e: String) -> TlsError {
         TlsError::Other(e)
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Whether the key at `path` is encrypted and `passphrase` doesn't open it.
 /// False for every other problem, where no passphrase helps: an unreadable
 /// file (connecting retries) or an unsupported or damaged key (connecting
@@ -133,12 +145,14 @@ pub fn key_needs_passphrase(path: &str, passphrase: Option<&str>) -> bool {
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Reads the private key at `path`, decrypting it with `passphrase` if needed.
 pub fn load_key(path: &str, passphrase: Option<&str>) -> Result<PrivateKeyDer<'static>, TlsError> {
     let pem = std::fs::read(path).map_err(|e| TlsError::Other(format!("key {path}: {e}")))?;
     pemkey::load(&pem, passphrase).map_err(|e| TlsError::Key(path.into(), e))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn tls_config(cfg: &Config) -> Result<Option<Arc<rustls::ClientConfig>>, TlsError> {
     if !cfg.tls {
         return Ok(None);
@@ -194,8 +208,10 @@ pub fn tls_config(cfg: &Config) -> Result<Option<Arc<rustls::ClientConfig>>, Tls
 }
 
 #[derive(Debug)]
+#[cfg(not(target_arch = "wasm32"))]
 struct NoVerify(Arc<rustls::crypto::CryptoProvider>);
 
+#[cfg(not(target_arch = "wasm32"))]
 impl rustls::client::danger::ServerCertVerifier for NoVerify {
     fn verify_server_cert(
         &self,
@@ -228,8 +244,10 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 type TlsStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 
+#[cfg(not(target_arch = "wasm32"))]
 enum Conn {
     Plain(TcpStream),
     Tls(Box<TlsStream>),
@@ -237,6 +255,7 @@ enum Conn {
     Wss(Box<crate::ws::Ws<TlsStream>>),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Conn {
     fn tcp(&self) -> &TcpStream {
         match self {
@@ -258,6 +277,7 @@ impl Conn {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Read for Conn {
     fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -269,6 +289,7 @@ impl Read for Conn {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Write for Conn {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
         match self {
@@ -297,6 +318,19 @@ enum End {
     Reconfigured(Box<Config>, bool), // new settings; connect with them?
 }
 
+/// In the browser: over the page's WebSocket, polled each frame.
+#[cfg(target_arch = "wasm32")]
+mod browser;
+#[cfg(target_arch = "wasm32")]
+pub use browser::{poll, spawn};
+
+/// No key files in the browser.
+#[cfg(target_arch = "wasm32")]
+pub fn key_needs_passphrase(_path: &str, _passphrase: Option<&str>) -> bool {
+    false
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 /// Starts the connection's thread. It connects now if `start`, then follows
 /// commands; after a failure it retries every few seconds until told to stop.
 pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<Cmd> {
@@ -400,6 +434,7 @@ fn set_sub_err(store: &Mutex<Store>, conn: usize, topic: &str, err: Option<Strin
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn dial(host: &str, port: u16) -> Result<TcpStream, String> {
     let addrs = (host, port)
         .to_socket_addrs()
@@ -606,6 +641,7 @@ fn publish_id(o: &Outgoing, ids: &mut Ids, outbox: &Outbox, lim: &Limits) -> Res
 }
 
 /// One connection's lifetime.
+#[cfg(not(target_arch = "wasm32"))]
 fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut Inbox, outbox: &mut Outbox) -> End {
     // A header or a password from an unset environment variable won't be
     // set by retrying.
@@ -662,8 +698,103 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut I
         Ok(None) => return End::Failed("timed out waiting for CONNACK".into()),
         Err(e) => return End::Failed(tidy_io(e)),
     };
+    let (keep_alive, limits) = match connack(kind, &body) {
+        Ok(k) => k,
+        Err(e) => return End::Failed(e),
+    };
+    set_status(store, cfg.conn, ConnState::Connected, None);
+
+    let mut ids = Ids::default();
+    for pkt in subscribe_all(cfg, store, &mut ids, outbox) {
+        if let Err(e) = conn.write_all(&pkt) {
+            return End::Failed(tidy_io(e));
+        }
+    }
+    let _ = conn.flush();
+
+    let _ = conn.tcp().set_read_timeout(Some(Duration::from_millis(100)));
+    let ping_every = ping_every(keep_alive);
+    let mut last_send = Instant::now();
+    let mut last_recv = Instant::now();
+
+    let mut sent: Option<String> = None; // a QoS 0 publish, reported once written
+    loop {
+        // Commands from the UI.
+        loop {
+            let cmd = match rx.try_recv() {
+                Ok(c) => c,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return End::Closed,
+            };
+            let out = match command(cmd, cfg, store, &mut ids, outbox, &limits, &mut sent) {
+                Ok(Some(pkt)) => pkt,
+                Ok(None) => continue,
+                Err(end) => {
+                    let _ = conn.write_all(&DISCONNECT).and_then(|_| conn.flush());
+                    return end;
+                }
+            };
+            if let Err(e) = conn.write_all(&out).and_then(|_| conn.flush()) {
+                return End::Failed(tidy_io(e));
+            }
+            last_send = Instant::now();
+            if let Some(m) = sent.take() {
+                store.lock().unwrap().notify(m, false); // QoS 0: written is all we learn
+            }
+        }
+        outbox.expire(store);
+
+        let pkt = match rd.next(&mut conn) {
+            Ok(p) => p,
+            Err(e) => return End::Failed(tidy_io(e)),
+        };
+        if let Some((kind, body)) = pkt {
+            last_recv = Instant::now();
+            let reply = match packet_in(kind, &body, cfg, store, inbox, outbox, &mut ids) {
+                Ok(r) => r,
+                Err(end) => return end,
+            };
+            if let Some(r) = reply {
+                if let Err(e) = conn.write_all(&r) {
+                    return End::Failed(tidy_io(e));
+                }
+                last_send = Instant::now();
+            }
+            if rd.buffered() {
+                continue; // drain what we already have before flushing
+            }
+            let _ = conn.flush();
+        }
+        if last_send.elapsed() >= ping_every {
+            if let Err(e) = conn.write_all(&PINGREQ).and_then(|_| conn.flush()) {
+                return End::Failed(tidy_io(e));
+            }
+            last_send = Instant::now();
+        }
+        if last_recv.elapsed() > silence_limit(keep_alive) {
+            return End::Failed("keepalive timeout".into());
+        }
+    }
+}
+
+const DISCONNECT: [u8; 2] = [0xE0, 0];
+const PINGREQ: [u8; 2] = [0xC0, 0];
+
+/// How often to ping, a little inside the keep alive.
+fn ping_every(keep_alive: u16) -> Duration {
+    Duration::from_secs((keep_alive.max(2) as u64) * 3 / 4)
+}
+
+/// How long the broker may say nothing before the connection counts as lost.
+fn silence_limit(keep_alive: u16) -> Duration {
+    Duration::from_secs(keep_alive.max(2) as u64 * 2)
+}
+
+/// What the broker's CONNACK says: the keep alive and what it accepts, or
+/// why it refused the connection.
+fn connack(kind: u8, body: &[u8]) -> Result<(u16, Limits), String> {
     if kind >> 4 != 2 || body.len() < 2 {
-        return End::Failed("unexpected reply to CONNECT".into());
+        return Err("unexpected reply to CONNECT".into());
     }
     let mut keep_alive = KEEP_ALIVE;
     let mut reason_str = None;
@@ -687,180 +818,151 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut I
         if let Some(r) = reason_str {
             msg += &format!(": {r}");
         }
-        return End::Failed(msg);
+        return Err(msg);
     }
-    set_status(store, cfg.conn, ConnState::Connected, None);
+    Ok((keep_alive, limits))
+}
 
-    let mut ids = Ids::default();
-    // One SUBSCRIBE per filter, so a refused one is named and the rest work.
+/// The SUBSCRIBEs a new session sends: one per enabled filter, so a refused
+/// one is named and the rest work.
+fn subscribe_all(cfg: &Config, store: &Mutex<Store>, ids: &mut Ids, outbox: &Outbox) -> Vec<Vec<u8>> {
     let topics: Vec<String> = {
         let mut st = store.lock().unwrap();
         let c = &mut st.conns[cfg.conn];
         c.subs.iter_mut().for_each(|s| s.err = None);
         c.subs.iter().filter(|s| s.enabled).map(|s| s.topic.clone()).collect()
     };
+    let mut out = Vec::new();
     for t in topics {
         let Some(p) = ids.next(outbox) else {
             set_sub_err(store, cfg.conn, &t, Some(NO_FREE_ID.into()));
             continue;
         };
-        if let Err(e) = conn.write_all(&subscribe_packet(p, &t, cfg.qos)) {
-            return End::Failed(tidy_io(e));
-        }
+        out.push(subscribe_packet(p, &t, cfg.qos));
         ids.subscribes.push((p, t));
     }
-    let _ = conn.flush();
+    out
+}
 
-    let _ = conn.tcp().set_read_timeout(Some(Duration::from_millis(100)));
-    let ping_every = Duration::from_secs((keep_alive.max(2) as u64) * 3 / 4);
-    let mut last_send = Instant::now();
-    let mut last_recv = Instant::now();
-
-    let mut sent: Option<String> = None; // a QoS 0 publish, reported once written
-    loop {
-        // Commands from the UI.
-        loop {
-            let cmd = match rx.try_recv() {
-                Ok(c) => c,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return End::Closed,
-            };
-            let out = match cmd {
-                Cmd::Disconnect => {
-                    let _ = conn.write_all(&[0xE0, 0]).and_then(|_| conn.flush());
-                    return End::Stopped;
-                }
-                Cmd::Reconfigure { cfg, connect } => {
-                    let _ = conn.write_all(&[0xE0, 0]).and_then(|_| conn.flush());
-                    return End::Reconfigured(cfg, connect);
-                }
-                Cmd::Connect { .. } => continue,
-                Cmd::Publish(o) => {
-                    let what = target(store, cfg.conn, &o.topic);
-                    let ready = publish_id(&o, &mut ids, outbox, &limits)
-                        .and_then(|p| publish_packet(&o, p, &limits).map(|pkt| (p, pkt)));
-                    let (p, pkt) = match ready {
-                        Ok(r) => r,
-                        Err(e) => {
-                            store
-                                .lock()
-                                .unwrap()
-                                .notify(format!("not published to {what}: {e}"), true);
-                            continue;
-                        }
-                    };
-                    if o.qos == 0 {
-                        sent = Some(format!("published to {what} (QoS 0)"));
-                    } else {
-                        outbox.waiting.push(Waiting {
-                            pid: p,
-                            what,
-                            qos: o.qos,
-                            released: false,
-                            no_subscribers: false,
-                            since: Instant::now(),
-                        });
-                    }
-                    pkt
-                }
-                Cmd::Subscribe(t) => {
-                    let Some(p) = ids.next(outbox) else {
-                        set_sub_err(store, cfg.conn, &t, Some(NO_FREE_ID.into()));
-                        continue;
-                    };
-                    let pkt = subscribe_packet(p, &t, cfg.qos);
-                    ids.subscribes.push((p, t));
-                    pkt
-                }
-                Cmd::Unsubscribe(t) => {
-                    let Some(p) = ids.next(outbox) else {
-                        store
-                            .lock()
-                            .unwrap()
-                            .notify(format!("{t} not unsubscribed: {NO_FREE_ID}"), true);
-                        continue;
-                    };
-                    ids.unsubscribes.push(p);
-                    unsubscribe_packet(p, &t)
+/// A command from the UI to a connected session: the packet it sends, if
+/// any, or how the session ends (the caller sends the DISCONNECT). A QoS 0
+/// publish leaves its notice in `sent`, for once it's written.
+fn command(
+    cmd: Cmd,
+    cfg: &Config,
+    store: &Mutex<Store>,
+    ids: &mut Ids,
+    outbox: &mut Outbox,
+    limits: &Limits,
+    sent: &mut Option<String>,
+) -> Result<Option<Vec<u8>>, End> {
+    Ok(Some(match cmd {
+        Cmd::Disconnect => return Err(End::Stopped),
+        Cmd::Reconfigure { cfg, connect } => return Err(End::Reconfigured(cfg, connect)),
+        Cmd::Connect { .. } => return Ok(None),
+        Cmd::Publish(o) => {
+            let what = target(store, cfg.conn, &o.topic);
+            let ready =
+                publish_id(&o, ids, outbox, limits).and_then(|p| publish_packet(&o, p, limits).map(|pkt| (p, pkt)));
+            let (p, pkt) = match ready {
+                Ok(r) => r,
+                Err(e) => {
+                    store
+                        .lock()
+                        .unwrap()
+                        .notify(format!("not published to {what}: {e}"), true);
+                    return Ok(None);
                 }
             };
-            if let Err(e) = conn.write_all(&out).and_then(|_| conn.flush()) {
-                return End::Failed(tidy_io(e));
+            if o.qos == 0 {
+                *sent = Some(format!("published to {what} (QoS 0)"));
+            } else {
+                outbox.waiting.push(Waiting {
+                    pid: p,
+                    what,
+                    qos: o.qos,
+                    released: false,
+                    no_subscribers: false,
+                    since: Instant::now(),
+                });
             }
-            last_send = Instant::now();
-            if let Some(m) = sent.take() {
-                store.lock().unwrap().notify(m, false); // QoS 0: written is all we learn
-            }
+            pkt
         }
-        outbox.expire(store);
+        Cmd::Subscribe(t) => {
+            let Some(p) = ids.next(outbox) else {
+                set_sub_err(store, cfg.conn, &t, Some(NO_FREE_ID.into()));
+                return Ok(None);
+            };
+            let pkt = subscribe_packet(p, &t, cfg.qos);
+            ids.subscribes.push((p, t));
+            pkt
+        }
+        Cmd::Unsubscribe(t) => {
+            let Some(p) = ids.next(outbox) else {
+                store
+                    .lock()
+                    .unwrap()
+                    .notify(format!("{t} not unsubscribed: {NO_FREE_ID}"), true);
+                return Ok(None);
+            };
+            ids.unsubscribes.push(p);
+            unsubscribe_packet(p, &t)
+        }
+    }))
+}
 
-        let pkt = match rd.next(&mut conn) {
-            Ok(p) => p,
-            Err(e) => return End::Failed(tidy_io(e)),
-        };
-        if let Some((kind, body)) = pkt {
-            last_recv = Instant::now();
-            let mut reply: Option<[u8; 4]> = None;
-            match kind >> 4 {
-                3 => {
-                    let qos = (kind >> 1) & 3;
-                    let retain = kind & 1 == 1;
-                    let Some((topic, pid, props, payload)) = parse_publish(&body, qos) else {
-                        return End::Failed("malformed PUBLISH".into());
-                    };
-                    inbox.receive(store, cfg.conn, &topic, payload, qos, retain, props);
-                    match qos {
-                        1 => reply = Some([0x40, 2, (pid >> 8) as u8, pid as u8]),
-                        2 => reply = Some([0x50, 2, (pid >> 8) as u8, pid as u8]),
-                        _ => {}
-                    }
-                }
-                4 | 5 | 7 if body.len() >= 2 => reply = outbox.ack(store, kind >> 4, &body),
-                6 if body.len() >= 2 => reply = Some([0x70, 2, body[0], body[1]]), // PUBREL → PUBCOMP
-                9 if body.len() >= 2 => {
-                    // SUBACK
-                    let p = u16::from_be_bytes([body[0], body[1]]);
-                    let mut b = Buf(&body[2..]);
-                    let _ = b.props();
-                    let code = b.0.first().copied().unwrap_or(0x80);
-                    if let Some(i) = ids.subscribes.iter().position(|(q, _)| *q == p) {
-                        let (_, t) = ids.subscribes.remove(i);
-                        let err = (code >= 0x80).then(|| suback_reason(code));
-                        set_sub_err(store, cfg.conn, &t, err);
-                    }
-                }
-                11 if body.len() >= 2 => {
-                    // UNSUBACK: its id is free again.
-                    let p = u16::from_be_bytes([body[0], body[1]]);
-                    ids.unsubscribes.retain(|&q| q != p);
-                }
-                14 => {
-                    let code = body.first().copied().unwrap_or(0);
-                    return End::Failed(format!("broker disconnected: {}", connack_reason(code)));
-                }
+/// A packet from the broker: what to answer it with, if anything, or why
+/// the session ends.
+fn packet_in(
+    kind: u8,
+    body: &[u8],
+    cfg: &Config,
+    store: &Mutex<Store>,
+    inbox: &mut Inbox,
+    outbox: &mut Outbox,
+    ids: &mut Ids,
+) -> Result<Option<[u8; 4]>, End> {
+    let mut reply = None;
+    match kind >> 4 {
+        3 => {
+            let qos = (kind >> 1) & 3;
+            let retain = kind & 1 == 1;
+            let Some((topic, pid, props, payload)) = parse_publish(body, qos) else {
+                return Err(End::Failed("malformed PUBLISH".into()));
+            };
+            inbox.receive(store, cfg.conn, &topic, payload, qos, retain, props);
+            match qos {
+                1 => reply = Some([0x40, 2, (pid >> 8) as u8, pid as u8]),
+                2 => reply = Some([0x50, 2, (pid >> 8) as u8, pid as u8]),
                 _ => {}
             }
-            if let Some(r) = reply {
-                if let Err(e) = conn.write_all(&r) {
-                    return End::Failed(tidy_io(e));
-                }
-                last_send = Instant::now();
-            }
-            if rd.buffered() {
-                continue; // drain what we already have before flushing
-            }
-            let _ = conn.flush();
         }
-        if last_send.elapsed() >= ping_every {
-            if let Err(e) = conn.write_all(&[0xC0, 0]).and_then(|_| conn.flush()) {
-                return End::Failed(tidy_io(e));
+        4 | 5 | 7 if body.len() >= 2 => reply = outbox.ack(store, kind >> 4, body),
+        6 if body.len() >= 2 => reply = Some([0x70, 2, body[0], body[1]]), // PUBREL → PUBCOMP
+        9 if body.len() >= 2 => {
+            // SUBACK
+            let p = u16::from_be_bytes([body[0], body[1]]);
+            let mut b = Buf(&body[2..]);
+            let _ = b.props();
+            let code = b.0.first().copied().unwrap_or(0x80);
+            if let Some(i) = ids.subscribes.iter().position(|(q, _)| *q == p) {
+                let (_, t) = ids.subscribes.remove(i);
+                let err = (code >= 0x80).then(|| suback_reason(code));
+                set_sub_err(store, cfg.conn, &t, err);
             }
-            last_send = Instant::now();
         }
-        if last_recv.elapsed() > Duration::from_secs(keep_alive.max(2) as u64 * 2) {
-            return End::Failed("keepalive timeout".into());
+        11 if body.len() >= 2 => {
+            // UNSUBACK: its id is free again.
+            let p = u16::from_be_bytes([body[0], body[1]]);
+            ids.unsubscribes.retain(|&q| q != p);
         }
+        14 => {
+            let code = body.first().copied().unwrap_or(0);
+            return Err(End::Failed(format!("broker disconnected: {}", connack_reason(code))));
+        }
+        _ => {}
     }
+    Ok(reply)
 }
 
 fn tidy_io(e: io::Error) -> String {
@@ -914,6 +1016,17 @@ impl Reader {
             }
         }
         Some(pkt)
+    }
+
+    /// Bytes as they arrived, for `try_take` (the browser's WebSocket
+    /// hands them over a message at a time).
+    #[cfg(target_arch = "wasm32")]
+    fn push(&mut self, b: &[u8]) {
+        if self.pos > 0 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
+        self.buf.extend_from_slice(b);
     }
 
     fn next(&mut self, r: &mut impl Read) -> io::Result<Option<(u8, Vec<u8>)>> {

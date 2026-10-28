@@ -5,13 +5,18 @@
 //! Pings are answered; a close ends the stream. Under a read timeout, a frame
 //! that arrives in parts is kept until it's whole.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::{self, Read, Write};
 
+#[cfg(not(target_arch = "wasm32"))]
 use ring::rand::SecureRandom;
 
+#[cfg(not(target_arch = "wasm32"))]
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_HEAD: usize = 16 * 1024;
 /// Larger than any MQTT packet (256 MiB).
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_FRAME: u64 = 512 << 20;
 /// Headers the handshake sets itself.
 const OURS: [&str; 6] = [
@@ -69,6 +74,7 @@ pub fn header(s: &str) -> Result<(String, String), String> {
 }
 
 /// A WebSocket over `inner` (a TCP or TLS stream), once the handshake is done.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Ws<S> {
     pub inner: S,
     /// Bytes read, not yet a whole frame (from `start`).
@@ -80,10 +86,12 @@ pub struct Ws<S> {
     closed: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn bad(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("websocket: {}", msg.into()))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn random<const N: usize>() -> io::Result<[u8; N]> {
     let mut b = [0u8; N];
     ring::rand::SystemRandom::new()
@@ -93,6 +101,7 @@ fn random<const N: usize>() -> io::Result<[u8; N]> {
 }
 
 /// The Sec-WebSocket-Accept a server answers `key` with.
+#[cfg(not(target_arch = "wasm32"))]
 fn accept(key: &str) -> String {
     let d = ring::digest::digest(
         &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
@@ -103,6 +112,7 @@ fn accept(key: &str) -> String {
 
 /// Opens the WebSocket on `s`, to `host`:`port` (`tls` for wss): the
 /// request, then the server's 101 checked. `s` should have a read timeout.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn handshake<S: Read + Write>(
     mut s: S,
     host: &str,
@@ -193,6 +203,7 @@ pub fn handshake<S: Read + Write>(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<S: Read + Write> Ws<S> {
     /// Sends a frame: final, masked, with opcode `op`.
     fn send(&mut self, op: u8, payload: &[u8]) -> io::Result<()> {
@@ -280,6 +291,7 @@ impl<S: Read + Write> Ws<S> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<S: Read + Write> Read for Ws<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
@@ -310,6 +322,7 @@ impl<S: Read + Write> Read for Ws<S> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<S: Read + Write> Write for Ws<S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.send(0x2, buf)?;
@@ -326,7 +339,7 @@ mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
     use std::thread;
-    use std::time::Duration;
+    use web_time::Duration;
 
     /// A frame as a server sends it: unmasked.
     fn frame(op: u8, payload: &[u8]) -> Vec<u8> {

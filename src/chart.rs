@@ -7,7 +7,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use web_time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::fmt::commas;
 use crate::json::Json;
@@ -132,6 +132,7 @@ pub fn quiet_panics() -> bool {
 
 /// Reads all of a message's rows from its whole payload, on a thread of
 /// its own. The slot gets them, or nothing when that fails, a panic included.
+#[cfg(not(target_arch = "wasm32"))]
 fn read_in_background(m: Arc<Message>, payload: Arc<Vec<u8>>, read: Reader) -> Reading {
     let slot: Reading = Arc::new(Mutex::new(None));
     let done = slot.clone();
@@ -141,6 +142,12 @@ fn read_in_background(m: Arc<Message>, payload: Arc<Vec<u8>>, read: Reader) -> R
         *done.lock().unwrap() = Some(rows.ok().flatten().unwrap_or_default());
     });
     slot
+}
+
+/// A web page has no threads: it reads the rows now.
+#[cfg(target_arch = "wasm32")]
+fn read_in_background(m: Arc<Message>, payload: Arc<Vec<u8>>, read: Reader) -> Reading {
+    Arc::new(Mutex::new(Some(read(&m, &payload).unwrap_or_default())))
 }
 
 impl State {
@@ -782,7 +789,7 @@ mod tests {
     use super::*;
     use crate::store::{Props, Store};
     use crate::view::{DocView, Section};
-    use std::time::Duration;
+    use web_time::Duration;
 
     fn message(seq: u64, secs: u64, payload: &str, ct: Option<&str>) -> Message {
         Message {
@@ -994,7 +1001,7 @@ mod tests {
         let mut st = State::default();
         st.update((1, 1, None, 1), &[Arc::new(kept)], 0, None);
         assert!(st.reading() && st.current().unwrap().count < 500);
-        let start = std::time::Instant::now();
+        let start = web_time::Instant::now();
         while !st.poll() {
             assert!(start.elapsed() < Duration::from_secs(10), "never read");
             std::thread::sleep(Duration::from_millis(2));
@@ -1004,7 +1011,7 @@ mod tests {
 
     /// Polls until no read is under way.
     fn wait_for_reads(st: &mut State) {
-        let start = std::time::Instant::now();
+        let start = web_time::Instant::now();
         while st.reading.is_some() {
             assert!(start.elapsed() < Duration::from_secs(10), "never read");
             st.poll();

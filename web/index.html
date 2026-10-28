@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>fss-mqtt — the MQTT explorer, in your browser</title>
+  <meta name="description" content="fss-mqtt, a fast keyboard-driven MQTT explorer for the terminal, running in the browser with demo data and a live public broker.">
+  <meta property="og:title" content="fss-mqtt — the MQTT explorer, in your browser">
+  <meta property="og:description" content="A fast, keyboard-driven MQTT v5 explorer for the terminal. Try it here, with demo data and a live public broker.">
+  <meta property="og:image" content="https://raw.githubusercontent.com/mbilling/fss-mqtt/main/docs/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta property="og:url" content="https://mbilling.github.io/fss-mqtt/">
+  <link data-trunk rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;700&display=swap" rel="stylesheet">
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      color: #e8e6e3;
+      /* Fira Code: its box drawing (│ ╭ ╰) is taller than a row, so
+         borders join from row to row; with many system fonts they stop
+         short and show gaps. Until it's loaded, the system's. */
+      font-family: "Fira Code", ui-monospace, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+      font-variant-ligatures: none;
+      font-size: 15px;
+    }
+    body {
+      display: flex;
+      flex-direction: column;
+      /* Taps are the app's: no double-tap zoom. */
+      touch-action: manipulation;
+    }
+    /* The app's grid fills what the footer leaves. */
+    #app {
+      flex: 1;
+      min-height: 0;
+      overflow: hidden;
+    }
+    pre {
+      margin: 0;
+      font-family: inherit;
+    }
+    /* Rows a little shorter than Fira Code's own line height: still
+       shorter than its box drawing. The grid measures its cell with a span
+       here too, so it's sized to these rows. */
+    #app pre,
+    #app pre span {
+      line-height: 1.2;
+    }
+    #loading {
+      padding: 1em;
+      color: #888;
+    }
+    footer {
+      flex: none;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0 1.5em;
+      padding: 4px 1ch;
+      border-top: 1px solid #333;
+      color: #888;
+      font-size: 13px;
+    }
+    footer b {
+      color: #d77757;
+    }
+    footer a {
+      color: #e8e6e3;
+    }
+    footer .end {
+      margin-left: auto;
+    }
+    /* The keys a phone lacks, on touch screens. */
+    #keys {
+      display: none;
+      flex: none;
+      gap: 4px;
+      padding: 4px;
+      border-top: 1px solid #333;
+    }
+    #keys button {
+      flex: 1;
+      min-width: 0;
+      min-height: 40px;
+      padding: 0;
+      border: 1px solid #333;
+      border-radius: 6px;
+      background: #161616;
+      color: #e8e6e3;
+      font: inherit;
+      touch-action: manipulation;
+    }
+    #keys button:active {
+      background: #333;
+    }
+    /* Where the phone's keyboard types: out of sight. 16px, or iOS zooms. */
+    #kbd {
+      position: fixed;
+      left: 0;
+      bottom: 0;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      font-size: 16px;
+      pointer-events: none;
+    }
+    @media (pointer: coarse) {
+      #keys {
+        display: flex;
+      }
+    }
+    @media (max-width: 640px) {
+      html, body {
+        font-size: 12px;
+      }
+      footer .about {
+        display: none;
+      }
+    }
+  </style>
+  <link data-trunk rel="rust" href="../Cargo.toml" data-bin="fss-mqtt" data-type="main" data-wasm-opt="z" data-wasm-opt-params="--all-features" />
+</head>
+<body>
+  <div id="app"><div id="loading">Loading fss-mqtt…</div></div>
+  <div id="keys">
+    <button data-key="esc" tabindex="-1">esc</button>
+    <button data-key="tab" tabindex="-1">tab</button>
+    <button data-key="left" tabindex="-1">←</button>
+    <button data-key="up" tabindex="-1">↑</button>
+    <button data-key="down" tabindex="-1">↓</button>
+    <button data-key="right" tabindex="-1">→</button>
+    <button data-key="enter" tabindex="-1">⏎</button>
+    <button data-key="bs" tabindex="-1">⌫</button>
+    <button data-key="^e" tabindex="-1">^e</button>
+    <button data-key="^s" tabindex="-1">^s</button>
+    <button data-key="^y" tabindex="-1">^y</button>
+    <button data-key="kbd" tabindex="-1">abc</button>
+  </div>
+  <input id="kbd" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="go" aria-label="Type to the app">
+  <footer>
+    <span class="about"><b>fss-mqtt</b> — the MQTT explorer for your terminal, here in the browser</span>
+    <span class="end"><a href="https://github.com/mbilling/fss-mqtt#install">Install</a> · <a href="https://github.com/mbilling/fss-mqtt">GitHub</a> · <a href="https://github.com/mbilling/fss-mqtt#web-version">Your broker</a></span>
+  </footer>
+  <script>
+    // The grid is measured when the app starts, maybe before the font has
+    // come: once it has, a resize makes it measure again.
+    document.fonts.load('15px "Fira Code"').then(() => window.dispatchEvent(new Event("resize")));
+    // With the phone's keyboard up, the page is what's still in view.
+    if (window.visualViewport) {
+      visualViewport.addEventListener("resize", () => {
+        document.body.style.height = visualViewport.height + "px";
+        window.scrollTo(0, 0);
+        window.dispatchEvent(new Event("resize"));
+      });
+    }
+  </script>
+</body>
+</html>

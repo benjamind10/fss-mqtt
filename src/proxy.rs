@@ -6,7 +6,7 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream};
-use std::time::Duration;
+use web_time::Duration;
 
 const MAX_HEAD: usize = 16 * 1024;
 

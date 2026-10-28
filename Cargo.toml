@@ -1,6 +1,6 @@
 [package]
 name = "fss-mqtt"
-version = "0.11.0"
+version = "0.15.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Fast, keyboard-driven MQTT v5 explorer for the terminal"
@@ -15,14 +15,26 @@ des = "0.9"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-decode"] }
 md-5 = "0.11"
 miniz_oxide = "0.9.1"
+ratatui = { version = "0.30", default-features = false, features = ["std"] }
+ruzstd = { version = "0.9.0", default-features = false, features = ["std"] }
+snap = "1.1.2"
+unicode-width = "0.2"
+web-time = "1"
+
+# The desktop app: a terminal, and its own TCP and TLS. (In the browser,
+# the web version, the page is the terminal and the browser does TLS.)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 ring = { version = "0.17", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = { version = "1", features = ["std"] }
-ruzstd = { version = "0.9.0", default-features = false, features = ["std"] }
-snap = "1.1.2"
-unicode-width = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+ratzilla = "0.3"
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["AddEventListenerOptions", "BinaryType", "Clipboard", "CloseEvent", "CompositionEvent", "Document", "DomRect", "DomStringMap", "Element", "Event", "EventTarget", "HtmlElement", "HtmlInputElement", "InputEvent", "Location", "MessageEvent", "MouseEvent", "Navigator", "NodeList", "Touch", "TouchEvent", "TouchList", "UrlSearchParams", "WebSocket", "WheelEvent", "Window"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

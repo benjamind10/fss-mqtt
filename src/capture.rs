@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant, SystemTime};
+use web_time::{Duration, Instant, SystemTime};
 
 use crate::store::{Props, Store};
 
@@ -571,7 +571,7 @@ pub fn encode(t: SystemTime, topic: &str, payload: &[u8], qos: u8, retain: bool,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::UNIX_EPOCH;
+    use web_time::UNIX_EPOCH;
 
     #[test]
     fn filters_match_like_mqtt() {

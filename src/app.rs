@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use web_time::{Duration, Instant, SystemTime};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::input::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::broker;
 use crate::clipboard;
@@ -28,11 +28,20 @@ const CLIP_HEX_WIDTH: usize = 80;
 /// The most rows the connections panel shows: five connections with a
 /// subscription each. More scroll.
 pub const PANEL_ROWS: u16 = 10;
+/// Stacked screens cap the connections panel here, borders included:
+/// four rows, then it scrolls, rather than the desktop's ten.
+const STACKED_PANEL_MAX: u16 = 6;
+/// Rows a chart needs to be worth drawing on a wide screen: its box, a
+/// heading, the plot. The detail pane splits one off at twice this.
+pub(crate) const CHART_MIN_H: u16 = 8;
+/// A stacked screen may draw a shorter chart: the plot needs four rows
+/// inside the box. Twice this is what the detail pane must hold.
+pub(crate) const CHART_MIN_H_STACKED: u16 = 6;
 /// How long the new version may take to be noticed after an update.
 const RESTART_WAIT: Duration = Duration::from_secs(30);
 
 /// The connections file's modified time and size, to notice edits.
-type Stamp = Option<(SystemTime, u64)>;
+type Stamp = Option<(std::time::SystemTime, u64)>; // the file system's times
 
 fn stamp(path: &Path) -> Stamp {
     let m = std::fs::metadata(path).ok()?;
@@ -100,7 +109,7 @@ impl ConnCtl {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
     Conns,
     Tree,
@@ -120,6 +129,10 @@ pub enum PanelRow {
 pub enum Ask {
     Password,
     KeyPassphrase,
+    /// A topic filter to subscribe to.
+    Subscribe,
+    /// A subscription's filter, edited (`Prompt::was`); empty removes it.
+    EditSub,
 }
 
 pub struct Prompt {
@@ -127,6 +140,8 @@ pub struct Prompt {
     pub ask: Ask,
     pub input: String,
     pub err: Option<&'static str>,
+    /// The filter being edited.
+    pub was: String,
 }
 
 pub struct Layout {
@@ -187,6 +202,8 @@ pub struct App {
     pub rate: f64,
     pub(crate) rate_total: u64,
     pub(crate) rate_at: Instant,
+    /// When the topics' watches were last looked at (for silence).
+    watched_at: Instant,
     pub quit: bool,
     /// Watching for a newer fss-mqtt in our place (not in tests).
     pub upgrade: Option<crate::upgrade::Watch>,
@@ -204,6 +221,26 @@ pub struct App {
     installed: Option<String>,
     /// Quit to restart into it (ctrl+n), continuing the session.
     pub restart: bool,
+}
+
+/// Topic-list and detail heights for a stacked body.
+///
+/// Without a chart the list keeps 55%. With one, the detail pane gets at
+/// least `2 * CHART_MIN_H_STACKED` (the messages, and a short chart under
+/// them) and two thirds of whatever is left after a small list; the list
+/// keeps the rest. A 35–40 row phone then shows the chart: a 55% list used
+/// to leave the detail pane a row or two short of `2 * CHART_MIN_H`.
+fn stacked_split(body_h: u16, has_chart: bool) -> (u16, u16) {
+    const TREE_MIN: u16 = 6;
+    let chart_block = 2 * CHART_MIN_H_STACKED;
+    if has_chart && body_h >= chart_block + 4 {
+        let tree_min = TREE_MIN.min(body_h - chart_block);
+        let spare = body_h - chart_block - tree_min;
+        let tree_h = tree_min + spare / 3;
+        return (tree_h, body_h - tree_h);
+    }
+    let tree_h = body_h * 55 / 100;
+    (tree_h, body_h - tree_h)
 }
 
 impl App {
@@ -259,6 +296,7 @@ impl App {
             // The rate counts what arrives from now on.
             rate_total: store_total,
             rate_at: Instant::now(),
+            watched_at: Instant::now(),
             quit: false,
             upgrade: None,
             omarchy: None,
@@ -285,19 +323,25 @@ impl App {
     /// of the frame it draws, which can be newer than the last resize the
     /// app has seen (the window shrank just before the frame).
     pub fn layout_for(&self, width: u16, height: u16) -> Layout {
+        let stacked = width < 80;
         // The connections panel takes what it needs, up to a third of the
-        // screen and `PANEL_ROWS` rows; more scroll.
-        let max_panel = (height / 3).clamp(3, PANEL_ROWS + 2);
+        // screen and `PANEL_ROWS` rows; more scroll. Stacked, it stays
+        // shorter so a phone still has room under it.
+        let max_panel = if stacked {
+            (height / 5).clamp(3, STACKED_PANEL_MAX)
+        } else {
+            (height / 3).clamp(3, PANEL_ROWS + 2)
+        };
         let panel_h = (self.panel.len() as u16 + 2).clamp(3, max_panel);
         let body_h = height.saturating_sub(5 + panel_h).max(4); // header + input box (3) + hints
-        if width < 80 {
-            let th = body_h * 55 / 100;
+        if stacked {
+            let (tree_h, det_h) = stacked_split(body_h, self.has_chart());
             return Layout {
                 panel_h,
                 tree_w: width,
-                tree_h: th,
+                tree_h,
                 det_w: width,
-                det_h: body_h - th,
+                det_h,
                 stacked: true,
             };
         }
@@ -310,6 +354,11 @@ impl App {
             det_h: body_h,
             stacked: false,
         }
+    }
+
+    /// The selected topic has numbers to plot.
+    fn has_chart(&self) -> bool {
+        self.chart.topic() == self.selected && self.chart.current().is_some()
     }
 
     pub fn tree_height(&self) -> usize {
@@ -336,6 +385,10 @@ impl App {
         self.now = SystemTime::now();
         let (total, notices) = {
             let mut st = self.store.lock().unwrap();
+            if self.watched_at.elapsed() >= Duration::from_secs(1) {
+                self.watched_at = Instant::now();
+                st.check_watches(self.now);
+            }
             if st.struct_ver != self.struct_ver {
                 self.need_rebuild = true;
             }
@@ -614,8 +667,8 @@ impl App {
         let mut order = vec![Focus::Conns, Focus::Tree];
         if has_msgs {
             order.push(Focus::Msgs);
-            if !self.chart.series.is_empty() {
-                order.push(Focus::Chart);
+            if self.chart_shown() {
+                order.push(Focus::Chart); // (full screen, tab shows it on a short one)
             }
         }
         let i = order.iter().position(|&f| f == self.focus).unwrap_or(1);
@@ -872,6 +925,49 @@ impl App {
         self.panel_offset = self.panel_offset.min(self.panel.len().saturating_sub(rows));
     }
 
+    /// A tap (or click) on cell `x`, `y` of the main screen: on a row of
+    /// the connections panel or the topic tree it moves the cursor there,
+    /// and on the cursor's own row it does what Enter does. Elsewhere, and
+    /// on screens that cover the main one, it does nothing.
+    /// (The web version's: a terminal would have to capture the mouse,
+    /// which takes selecting text away.)
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub fn tap(&mut self, x: u16, y: u16) {
+        if self.composer.is_some() || self.viewer.is_some() || self.prompt.is_some() {
+            return;
+        }
+        let l = self.layout();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        // Inside the panel's border: rows 2 to panel_h - 1.
+        if (2..l.panel_h).contains(&y) {
+            let i = self.panel_offset + (y - 2) as usize;
+            if i < self.panel.len() {
+                let again = self.focus == Focus::Conns && self.panel_cursor == i;
+                self.focus = Focus::Conns;
+                self.panel_cursor = i;
+                if again {
+                    self.key(enter);
+                }
+            }
+            return;
+        }
+        let top = 1 + l.panel_h; // the tree's top border
+        if x < l.tree_w && y > top && y + 1 < top + l.tree_h {
+            let i = self.offset + (y - top - 1) as usize;
+            if i < self.rows.len() {
+                let again = self.focus == Focus::Tree && self.cursor == i;
+                self.focus = Focus::Tree;
+                self.cursor = i;
+                self.clamp_cursor();
+                if again {
+                    self.key(enter);
+                } else {
+                    self.update_chart();
+                }
+            }
+        }
+    }
+
     /// Handles a key in the panel; false lets it fall through (e.g. typing).
     fn panel_key(&mut self, k: KeyEvent) -> bool {
         let last = self.panel.len().saturating_sub(1);
@@ -883,10 +979,17 @@ impl App {
             KeyCode::PageDown => self.panel_cursor = (self.panel_cursor + page).min(last),
             KeyCode::Home => self.panel_cursor = 0,
             KeyCode::End => self.panel_cursor = last,
+            // Space switches on and off; enter edits a subscription.
             KeyCode::Char(' ') | KeyCode::Enter => match self.panel.get(self.panel_cursor).copied() {
                 Some(PanelRow::Conn(i)) => self.toggle_conn(i),
+                Some(PanelRow::Sub(i, j)) if k.code == KeyCode::Enter => self.ask_sub(i, Some(j)),
                 Some(PanelRow::Sub(i, j)) => self.toggle_sub(i, j),
                 Some(PanelRow::Capture(i, j)) => self.toggle_capture(i, j),
+                None => {}
+            },
+            // A new subscription, on the connection the cursor is in.
+            KeyCode::Char('+') => match self.panel.get(self.panel_cursor).copied() {
+                Some(PanelRow::Conn(i) | PanelRow::Sub(i, _) | PanelRow::Capture(i, _)) => self.ask_sub(i, None),
                 None => {}
             },
             KeyCode::Esc => self.focus = Focus::Tree,
@@ -941,6 +1044,78 @@ impl App {
         self.save_conn(i);
     }
 
+    /// Asks for a topic filter to subscribe connection `i` to, or for
+    /// subscription `j`'s edited.
+    fn ask_sub(&mut self, i: usize, j: Option<usize>) {
+        if let Some(name) = self.file_name(i) {
+            return self.notify(format!("{name} is a file: it has no subscriptions"), false);
+        }
+        let was = j
+            .and_then(|j| self.store.lock().unwrap().conns[i].subs.get(j).map(|s| s.topic.clone()))
+            .unwrap_or_default();
+        self.prompt = Some(Prompt {
+            conn: i,
+            ask: if j.is_some() { Ask::EditSub } else { Ask::Subscribe },
+            input: was.clone(),
+            err: None,
+            was,
+        });
+    }
+
+    /// Subscribes connection `i` to `filter`, or (`was` not empty) puts it
+    /// in that subscription's place, or with `filter` empty removes that
+    /// one. A live connection subscribes and unsubscribes now; the
+    /// connections file keeps it.
+    fn edit_subs(&mut self, i: usize, was: &str, filter: &str) -> Result<(), &'static str> {
+        let filter = filter.trim();
+        if filter.is_empty() && was.is_empty() {
+            return Ok(()); // nothing to add
+        }
+        if !filter.is_empty() && !crate::capture::valid_filter(filter) {
+            return Err("not a topic filter: + and # stand for whole levels, # last");
+        }
+        // Apply pending edits to the file first, as toggle_sub does.
+        self.check_config();
+        if self.is_removed(i) {
+            return Ok(());
+        }
+        let mut new = self.ctls[i].cfg.clone();
+        if filter != was && new.topics.iter().any(|t| t == filter) {
+            return Err("it's subscribed to that already");
+        }
+        let name = new.name.clone();
+        let note = if filter.is_empty() {
+            new.topics.retain(|t| t != was);
+            new.paused.retain(|t| t != was);
+            format!("{name}: unsubscribed from {was}, and removed it")
+        } else if was.is_empty() {
+            new.topics.push(filter.to_string());
+            format!("{name}: subscribed to {filter}")
+        } else {
+            // In its place, on or off as it was.
+            for t in new.topics.iter_mut().chain(new.paused.iter_mut()) {
+                if t == was {
+                    *t = filter.to_string();
+                }
+            }
+            format!("{name}: {was} is now {filter}")
+        };
+        if new.topics == self.ctls[i].cfg.topics {
+            return Ok(()); // unchanged
+        }
+        match self.update_conn(i, new) {
+            Ok(()) => {
+                self.save_conn(i);
+                self.refresh_panel();
+                let up = self.store.lock().unwrap().conns[i].status.state == ConnState::Connected;
+                let when = if up { "" } else { " (when it connects)" };
+                self.notify(format!("{note}{when}"), false);
+            }
+            Err(e) => self.notify(format!("{name}: {e}"), true),
+        }
+        Ok(())
+    }
+
     /// Writes connection `i`'s entry back to the connections file, if it
     /// came from there.
     fn save_conn(&mut self, i: usize) {
@@ -960,6 +1135,9 @@ impl App {
     /// captures gets no narrower rule.
     fn capture_selected(&mut self) {
         let Some(n) = self.selected else { return };
+        if cfg!(target_arch = "wasm32") {
+            return self.notify("capture writes files: not in the web version", false);
+        }
         let (i, path) = {
             let st = self.store.lock().unwrap();
             (st.nodes[n].conn, st.nodes[n].path.clone())
@@ -1247,6 +1425,22 @@ impl App {
         self.store.lock().unwrap().conns[i].removed
     }
 
+    /// The web version's: a connection of its own, which isn't saved
+    /// (there's no file); connected now if `autoconnect`.
+    #[cfg(target_arch = "wasm32")]
+    pub fn add_unsaved(&mut self, c: ConnCfg) -> Result<(), String> {
+        self.add_conn(c)?;
+        if let Some(ctl) = self.ctls.last_mut() {
+            ctl.saved = false;
+        }
+        // As a reloaded connections file adds one.
+        self.refresh_panel();
+        self.need_rebuild = true;
+        self.rebuild(false);
+        self.next_prompt();
+        Ok(())
+    }
+
     fn add_conn(&mut self, c: ConnCfg) -> Result<(), String> {
         let i = self.ctls.len();
         let password = env_secret(c.password_env.as_deref());
@@ -1373,6 +1567,7 @@ impl App {
                     ask,
                     input: String::new(),
                     err: None,
+                    was: String::new(),
                 })
             }
             None => {
@@ -1399,6 +1594,20 @@ impl App {
             KeyCode::Backspace => {
                 p.input.pop();
             }
+            KeyCode::Enter if matches!(p.ask, Ask::Subscribe | Ask::EditSub) => {
+                let (conn, was, input) = (p.conn, p.was.clone(), p.input.clone());
+                match self.edit_subs(conn, &was, &input) {
+                    Ok(()) => {
+                        self.prompt = None;
+                        self.next_prompt();
+                    }
+                    Err(e) => {
+                        if let Some(p) = &mut self.prompt {
+                            p.err = Some(e);
+                        }
+                    }
+                }
+            }
             KeyCode::Enter => {
                 let ctl = &mut self.ctls[p.conn];
                 match p.ask {
@@ -1411,6 +1620,7 @@ impl App {
                             return;
                         }
                     }
+                    Ask::Subscribe | Ask::EditSub => unreachable!("handled above"),
                 }
                 let conn = p.conn;
                 self.prompt = None;
@@ -1467,23 +1677,16 @@ impl App {
     }
 
     /// Keys in the chart: through its columns and fields, and along the
-    /// rows (or messages) when there are more than fit.
+    /// rows (or messages) when there are more than fit. Enter opens the
+    /// message full screen as its chart.
     fn chart_key(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Up => self.chart.step(-1),
             KeyCode::Down => self.chart.step(1),
             KeyCode::Home | KeyCode::PageUp => self.chart.pick(0),
             KeyCode::End | KeyCode::PageDown => self.chart.pick(usize::MAX),
-            KeyCode::Left | KeyCode::Right if !self.chart.scrollable() => self.why_no_scroll(),
             KeyCode::Left | KeyCode::Right => {
-                // A quarter of what's in view, or (with shift) all of it.
-                let room = self.chart.room.get().max(2) as isize;
-                let by = if k.modifiers.contains(KeyModifiers::SHIFT) {
-                    room
-                } else {
-                    (room / 4).max(1)
-                };
-                self.chart.scroll(if k.code == KeyCode::Left { -by } else { by });
+                self.chart_pan(k.code == KeyCode::Left, k.modifiers.contains(KeyModifiers::SHIFT));
             }
             KeyCode::Esc => {
                 self.focus = Focus::Tree;
@@ -1492,10 +1695,23 @@ impl App {
             KeyCode::Enter => {
                 if let Some(n) = self.selected {
                     self.open_viewer(n, self.msg_sel);
+                    if let Some(v) = &mut self.viewer {
+                        v.set_mode(crate::viewer::Mode::Chart, &self.th);
+                    }
                 }
             }
             _ => {}
         }
+    }
+
+    /// Scrolls the chart a quarter of what's in view, or `all` of it.
+    fn chart_pan(&mut self, left: bool, all: bool) {
+        if !self.chart.scrollable() {
+            return self.why_no_scroll();
+        }
+        let room = self.chart.room.get().max(2) as isize;
+        let by = if all { room } else { (room / 4).max(1) };
+        self.chart.scroll(if left { -by } else { by });
     }
 
     /// ← → with all of the chart in view: why there's nothing to scroll to.
@@ -1525,10 +1741,17 @@ impl App {
     pub fn update_chart(&mut self) {
         // All of a big table's rows, read meanwhile.
         self.chart.poll();
-        let picked = matches!(self.focus, Focus::Msgs | Focus::Chart)
-            .then_some(self.msg_sel)
-            .flatten();
-        let found = self.selected.and_then(|n| {
+        // Full screen, the message shown; else the one picked in the list.
+        let (node, picked) = match &self.viewer {
+            Some(v) => (Some(v.node), v.msgs.get(v.idx).map(|m| m.seq)),
+            None => (
+                self.selected,
+                matches!(self.focus, Focus::Msgs | Focus::Chart)
+                    .then_some(self.msg_sel)
+                    .flatten(),
+            ),
+        };
+        let found = node.and_then(|n| {
             let st = self.store.lock().unwrap();
             let node = &st.nodes[n];
             let newest = node.latest()?.seq;
@@ -1547,10 +1770,29 @@ impl App {
             }
             None => self.chart.clear(),
         }
-        if self.focus == Focus::Chart && self.chart.series.is_empty() {
+        if self.focus == Focus::Chart && self.viewer.is_none() && !self.chart_shown() {
             self.focus = Focus::Tree;
             self.msg_sel = None;
         }
+        // A chart changes how tall the topic list is; keep its scroll on
+        // the cursor for that height (the frame draws the same layout).
+        self.clamp_cursor();
+        // A message without numbers (←→ went to one) has no chart to show.
+        if let Some(v) = &mut self.viewer
+            && v.mode == crate::viewer::Mode::Chart
+            && self.chart.series.is_empty()
+        {
+            v.set_mode(crate::viewer::Mode::Pretty, &self.th);
+        }
+    }
+
+    /// Whether the main screen gives the chart a pane: the selected topic
+    /// has numbers, and the details pane room for both (a stacked screen
+    /// takes a shorter chart).
+    pub fn chart_shown(&self) -> bool {
+        let l = self.layout();
+        let min_h = if l.stacked { CHART_MIN_H_STACKED } else { CHART_MIN_H };
+        self.has_chart() && l.det_h >= 2 * min_h
     }
 
     fn open_viewer(&mut self, n: usize, sel: Option<u64>) {
@@ -1753,7 +1995,31 @@ impl App {
         match k.code {
             KeyCode::Char('t') => return self.copy_topic(),
             KeyCode::Char('y') => return self.copy_message(),
+            KeyCode::Tab | KeyCode::Char('m') => {
+                let chart = !self.chart.series.is_empty();
+                let v = self.viewer.as_mut().unwrap();
+                return v.set_mode(v.next_mode(chart), &self.th);
+            }
             _ => {}
+        }
+        // Charted: ↑↓ pick what to chart, and shift ←→ (< >) pan it.
+        if self
+            .viewer
+            .as_ref()
+            .is_some_and(|v| v.mode == crate::viewer::Mode::Chart)
+        {
+            let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+            match k.code {
+                KeyCode::Up => return self.chart.step(-1),
+                KeyCode::Down => return self.chart.step(1),
+                KeyCode::Home | KeyCode::PageUp => return self.chart.pick(0),
+                KeyCode::End | KeyCode::PageDown => return self.chart.pick(usize::MAX),
+                KeyCode::Left if shift => return self.chart_pan(true, false),
+                KeyCode::Right if shift => return self.chart_pan(false, false),
+                KeyCode::Char('<') => return self.chart_pan(true, false),
+                KeyCode::Char('>') => return self.chart_pan(false, false),
+                _ => {}
+            }
         }
         let body_h = self.viewer_body_h();
         let v = self.viewer.as_mut().unwrap();

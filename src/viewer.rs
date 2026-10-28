@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::input::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
@@ -16,6 +16,8 @@ use crate::ui::message_props;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Pretty, // JSON pretty-printed, otherwise text
+    /// The numbers in it charted (App::chart), when it has any.
+    Chart,
     Raw,
     Hex,
 }
@@ -61,9 +63,28 @@ impl Viewer {
     pub fn mode_name(&self) -> &'static str {
         match self.mode {
             Mode::Pretty => self.format.label(),
+            Mode::Chart => "chart",
             Mode::Raw => "raw",
             Mode::Hex => "hex",
         }
+    }
+
+    /// The view tab goes to: the chart after the formatted one, when
+    /// `chart` (the message has numbers to chart).
+    pub fn next_mode(&self, chart: bool) -> Mode {
+        match self.mode {
+            Mode::Pretty if chart => Mode::Chart,
+            Mode::Pretty | Mode::Chart => Mode::Raw,
+            Mode::Raw => Mode::Hex,
+            Mode::Hex => Mode::Pretty,
+        }
+    }
+
+    /// Shows the message as `mode` from the top.
+    pub fn set_mode(&mut self, mode: Mode, th: &Theme) {
+        self.mode = mode;
+        self.scroll = 0;
+        self.relayout(self.width, th);
     }
 
     pub fn relayout(&mut self, w: usize, th: &Theme) {
@@ -111,7 +132,8 @@ impl Viewer {
 
         let p = &msg.payload;
         let lines = match self.mode {
-            Mode::Pretty => pretty::render(&msg, th, w),
+            // (The chart is drawn over these.)
+            Mode::Pretty | Mode::Chart => pretty::render(&msg, th, w),
             Mode::Hex => fmt::hex_lines(p, w, th),
             Mode::Raw if p.is_empty() => vec![Line::styled("(empty payload)", th.dim.add_modifier(Modifier::ITALIC))],
             Mode::Raw if !fmt::is_text(p) => fmt::hex_lines(p, w, th),
@@ -162,11 +184,7 @@ impl Viewer {
                 relayout = true;
             }
             KeyCode::Tab | KeyCode::Char('m') => {
-                self.mode = match self.mode {
-                    Mode::Pretty => Mode::Raw,
-                    Mode::Raw => Mode::Hex,
-                    Mode::Hex => Mode::Pretty,
-                };
+                self.mode = self.next_mode(false);
                 relayout = true;
             }
             _ => {}

@@ -1,6 +1,6 @@
 //! Rendering. Everything is drawn straight into the frame buffer.
 
-use std::time::Duration;
+use web_time::Duration;
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Chart, Dataset, GraphType, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Ask, Focus, PanelRow, msg_index, node_title};
+use crate::app::{App, Ask, CHART_MIN_H, CHART_MIN_H_STACKED, Focus, PanelRow, msg_index, node_title};
 use crate::composer::{self, Editor};
 use crate::fmt::{self, ago, commas, human_bytes, human_count, msg_count, plural};
 use crate::glyph;
@@ -82,7 +82,7 @@ fn draw_all(f: &mut Frame, app: &App) {
         Rect::new(l.tree_w, top, l.det_w, l.det_h)
     };
     tree_box(buf, tree_area, app, &st);
-    detail_box(buf, det_area, app, &st);
+    detail_box(buf, det_area, app, &st, l.stacked);
     let y = det_area.bottom();
     input_box(buf, Rect::new(0, y, area.width, 3), app);
     put(buf, 0, y + 3, hints(app), area.width);
@@ -296,22 +296,49 @@ fn prompt_box(buf: &mut Buffer, area: Rect, app: &App, st: &Store) {
             buf[(x, y)].reset();
         }
     }
+    let err = match p.err {
+        Some(e) => Line::styled(e, th.red),
+        None => Line::default(),
+    };
+    if matches!(p.ask, Ask::Subscribe | Ask::EditSub) {
+        let (title, keys) = if p.ask == Ask::Subscribe {
+            (
+                format!("Subscribe {}", c.name),
+                format!("{} subscribe  ·  esc cancel", glyph::ENTER),
+            )
+        } else {
+            (
+                format!("Subscription of {}", c.name),
+                format!("{} save (empty: remove it)  ·  esc cancel", glyph::ENTER),
+            )
+        };
+        let room = (w as usize).saturating_sub(4 + 14);
+        let lines = vec![
+            Line::styled(fmt::trunc_left(&c.url, w as usize - 4), th.dim),
+            err,
+            Line::from(vec![
+                Span::styled("Topic filter ", th.text),
+                Span::styled(fmt::trunc_left(&p.input, room), th.text),
+                Span::styled(" ", th.cursor),
+            ]),
+            Line::default(),
+            Line::styled(keys, th.faint),
+        ];
+        return draw_box(buf, r, &title, lines, true, None, th);
+    }
     let (who, label) = match p.ask {
         Ask::Password => (
             format!("{}@{}", c.username.as_deref().unwrap_or(""), c.url),
             "Password ",
         ),
-        Ask::KeyPassphrase => {
+        Ask::KeyPassphrase | Ask::Subscribe | Ask::EditSub => {
             let key = app.ctls[p.conn].cfg.key.clone().unwrap_or_default();
             (format!("client key {key}"), "Key passphrase ")
         }
     };
     let lines = vec![
         Line::styled(fmt::trunc_left(&who, w as usize - 4), th.dim),
-        match p.err {
-            Some(e) => Line::styled(e, th.red),
-            None => Line::default(),
-        },
+        err,
         Line::from(vec![
             Span::styled(label, th.text),
             Span::styled("•".repeat(p.input.chars().count()), th.text),
@@ -403,6 +430,10 @@ fn header<'a>(app: &App, st: &Store) -> Line<'a> {
     if st.live().any(|c| c.capture.active()) {
         left.push(Span::styled("  ● capturing", th.red));
     }
+    if st.flagged > 0 {
+        let n = plural(st.flagged, "anomaly", "anomalies");
+        left.push(Span::styled(format!("  ! {n}"), th.red));
+    }
     if let Some(v) = app.upgrade.as_ref().and_then(|w| w.offering()) {
         let v = if v == env!("CARGO_PKG_VERSION") { "new build" } else { v };
         left.push(Span::styled(format!("  ↑ {v} · ^n restart"), th.accent_b));
@@ -470,9 +501,17 @@ fn tree_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
             ]));
         }
     }
-    let end = (app.offset + ih).min(app.rows.len());
+    // Where the list was scrolled to, unless this frame is shorter than
+    // the app last clamped for (a chart just took the rows, or the window
+    // changed): then wherever shows the cursor.
+    let offset = if (app.offset..app.offset + ih).contains(&app.cursor) {
+        app.offset
+    } else {
+        app.cursor.saturating_sub(ih.saturating_sub(1))
+    };
+    let end = (offset + ih).min(app.rows.len());
     let mut sel_line = None;
-    for i in app.offset..end {
+    for i in offset..end {
         if i == app.cursor {
             sel_line = Some(lines.len());
         }
@@ -507,6 +546,9 @@ fn tree_line<'a>(app: &App, st: &Store, r: &Row, sel: bool, w: usize) -> Line<'a
         }
         if !r.expanded {
             spans.push(Span::styled(format!(" ({})", n.topics), th.faint));
+            if n.flagged_below > 0 {
+                spans.push(Span::styled(format!(" !{}", n.flagged_below), th.red));
+            }
         }
         return join_lr(spans, vec![Span::styled(human_count(n.sub_msgs), th.faint)], w);
     }
@@ -528,6 +570,9 @@ fn tree_line<'a>(app: &App, st: &Store, r: &Row, sel: bool, w: usize) -> Line<'a
         gs,
     ));
     spans.extend(node_name(app, &n.name, r.mark, sel));
+    if let Some(f) = n.watch.as_ref().and_then(|w| w.flag(app.now)) {
+        spans.push(Span::styled(format!(" ! {}", f.kind.name()), th.red));
+    }
     if st.conns[n.conn].capture.captures(&n.path) {
         spans.push(Span::styled(" ●", th.red)); // written to disk
     }
@@ -545,6 +590,9 @@ fn tree_line<'a>(app: &App, st: &Store, r: &Row, sel: bool, w: usize) -> Line<'a
     }
     if n.has_children() && !r.expanded {
         spans.push(Span::styled(format!(" ({})", n.topics), th.faint));
+        if n.flagged_below > 0 {
+            spans.push(Span::styled(format!(" !{}", n.flagged_below), th.red));
+        }
     }
     join_lr(spans, vec![Span::styled(human_count(n.sub_msgs), th.faint)], w)
 }
@@ -583,17 +631,16 @@ fn node_name<'a>(app: &App, name: &str, mark: u8, sel: bool) -> Vec<Span<'a>> {
     out
 }
 
-/// Rows a chart needs to be worth drawing: its box, a heading, the plot.
-const CHART_MIN_H: u16 = 8;
-
-fn detail_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
+fn detail_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store, stacked: bool) {
     let Some(n) = app.selected else {
         draw_box(buf, r, "", vec![], false, None, &app.th);
         return;
     };
     let node = &st.nodes[n];
-    // A topic with numbers gives the lower half to their chart.
-    let (r, chart) = if app.chart.topic() == Some(n) && app.chart.current().is_some() && r.height >= 2 * CHART_MIN_H {
+    // A topic with numbers gives the lower half to their chart, when the
+    // pane is tall enough for both. A stacked screen accepts a shorter one.
+    let min_h = if stacked { CHART_MIN_H_STACKED } else { CHART_MIN_H };
+    let (r, chart) = if app.chart.topic() == Some(n) && app.chart.current().is_some() && r.height >= 2 * min_h {
         let h = r.height / 2;
         (
             Rect {
@@ -610,7 +657,7 @@ fn detail_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
         (r, None)
     };
     if let Some(c) = chart {
-        chart_box(buf, c, app);
+        chart_box(buf, c, app, app.focus == Focus::Chart);
     }
     let (iw, ih) = (r.width.saturating_sub(4) as usize, r.height.saturating_sub(2) as usize);
     let (mut lines, sel) = if node.is_conn() {
@@ -658,6 +705,14 @@ fn topic_detail<'a>(app: &App, st: &Store, n: usize, w: usize, h: usize) -> (Vec
         ));
     }
     out.push(Line::from(meta));
+    // What its watch flags, and since when.
+    if let Some(f) = node.watch.as_ref().and_then(|w| w.flag(app.now)) {
+        out.push(Line::from(vec![
+            Span::styled(format!("! {} ", f.kind.name()), th.red),
+            Span::styled(f.what.clone(), th.text),
+            Span::styled(format!(" · {}", ago(app.now, f.at)), th.dim),
+        ]));
+    }
     out.push(Line::default());
 
     // Messages
@@ -743,11 +798,11 @@ fn topic_detail<'a>(app: &App, st: &Store, n: usize, w: usize, h: usize) -> (Vec
 /// The selected topic's numbers: the one picked (`↑↓` with the chart in
 /// focus), where it comes from and its range, the list to pick from, and
 /// the plot.
-fn chart_box(buf: &mut Buffer, r: Rect, app: &App) {
+fn chart_box(buf: &mut Buffer, r: Rect, app: &App, focused: bool) {
     let th = &app.th;
     let ch = &app.chart;
     let Some(s) = ch.current() else { return };
-    draw_box(buf, r, "Chart", vec![], app.focus == Focus::Chart, None, th);
+    draw_box(buf, r, "Chart", vec![], focused, None, th);
     let inner =
         Rect::new(r.x + 2, r.y + 1, r.width.saturating_sub(4), r.height.saturating_sub(2)).intersection(buf.area);
     if inner.width < 16 || inner.height < 4 {
@@ -1067,6 +1122,10 @@ fn input_box(buf: &mut Buffer, r: Rect, app: &App) {
             Span::styled("search · ", th.dim),
             Span::styled(plural(app.matched as usize, "topic", "topics"), th.text),
         ],
+        FilterMode::Flagged => vec![
+            Span::styled("flagged · ", th.dim),
+            Span::styled(plural(app.matched as usize, "topic", "topics"), th.text),
+        ],
         FilterMode::None => vec![],
     };
     let mut left = vec![Span::styled("> ", th.accent_b)];
@@ -1178,6 +1237,8 @@ fn hints<'a>(app: &App) -> Line<'a> {
         (true, false, Focus::Conns) => vec![
             ("j k", "move", 3),
             (&space, "connect / on-off", 1),
+            ("+", "subscribe", 1),
+            (glyph::ENTER, "edit", 1),
             ("tab", "pane", 2),
             ("/", "filter", 1),
         ],
@@ -1193,7 +1254,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
         (true, false, Focus::Chart) => vec![
             ("j k", "column / field", 3),
             ("h l", "scroll", 2),
-            (glyph::ENTER, "open", 2),
+            (glyph::ENTER, "full", 1),
             ("e", "publish", 1),
             ("t y", "copy", 1),
             ("esc", "back", 2),
@@ -1213,6 +1274,8 @@ fn hints<'a>(app: &App) -> Line<'a> {
         (false, _, Focus::Conns) => vec![
             ("↑↓", "move", 3),
             (&space, "connect / on-off", 1),
+            ("+", "subscribe", 1),
+            (glyph::ENTER, "edit", 1),
             ("tab", "pane", 2),
             ("type", "filter", 2),
         ],
@@ -1228,7 +1291,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
         (false, _, Focus::Chart) => vec![
             ("↑↓", "column / field", 3),
             ("←→", "scroll", 2),
-            (glyph::ENTER, "open", 2),
+            (glyph::ENTER, "full", 1),
             ("^e", "publish", 1),
             ("^t ^y", "copy", 1),
             ("esc", "back", 2),
@@ -1254,7 +1317,9 @@ fn hints<'a>(app: &App) -> Line<'a> {
     } else if app.updating.is_none() && app.update_offer().is_some() {
         keys.push(("^n", "update", 0));
     }
-    if !app.opts.vim {
+    if cfg!(target_arch = "wasm32") {
+        // A web page isn't quit.
+    } else if !app.opts.vim {
         keys.push(("^c", "quit", 0));
     } else if !app.filtering {
         keys.push(("q", "quit", 0));
@@ -1276,11 +1341,33 @@ fn viewer(buf: &mut Buffer, area: Rect, app: &App) {
         }
     }));
     let r = Rect::new(0, 0, area.width, area.height - 1);
-    draw_box(buf, r, &v.path, lines, true, None, th);
+    let charted = v.mode == crate::viewer::Mode::Chart;
+    if charted {
+        // The message's head, then its chart in the rest.
+        draw_box(buf, r, &v.path, v.head.clone(), true, None, th);
+        let top = 1 + v.head.len() as u16;
+        let c = Rect::new(
+            r.x + 1,
+            r.y + top,
+            r.width.saturating_sub(2),
+            r.height.saturating_sub(top + 1),
+        );
+        chart_box(buf, c, app, true);
+    } else {
+        draw_box(buf, r, &v.path, lines, true, None, th);
+    }
 
     let mode = format!("view: {}", v.mode_name());
-    let mut keys = vec![("↑↓ pgup pgdn", "scroll", 3), ("←→", "older/newer", 2)];
-    if v.max_width > v.width_now() {
+    let mut keys = if charted {
+        let mut k = vec![("↑↓", "series", 3), ("←→", "older/newer", 2)];
+        if app.chart.scrollable() {
+            k.push(("shift ←→", "pan", 1));
+        }
+        k
+    } else {
+        vec![("↑↓ pgup pgdn", "scroll", 3), ("←→", "older/newer", 2)]
+    };
+    if !charted && v.max_width > v.width_now() {
         keys.push(("shift ←→", "pan", 1));
     }
     keys.extend([
@@ -1289,7 +1376,7 @@ fn viewer(buf: &mut Buffer, area: Rect, app: &App) {
         ("t y", "copy", 1),
         ("esc", "back", 0),
     ]);
-    let lines = (v.lines.len() > body_h && app.notice.is_none())
+    let lines = (!charted && v.lines.len() > body_h && app.notice.is_none())
         .then(|| format!("  {}–{} of {} lines", v.scroll + 1, end, v.lines.len()));
     let room = hint_room(app).saturating_sub(lines.as_deref().map_or(0, fmt::str_width));
     let mut h = notice_line(app).unwrap_or_else(|| hint(th, &keys, room));
@@ -1396,9 +1483,9 @@ mod tests {
     use std::sync::mpsc::{self, Receiver};
     use std::sync::{Arc, Mutex};
 
+    use crate::input::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use crate::app::{App, Ask, ConnCtl, Focus, Options, PanelRow};
     use crate::config::{self, ConnCfg};
@@ -1555,6 +1642,29 @@ mod tests {
         app.resize(110, 36);
         app.tick();
         (app, rxs)
+    }
+
+    #[test]
+    fn a_tap_moves_the_cursor_and_a_second_one_enters() {
+        let (mut app, _rx) = sample(PathBuf::new());
+        let l = app.layout();
+        let top = 1 + l.panel_h;
+        // The tree's second row: the cursor goes there.
+        app.tap(3, top + 2);
+        assert_eq!((app.focus, app.cursor), (Focus::Tree, 1));
+        let row = &app.rows[1];
+        let (expanded, kids) = (row.expanded, app.store.lock().unwrap().nodes[row.node].has_children());
+        assert!(kids, "{}", frame(&app, "tapped"));
+        // Again: Enter, which opens or closes it.
+        app.tap(3, top + 2);
+        assert!(app.viewer.is_some() || app.rows[1].expanded != expanded);
+        // The panel's second row (local's first subscription).
+        app.viewer = None;
+        app.tap(5, 3);
+        assert_eq!((app.focus, app.panel_cursor), (Focus::Conns, 1));
+        // A border does nothing.
+        app.tap(0, top);
+        assert_eq!(app.focus, Focus::Conns);
     }
 
     fn typ(app: &mut App, s: &str) {
@@ -1863,7 +1973,7 @@ mod tests {
         // The rate's last sample saw every message, so the removal makes
         // the total smaller than it; the next rate must not underflow.
         app.rate_total = total;
-        app.rate_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.rate_at = web_time::Instant::now() - web_time::Duration::from_secs(2);
         app.apply_config(vec![edited.clone(), lab]);
         app.tick();
         assert_eq!(app.rate, 0.0);
@@ -2200,6 +2310,10 @@ mod tests {
         );
         let v = frame(&app, "copied full screen");
         assert!(v.contains("copied formatted JSON, "), "notice full screen");
+        // Its number charted: a copy there is the formatted message.
+        press(&mut app, &[KeyCode::Tab]);
+        typ(&mut app, "y");
+        assert_eq!(last(&app), pretty, "chart");
         press(&mut app, &[KeyCode::Tab]);
         typ(&mut app, "y");
         assert_eq!(last(&app), payload.replace("22.5", "20.5"), "raw");
@@ -2353,7 +2467,7 @@ mod tests {
 
         // A write that fails (the capture dir can't be made) stops capture
         // and says so, in the panel and the status line.
-        let wait = std::time::Duration::from_secs(5);
+        let wait = web_time::Duration::from_secs(5);
         let blocker = dir.with_extension("blocker");
         std::fs::write(&blocker, "x").unwrap();
         app.store.lock().unwrap().capture_dir = blocker.join("captures");
@@ -2404,9 +2518,9 @@ mod tests {
             .expect("captured");
         let go_on = app.store.lock().unwrap().conns[0].capture.writer().unwrap().stall();
         target.record("v2/fleet", b"2", 0, false, &Props::default());
-        let start = std::time::Instant::now();
-        let late = app.flush_captures(std::time::Duration::from_millis(100));
-        assert!(start.elapsed() < std::time::Duration::from_secs(1), "bounded");
+        let start = web_time::Instant::now();
+        let late = app.flush_captures(web_time::Duration::from_millis(100));
+        assert!(start.elapsed() < web_time::Duration::from_secs(1), "bounded");
         assert!(
             late.len() == 1 && late[0].starts_with("local: ") && late[0].ends_with("the disk is too slow"),
             "{late:?}"
@@ -2429,7 +2543,7 @@ mod tests {
         let (mut app, rx) = sample(tmp_config("open"));
         // A capture file, as the capture writer makes it.
         let path = std::env::temp_dir().join(format!("fss-mqtt-test-{}-open.jsonl", std::process::id()));
-        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let t = web_time::SystemTime::now() - web_time::Duration::from_secs(3600);
         let props = Props {
             content_type: Some("application/json".into()),
             ..Props::default()
@@ -2579,7 +2693,7 @@ mod tests {
             st.all_messages()
                 .into_iter()
                 .map(|(c, t, m)| {
-                    let ms = m.time.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+                    let ms = m.time.duration_since(web_time::UNIX_EPOCH).unwrap().as_millis();
                     (c, t.to_string(), m.payload.clone(), m.size, m.qos, ms)
                 })
                 .collect()
@@ -2602,7 +2716,7 @@ mod tests {
             app.composer.as_ref().unwrap().ed.text()
         );
         // No message rate from the restored messages.
-        back.rate_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        back.rate_at = web_time::Instant::now() - web_time::Duration::from_secs(2);
         back.tick();
         assert_eq!(back.rate, 0.0);
         let _ = std::fs::remove_file(&path);
@@ -2628,7 +2742,7 @@ mod tests {
             "{v}"
         );
         // Changing again since it said its version: not now.
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(web_time::Duration::from_millis(20));
         std::fs::write(&bin, "v10, being written").unwrap();
         app.key(ctrl_n);
         assert!(!app.quit && app.notice.as_ref().unwrap().0.contains("changing on disk"));
@@ -2706,7 +2820,17 @@ mod tests {
             let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
             t.draw(|f| super::draw(f, app)).unwrap();
         };
-        let sizes = [(184, 55), (184, 57), (110, 36), (79, 40), (60, 20), (20, 9), (10, 8)];
+        let sizes = [
+            (184, 55),
+            (184, 57),
+            (110, 36),
+            (79, 40),
+            (60, 20),
+            (54, 40),
+            (52, 35),
+            (20, 9),
+            (10, 8),
+        ];
         let check = |app: &mut App, what: &str| {
             for &(aw, ah) in &sizes {
                 app.resize(aw, ah);
@@ -2727,8 +2851,18 @@ mod tests {
         check(&mut app, "prompt");
         press(&mut app, &[KeyCode::Esc, KeyCode::Esc, KeyCode::Esc, KeyCode::Tab]);
         app.prompt = None;
-        // Full screen, and the publish editor.
+        // The chart full screen, the message full screen, and the publish editor.
+        app.resize(110, 36); // with room for the chart pane, to tab to
         typ(&mut app, "v1/plant/line1/temp");
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab, KeyCode::Enter]);
+        assert!(
+            app.viewer
+                .as_ref()
+                .is_some_and(|v| v.mode == crate::viewer::Mode::Chart)
+        );
+        check(&mut app, "chart full screen");
+        press(&mut app, &[KeyCode::Esc, KeyCode::Esc]);
+        assert!(app.viewer.is_none() && app.focus == Focus::Tree);
         press(&mut app, &[KeyCode::Enter]);
         assert!(app.viewer.is_some());
         check(&mut app, "viewer");
@@ -2756,8 +2890,8 @@ mod tests {
         assert_eq!(saved[0].paused, vec!["v1/#"]);
         let v = frame(&app, "v1 paused");
         assert!(v.contains(&format!("{}v1/#", glyph::OFF)));
-        // And back on.
-        press(&mut app, &[KeyCode::Enter]);
+        // And back on (space: enter edits a subscription).
+        press(&mut app, &[KeyCode::Char(' ')]);
         assert!(matches!(rx[0].try_recv(), Ok(Cmd::Subscribe(t)) if t == "v1/#"));
         assert!(config::load(&cfg).unwrap()[0].paused.is_empty());
 
@@ -3017,6 +3151,167 @@ mod tests {
     }
 
     #[test]
+    fn subscribe_edit_and_remove_from_the_connections_panel() {
+        let cfg = tmp_config("edit-subs");
+        let (mut app, rxs) = sample(cfg.clone());
+        let sent = |rx: &Receiver<Cmd>| -> Vec<String> {
+            rx.try_iter()
+                .filter_map(|c| match c {
+                    Cmd::Subscribe(t) => Some(format!("+{t}")),
+                    Cmd::Unsubscribe(t) => Some(format!("-{t}")),
+                    _ => None,
+                })
+                .collect()
+        };
+        let topics = |app: &App| app.ctls[0].cfg.topics.clone();
+        app.focus = Focus::Conns;
+        app.panel_cursor = 0; // local, connected
+
+        // + asks for a filter; enter subscribes, now and in the file.
+        typ(&mut app, "+");
+        assert!(app.prompt.as_ref().is_some_and(|p| p.ask == Ask::Subscribe));
+        assert!(frame(&app, "subscribe prompt").contains("Subscribe local"));
+        typ(&mut app, "v3/#");
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(app.prompt.is_none());
+        assert_eq!(topics(&app), ["v1/#", "v2/#", "v3/#"]);
+        assert_eq!(sent(&rxs[0]), ["+v3/#"]);
+        assert!(std::fs::read_to_string(&cfg).unwrap().contains("v3/#"));
+        assert!(app.notice.as_ref().unwrap().0.contains("local: subscribed to v3/#"));
+
+        // Not a filter, or one it has: said in the prompt, which stays.
+        typ(&mut app, "+");
+        typ(&mut app, "a/b#");
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(
+            app.prompt
+                .as_ref()
+                .unwrap()
+                .err
+                .unwrap()
+                .starts_with("not a topic filter")
+        );
+        for _ in 0..4 {
+            press(&mut app, &[KeyCode::Backspace]);
+        }
+        typ(&mut app, "v1/#");
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(
+            app.prompt.as_ref().unwrap().err,
+            Some("it's subscribed to that already")
+        );
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.prompt.is_none() && sent(&rxs[0]).is_empty());
+
+        // Enter on a subscription edits it: the old one goes, the new one comes.
+        app.panel_cursor = 3; // v3/#
+        press(&mut app, &[KeyCode::Enter]);
+        let p = app.prompt.as_ref().unwrap();
+        assert_eq!((p.ask, p.input.as_str()), (Ask::EditSub, "v3/#"));
+        press(&mut app, &[KeyCode::Backspace]);
+        typ(&mut app, "temp");
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(topics(&app), ["v1/#", "v2/#", "v3/temp"]);
+        let mut s = sent(&rxs[0]);
+        s.sort();
+        assert_eq!(s, ["+v3/temp", "-v3/#"]);
+
+        // Emptied, it's removed.
+        press(&mut app, &[KeyCode::Enter]);
+        for _ in 0..7 {
+            press(&mut app, &[KeyCode::Backspace]);
+        }
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(topics(&app), ["v1/#", "v2/#"]);
+        assert_eq!(sent(&rxs[0]), ["-v3/temp"]);
+        assert!(!std::fs::read_to_string(&cfg).unwrap().contains("v3/"));
+
+        // Space still switches one off and on.
+        app.panel_cursor = 1;
+        typ(&mut app, " ");
+        assert_eq!(sent(&rxs[0]), ["-v1/#"]);
+        assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn anomalies_show_in_the_header_the_tree_and_with_the_bang_filter() {
+        let (mut app, _rx) = sample(tmp_config("anomaly"));
+        {
+            let mut st = app.store.lock().unwrap();
+            for i in 0..40 {
+                let p = format!("{{\"t\":{}}}", 20.0 + (i % 7) as f64 * 0.3);
+                st.add_decoded(0, "v1/plant/line9/temp", p.as_bytes(), 0, false, Props::default(), None);
+            }
+            assert_eq!(st.flagged, 0);
+            st.add_decoded(
+                0,
+                "v1/plant/line9/temp",
+                b"{\"t\":99}",
+                0,
+                false,
+                Props::default(),
+                None,
+            );
+            assert_eq!(st.flagged, 1);
+        }
+        app.tick();
+        let v = frame(&app, "flagged");
+        assert!(v.contains("! 1 anomaly"), "{v}");
+        // Collapsed, its connection says how many are below.
+        assert!(v.contains("!1"), "{v}");
+
+        typ(&mut app, "!");
+        let v = frame(&app, "the ! filter");
+        assert!(v.contains("flagged · 1 topic"), "{v}");
+        assert!(v.contains("temp ! spike"), "{v}");
+        assert!(v.contains("! spike t 99 (usual "), "the reason in the details: {v}");
+        assert!(!v.contains("line1"), "only flagged topics: {v}");
+    }
+
+    #[test]
+    fn tab_full_screen_goes_to_the_chart_when_there_are_numbers() {
+        use crate::viewer::Mode;
+        let (mut app, _rx) = sample(tmp_config("chart-view"));
+        let mode = |app: &App| app.viewer.as_ref().map(|v| v.mode);
+
+        // A day of minutes in a Parquet message: table, chart, raw, hex.
+        typ(&mut app, "v2/turbine/T01/fastlog");
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(mode(&app) == Some(Mode::Pretty));
+        press(&mut app, &[KeyCode::Tab]);
+        assert!(mode(&app) == Some(Mode::Chart));
+        let v = frame(&app, "full screen chart");
+        assert!(v.contains("╭─ Chart ─") && v.contains("view: chart"), "{v}");
+        let first = app.chart.sel;
+        press(&mut app, &[KeyCode::Down]);
+        assert_eq!(app.chart.sel, first + 1, "↓ picks the next series");
+        press(&mut app, &[KeyCode::Tab]);
+        assert!(mode(&app) == Some(Mode::Raw));
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+        assert!(mode(&app) == Some(Mode::Pretty));
+
+        // Text without numbers: no chart to tab to.
+        press(&mut app, &[KeyCode::Esc, KeyCode::Esc]);
+        typ(&mut app, "v1/plant/line1/status");
+        press(&mut app, &[KeyCode::Enter, KeyCode::Tab]);
+        assert!(mode(&app) == Some(Mode::Raw));
+    }
+
+    #[test]
+    fn tab_passes_over_a_chart_with_no_room() {
+        let (mut app, _rx) = sample(tmp_config("chart-hidden"));
+        typ(&mut app, "v1/plant/line1/temp");
+        assert!(app.chart_shown());
+        // Too short for the details and the chart: tab never lands on it.
+        app.resize(110, 24);
+        assert!(!app.chart_shown() && !frame(&app, "short").contains("Chart"));
+        for _ in 0..4 {
+            press(&mut app, &[KeyCode::Tab]);
+            assert!(app.focus != Focus::Chart);
+        }
+    }
+
+    #[test]
     fn chart_of_the_selected_topic() {
         let (mut app, _rx) = sample(tmp_config("chart"));
         let selected = |app: &App| {
@@ -3089,6 +3384,180 @@ mod tests {
     }
 
     #[test]
+    fn a_phone_shows_the_chart_without_moving_the_desktop_layout() {
+        let (mut app, _rx) = sample(tmp_config("phone-chart"));
+        typ(&mut app, "v1/plant/line1/temp");
+
+        // A phone (about 52–54×35–40) used to leave the detail pane ~13 rows,
+        // short of the 16 a wide chart and its messages each need.
+        for &(w, h) in &[(54u16, 40u16), (52, 35), (53, 38)] {
+            app.resize(w, h);
+            let l = app.layout();
+            assert!(l.stacked, "{w}x{h}");
+            assert_eq!(l.panel_h, 6, "connections stay capped at {w}x{h}");
+            assert!(
+                l.det_h >= 2 * crate::app::CHART_MIN_H_STACKED,
+                "detail {} at {w}x{h}",
+                l.det_h
+            );
+            assert!(l.tree_h >= 6, "topic list {} at {w}x{h}", l.tree_h);
+            let v = frame(&app, &format!("phone {w}x{h}"));
+            assert!(
+                v.contains("╭─ Chart ─") && v.contains("min 20.5") && v.contains("Messages"),
+                "chart under the messages at {w}x{h}:\n{v}"
+            );
+        }
+
+        // The topic's enter still opens the message, on a phone too.
+        app.resize(54, 40);
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(
+            app.viewer
+                .as_ref()
+                .is_some_and(|v| v.mode == crate::viewer::Mode::Pretty)
+        );
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.focus == Focus::Tree && app.viewer.is_none());
+
+        // Wide layout is unchanged, including a short window with no chart.
+        app.resize(110, 36);
+        let l = app.layout();
+        assert!(!l.stacked);
+        assert_eq!((l.panel_h, l.tree_w, l.tree_h, l.det_w, l.det_h), (7, 49, 24, 61, 24));
+        assert!(frame(&app, "desktop").contains("╭─ Chart ─"));
+        app.resize(80, 40);
+        let l = app.layout();
+        assert!(
+            !l.stacked && l.panel_h == 7 && l.tree_h == 28,
+            "panel {} tree {}",
+            l.panel_h,
+            l.tree_h
+        );
+        app.resize(110, 24);
+        assert!(!frame(&app, "short desktop").contains("Chart"));
+
+        // No numbers: no chart, and the topic list keeps its 55%.
+        app.resize(54, 40);
+        press(&mut app, &[KeyCode::Esc]);
+        typ(&mut app, "v1/plant/line1/status");
+        let l = app.layout();
+        let body = 40 - 5 - l.panel_h;
+        assert_eq!(l.tree_h, body * 55 / 100);
+        assert!(!frame(&app, "no numbers on a phone").contains("Chart"));
+    }
+
+    #[test]
+    fn the_topic_list_stays_on_the_cursor_when_a_chart_shortens_it() {
+        let mut st = Store::new(10, 64 * 1024);
+        let c = st.add_conn("local", "mqtt://x", None, vec![sub("#")]);
+        for i in 0..40 {
+            st.add(c, &format!("n{i:02}"), b"RUNNING", 0, false, Props::default());
+        }
+        // Two values: a chart needs more than one point.
+        st.add(c, "temp", b"21.5", 0, false, Props::default());
+        st.add(c, "temp", b"22.0", 0, false, Props::default());
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            Arc::new(Mutex::new(st)),
+            Options {
+                inline_bytes: 64,
+                vim: false,
+                oma: false,
+            },
+            Theme::new(false),
+            vec![ConnCtl {
+                cfg: ConnCfg {
+                    name: "local".into(),
+                    url: "mqtt://x:1883".into(),
+                    topics: vec!["#".into()],
+                    ..Default::default()
+                },
+                saved: true,
+                tx,
+                password: None,
+                key_password: None,
+            }],
+            tmp_config("chart-scroll-tree"),
+            vec![],
+        );
+        app.resize(54, 40);
+        app.tick();
+        let tall = app.tree_height();
+        assert!(app.rows.len() > tall + 5, "the list has to scroll");
+        press(&mut app, &[KeyCode::End]);
+        assert_eq!(sel_path(&app), "temp");
+        let h = app.tree_height();
+        assert!(h < tall, "the chart takes rows from the list");
+        assert!(
+            app.offset <= app.cursor && app.cursor < app.offset + h,
+            "cursor {} offset {} window {h}",
+            app.cursor,
+            app.offset
+        );
+        let v = frame(&app, "chart shortened the list");
+        assert!(v.contains("╭─ Chart ─") && v.contains("min 21.5"), "{v}");
+        let l = app.layout();
+        let lines: Vec<_> = v.lines().collect();
+        let top = (1 + l.panel_h) as usize;
+        let shown = lines
+            .iter()
+            .skip(top + 1)
+            .take(h)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            shown.contains(glyph::CURSOR) && shown.contains("temp"),
+            "cursor row not in the list:\n{v}"
+        );
+    }
+
+    #[test]
+    fn enter_on_the_chart_opens_the_message_as_its_chart() {
+        use crate::viewer::Mode;
+        let (mut app, _rx) = sample(tmp_config("chart-full"));
+        let mode = |app: &App| app.viewer.as_ref().map(|v| v.mode);
+        typ(&mut app, "v1/plant/line1/temp");
+        // The topic's enter is still the message, formatted.
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(mode(&app) == Some(Mode::Pretty));
+        press(&mut app, &[KeyCode::Esc]);
+
+        // Tab to the chart, then enter: the message full screen, charted.
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+        assert!(app.focus == Focus::Chart);
+        assert!(frame(&app, "chart pane").contains(&format!("{} full", glyph::ENTER)));
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(mode(&app) == Some(Mode::Chart));
+        let v = frame(&app, "chart full screen");
+        assert!(
+            v.contains("╭─ Chart ─") && !v.contains("Topics") && v.contains("esc back"),
+            "{v}"
+        );
+        // Esc: back to the panes, on the chart.
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.viewer.is_none() && app.focus == Focus::Chart);
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.focus == Focus::Tree);
+
+        // A Parquet table: ↑↓ pick a column there, on a phone too.
+        press(&mut app, &[KeyCode::Esc]);
+        typ(&mut app, "fastlog");
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab, KeyCode::Enter]);
+        assert!(mode(&app) == Some(Mode::Chart));
+        let first = app.chart.current().unwrap().name.clone();
+        press(&mut app, &[KeyCode::Down]);
+        assert_ne!(app.chart.current().unwrap().name, first);
+        app.resize(52, 35);
+        app.notice = None;
+        let v = frame(&app, "phone full screen");
+        assert!(
+            v.contains("╭─ Chart ─") && v.contains("esc back") && !v.contains("Topics"),
+            "{v}"
+        );
+    }
+
+    #[test]
     fn the_picked_message_stays_in_view_above_a_chart() {
         let mut st = Store::new(10, 64 * 1024);
         let c = st.add_conn("local", "mqtt://x", None, vec![sub("#")]);
@@ -3128,10 +3597,10 @@ mod tests {
         if app.chart.reading() {
             assert!(frame(&app, "reading").contains("reading all rows…"));
         }
-        let start = std::time::Instant::now();
+        let start = web_time::Instant::now();
         while app.chart.reading() {
-            assert!(start.elapsed() < std::time::Duration::from_secs(10), "never read");
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            assert!(start.elapsed() < web_time::Duration::from_secs(10), "never read");
+            std::thread::sleep(web_time::Duration::from_millis(2));
             app.tick();
         }
         let v = frame(&app, "500 rows, the first in view");
@@ -3177,10 +3646,10 @@ mod tests {
         let (mut app, _rx) = app_with(table_topic(crate::store::WHOLE_BUDGET), tmp_config("chart-kept"));
         typ(&mut app, "fastlog");
         press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
-        let start = std::time::Instant::now();
+        let start = web_time::Instant::now();
         while app.chart.reading() {
-            assert!(start.elapsed() < std::time::Duration::from_secs(10), "never read");
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            assert!(start.elapsed() < web_time::Duration::from_secs(10), "never read");
+            std::thread::sleep(web_time::Duration::from_millis(2));
             app.tick();
         }
         let v = frame(&app, "the newest kept whole");

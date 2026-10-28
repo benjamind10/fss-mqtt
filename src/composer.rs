@@ -12,7 +12,7 @@
 //! {"ts":"…","power_kw":2265.8}
 //! ```
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::input::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
 
 use crate::base64;
@@ -986,7 +986,7 @@ impl Composer {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::time::SystemTime;
+    use web_time::SystemTime;
 
     fn msg(payload: &[u8], size: usize, props: Props) -> Arc<Message> {
         Arc::new(Message {

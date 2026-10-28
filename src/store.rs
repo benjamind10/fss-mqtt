@@ -8,7 +8,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use web_time::SystemTime;
 
 use crate::capture::{Capture, Target};
 
@@ -66,6 +66,12 @@ pub struct Node {
     pub sub_msgs: u64,
     pub topics: u32,
     pub last_seen: SystemTime,
+    /// What's usual for this topic, to flag what isn't (live messages).
+    pub watch: Option<Box<crate::watch::Watch>>,
+    /// The watch has a flag up.
+    pub flagged: bool,
+    /// Flagged topics below this node.
+    pub flagged_below: u32,
 }
 
 impl Node {
@@ -87,6 +93,9 @@ impl Node {
             sub_msgs: 0,
             topics: 0,
             last_seen: SystemTime::UNIX_EPOCH,
+            watch: None,
+            flagged: false,
+            flagged_below: 0,
         }
     }
     pub fn is_conn(&self) -> bool {
@@ -187,6 +196,9 @@ pub struct Store {
     whole_budget: usize,
     whole_order: VecDeque<(u64, usize)>,
     whole_live: usize,
+    /// Topics with a watch, and how many have a flag up.
+    watched: Vec<usize>,
+    pub flagged: usize,
 }
 
 impl Store {
@@ -205,6 +217,8 @@ impl Store {
             whole_budget: WHOLE_BUDGET,
             whole_order: VecDeque::new(),
             whole_live: 0,
+            watched: Vec::new(),
+            flagged: 0,
         }
     }
 
@@ -360,7 +374,69 @@ impl Store {
         if !self.conns[conn].removed {
             self.received += 1;
         }
-        self.insert(conn, topic, now, payload, payload.len(), qos, retain, props, decoded);
+        if let Some(n) = self.insert(conn, topic, now, payload, payload.len(), qos, retain, props, decoded) {
+            self.watch(n, now);
+        }
+    }
+
+    /// The watch on topic `n` takes in its newest message.
+    fn watch(&mut self, n: usize, now: SystemTime) {
+        // A big payload's numbers are a table's, for its chart.
+        const NUMBERS_UP_TO: usize = 16 * 1024;
+        let node = &mut self.nodes[n];
+        let numbers = match node.msgs.back() {
+            Some(m) if m.size <= NUMBERS_UP_TO => crate::chart::fields(m),
+            _ => vec![],
+        };
+        if node.watch.is_none() {
+            self.watched.push(n);
+        }
+        node.watch.get_or_insert_default().arrive(now, &numbers);
+        self.reflag(n, now);
+    }
+
+    /// Looks again at what the watches flag at `now`: topics gone quiet,
+    /// and spikes long enough ago.
+    pub fn check_watches(&mut self, now: SystemTime) {
+        for i in 0..self.watched.len() {
+            let n = self.watched[i];
+            let up = self.conns[self.nodes[n].conn].status.state == ConnState::Connected;
+            if let Some(w) = &mut self.nodes[n].watch {
+                // A topic of a connection that's down isn't silent itself.
+                if up {
+                    w.check(now);
+                } else {
+                    w.check(SystemTime::UNIX_EPOCH);
+                }
+            }
+            self.reflag(n, now);
+        }
+    }
+
+    /// Whether topic `n` is flagged at `now`; counts it up the tree.
+    fn reflag(&mut self, n: usize, now: SystemTime) {
+        let node = &mut self.nodes[n];
+        let on = node.watch.as_ref().is_some_and(|w| w.flag(now).is_some());
+        if on == node.flagged {
+            return;
+        }
+        node.flagged = on;
+        let mut a = node.parent;
+        while let Some(i) = a {
+            let p = &mut self.nodes[i];
+            if on {
+                p.flagged_below += 1;
+            } else {
+                p.flagged_below -= 1;
+            }
+            a = p.parent;
+        }
+        if on {
+            self.flagged += 1;
+        } else {
+            self.flagged -= 1;
+        }
+        self.struct_ver += 1; // the ! filter's rows change
     }
 
     /// A message from a session or capture file: it keeps the time it
@@ -379,7 +455,7 @@ impl Store {
         props: Props,
         decoded: Option<crate::pretty::Decoded>,
     ) {
-        self.insert(
+        let _ = self.insert(
             conn,
             topic,
             time,
@@ -404,9 +480,9 @@ impl Store {
         retain: bool,
         props: Props,
         decoded: Option<crate::pretty::Decoded>,
-    ) {
+    ) -> Option<usize> {
         if self.conns[conn].removed {
-            return; // its thread is on its way out
+            return None; // its thread is on its way out
         }
         let keep = payload.len().min(self.max_payload);
         self.seq += 1;
@@ -469,6 +545,7 @@ impl Store {
             }
             a = node.parent;
         }
+        Some(n)
     }
 
     /// The node for `path` under connection `conn` ("" is the connection).
@@ -557,6 +634,8 @@ pub enum FilterMode {
     /// MQTT-style (v1/+/temp, v1/#). The last literal level is a
     /// case-insensitive prefix and everything below a match is included.
     Pattern,
+    /// `!`: the topics with a flag up (see watch.rs).
+    Flagged,
 }
 
 #[derive(Clone)]
@@ -574,6 +653,8 @@ impl Filter {
     pub fn compile(raw: &str) -> Filter {
         let mode = if raw.is_empty() {
             FilterMode::None
+        } else if raw == "!" {
+            FilterMode::Flagged
         } else if raw.contains(['/', '+', '#']) {
             FilterMode::Pattern
         } else {
@@ -603,7 +684,11 @@ impl Filter {
         };
         // Connections are the top level; filters match the topics below them.
         for &c in st.nodes[ROOT].children() {
-            if self.mode == FilterMode::Search {
+            if self.mode == FilterMode::Flagged {
+                if v.flagged(c) {
+                    v.marks[c] |= VISIBLE;
+                }
+            } else if self.mode == FilterMode::Search {
                 let mut any = false;
                 for &t in st.nodes[c].children() {
                     any |= v.search(t);
@@ -642,6 +727,24 @@ impl Visitor<'_> {
             self.marks[c] |= m;
             self.inside(c);
         }
+    }
+
+    /// Flagged topics, and the way to them.
+    fn flagged(&mut self, n: usize) -> bool {
+        let node = &self.st.nodes[n];
+        if node.flagged_below == 0 && !node.flagged {
+            return false;
+        }
+        if node.flagged && !node.is_conn() {
+            self.topics += 1;
+            self.marks[n] |= VISIBLE | MATCHED;
+        }
+        for &c in node.children() {
+            if self.flagged(c) {
+                self.marks[n] |= VISIBLE;
+            }
+        }
+        true
     }
 
     fn search(&mut self, n: usize) -> bool {
@@ -955,7 +1058,7 @@ mod tests {
         s.sort_children();
         for f in ["", "v1/+/dev12/te", "temp"] {
             let iters = 50;
-            let t = std::time::Instant::now();
+            let t = web_time::Instant::now();
             for _ in 0..iters {
                 let (marks, matched) = Filter::compile(f).visibility(&s);
                 let rows = flatten(&s, marks.as_deref(), &|_, m| m & INSIDE == 0 || matched <= 300);

@@ -1,11 +1,13 @@
 # fss-mqtt
 
 A fast, keyboard-driven MQTT explorer for the terminal. Subscribe to a broker and get a
-live topic tree you narrow down just by typing; edit any message and publish it again.
+live topic tree you narrow down just by typing; see payloads decoded, their numbers charted and
+anomalies flagged as they arrive; edit any message and publish it again.
 
-![fss-mqtt: browsing two brokers and filtering them; a topic's messages, one full screen; the numbers in its messages charted live, and a day of minutes in one Parquet message charted and scrolled through; Parquet, Avro, Arrow, SQLite, SQLite changeset, Protobuf, MessagePack, CBOR, CSV and gzip payloads decoded; the keys pressed show below](docs/demo.gif)
+![fss-mqtt: browsing two brokers and filtering them; a topic's messages, one full screen; the numbers in its messages charted live, and a day of minutes in one Parquet message charted, scrolled through and shown full screen; Parquet, Avro, Arrow, SQLite, SQLite changeset, Protobuf, MessagePack, CBOR, CSV and gzip payloads decoded; a power spike, a stuck wind sensor and a silent turbine flagged as anomalies and listed with !; a new subscription added from the connections panel with +; the keys pressed show below](docs/demo.gif)
 
-Vim user? See [`--vim`](#vim-keys---vim).
+Vim user? See [`--vim`](#vim-keys---vim). Or [try it in your browser](https://mbilling.github.io/fss-mqtt/):
+the same app, with demo data and a live public broker ([web version](#web-version)).
 
 ## Install
 
@@ -59,6 +61,7 @@ fss-mqtt broker:8883 --cafile ca.pem --cert me.pem --key me.key   # mutual TLS
 fss-mqtt wss://broker.example.com:8884/mqtt -u me   # MQTT over WebSockets, with TLS
 fss-mqtt broker:8883 --proxy http://proxy.corp:8080   # through an HTTP proxy (or socks5://)
 fss-mqtt broker -t 'v1/#' -t '$SYS/#'      # several subscriptions
+fss-mqtt wss://test.mosquitto.org:8081/mqtt -t '$SYS/#'   # a public test broker's own statistics
 fss-mqtt                                   # connect the saved connections marked autoconnect
 fss-mqtt -c local -c staging               # connect these saved connections
 ```
@@ -77,6 +80,10 @@ With no saved connections and no broker given, it connects to `mqtt://localhost:
 Several brokers can be connected at once. Each is a top-level branch in the topic tree and keeps its
 own topics and history while you connect, disconnect or pause its subscriptions. Filters match
 below the broker level, so `devices/#` shows matches from every broker.
+
+In the connections panel (`tab` to it), `+` subscribes a connection to another topic filter and
+`⏎` on a subscription edits its filter (emptied, the subscription is removed). A connected broker
+subscribes and unsubscribes at once, and the connections file keeps the change.
 
 Connections are kept in a small file you can edit:
 `~/.config/fss-mqtt/connections.toml` (Linux, macOS; `$XDG_CONFIG_HOME` is honoured) or
@@ -175,6 +182,7 @@ Just type — the tree updates on every keystroke and the cursor jumps to the fi
   everything below a match is included.
 - **Search** (anything else): case-insensitive substring over the full topic path; matches are
   underlined.
+- **`!`** alone: the topics with an [anomaly](#anomalies) flagged.
 
 `backspace` deletes a character, `ctrl+w` deletes back to the previous level, `esc`/`ctrl+u`
 clears. Clearing keeps the tree open at the topic you were on.
@@ -185,7 +193,9 @@ clears. Clearing keeps the tree open at the topic you were on.
 |---|---|---|
 | anywhere | `tab` / `shift+tab` | next / previous pane: connections, topics, messages, chart |
 | connections | `↑ ↓ pgup pgdn home end` | move |
-| connections | `space` `⏎` | connect / disconnect, or subscription / capture rule on / off |
+| connections | `space` | connect / disconnect, or subscription / capture rule on / off |
+| connections | `⏎` | on a connection or capture rule as `space`; on a subscription, edit its topic filter (emptied, it's removed) |
+| connections | `+` | subscribe the connection to another topic filter |
 | tree | `↑ ↓ pgup pgdn home end` | move |
 | tree | `→` | expand; on a topic with messages, enter its message list |
 | tree | `←` | collapse, or jump to parent |
@@ -195,12 +205,12 @@ clears. Clearing keeps the tree open at the topic you were on.
 | messages | `← esc` | back to the tree |
 | chart | `↑ ↓ home end pgup pgdn` | pick the column or field to chart (see [Charts](#charts)) |
 | chart | `← →` (`shift`: a page) | scroll through the rows (or messages) when there are more than fit |
-| chart | `⏎` | open the message full screen |
+| chart | `⏎` | open the message full screen, as its chart |
 | chart | `esc` | back to the tree |
 | full screen | `↑ ↓ pgup pgdn` | scroll |
 | full screen | `← →` | older / newer message |
 | full screen | `shift ←→` `<` `>` | pan wide tables (CSV, Parquet) |
-| full screen | `tab` | cycle formatted / raw / hex |
+| full screen | `tab` | cycle formatted / chart (when it has numbers) / raw / hex |
 | full screen | `esc q ⏎` | close |
 | tree, messages | `ctrl+e` | publish: edit a copy of the selected message (or a new one on the topic) and send it |
 | full screen | `e` | publish: edit a copy of this message and send it |
@@ -316,6 +326,7 @@ format comes from the `content-type` property when there is one, otherwise from 
 | Protobuf (by content-type) | raw field numbers and values, nested messages indented; no schema needed |
 | Sparkplug B (on `spBv1.0/…` topics) | message type, seq and timestamp; the metrics as a table with names, types and values; data sets and templates as tables |
 | SQLite changeset / patchset | per table, the inserts, updates (old → new) and deletes |
+| Elspec PQZip | the recording's start and end, the analyser (names, model, firmware, MAC) and its channels' nominal values |
 | other text / binary | text / hex dump |
 
 Binary formats are decoded when the message arrives, while the whole payload is still there; what's
@@ -350,11 +361,18 @@ like one of these formats but can't be read, the reason is shown above a hex dum
 - **SQLite changesets / patchsets** (from the session extension): recognised by a `content-type`
   containing `changeset` or `patchset`, or without one when the whole payload reads as one; the
   format doesn't carry column names, so columns are numbered (`pk c0`, `c1`, …).
+- **Elspec PQZip** (the files Elspec's BLACKBOX power quality analysers record): recognised by its
+  header. The measurements after the header, the per-cycle voltages, currents and harmonics, are
+  in a layout not worked out yet; their size is shown. Times are the analyser's clock.
 
 ## Charts
 
 A topic with numbers gets a chart in the lower half of its details, when the window has room for
-both. `tab` goes to it from the message list, and `↑ ↓` pick what it shows:
+both. On a narrow screen the panes stack: the connections panel stays short, and a topic with a
+chart is given the rows for a shorter one, so it still shows on a phone-sized window. `tab` goes
+to the chart from the message list, and `↑ ↓` pick what it shows. Full screen, `tab` shows a
+message's chart over the whole screen, after its formatted view, and `⏎` on the chart opens it
+there; `shift ←→` pans it:
 
 ![fss-mqtt charts: a turbine's telemetry fields over the messages kept, live, and on the next turbine the same field; the columns of a Parquet fast log and of a CSV report; the keys pressed show below](docs/chart.gif)
 
@@ -380,6 +398,23 @@ of them, one to a dot, and `← →` scroll through (a quarter of the view at a 
 view); the bottom border says which are in view (`rows 1,201–1,400`). A message's rows start at
 the first; the numbers each message carries start at the newest, and keep following them until
 you scroll back. With all of it in view, `← →` say so, and what would keep more.
+
+## Anomalies
+
+fss-mqtt watches every topic as its messages arrive and flags what doesn't look usual:
+
+- **spike**: a number far outside its usual range (6 standard deviations), e.g.
+  `power_kw 9800 (usual 900–3600)`. Flagged for 5 minutes.
+- **stuck**: a number that usually changes has repeated one value 20 times (a frozen sensor).
+- **silent**: a topic that publishes regularly has said nothing for 4 of its usual intervals (and
+  at least 5 seconds) while its connection is up.
+
+The numbers are those a chart would show: JSON fields, a number payload, Sparkplug metrics. Each
+check waits for 20 messages to learn what's usual first, and keeps a running mean and spread
+weighted to about the last 30, so it costs a few numbers per field and nothing per message worth
+noticing. A flagged topic says why in red in the tree (`! spike`), a collapsed branch how many it
+hides (`!2`), the header the total (`! 2 anomalies`), and its details the reason and since when.
+Type `!` to see only the flagged topics.
 
 ## Capture to disk
 
@@ -518,11 +553,39 @@ ones kept longest making room. Filtering 100k topics takes a few milliseconds.
 The MQTT client (`src/mqtt.rs`) is a small MQTT v5 client on blocking I/O with one thread per
 connection and no async runtime, which keeps the binary around 1 MB. TLS uses rustls.
 
+## Web version
+
+The web version at <https://mbilling.github.io/fss-mqtt/> is the same app built for the browser
+(WebAssembly), with the same keys, panes, viewer and charts. It starts with two demo connections,
+whose wind-farm data is made in the page, and a live one to the public test broker
+`wss://test.mosquitto.org:8081/mqtt`, subscribed to its `$SYS/#` statistics. That broker comes
+and goes: when it hasn't answered in 10 seconds, the page connects to EMQX's public broker
+(`wss://broker.emqx.io:8084/mqtt`) instead, subscribed to `fss-mqtt/#`, where what you publish
+comes back.
+
+Point it at your own broker with the page's address:
+
+```
+https://mbilling.github.io/fss-mqtt/?broker=wss://broker.example.com:8884/mqtt&topic=v1/%23&topic=alerts
+```
+
+`topic` can be repeated (`#` is `%23` in an address) and defaults to `#`. A page can only reach
+brokers over WebSockets, and from an https page only `wss://` ones; it can't send headers, use a
+proxy or certificate files of its own, or write to disk (capture, sessions). Nothing is saved.
+On a phone or tablet, tap a row to select it and again to open it, swipe to move, and use the
+key bar for the keys a phone has none of; tap the filter line (or abc) for the keyboard.
+For a chart full screen, open the message (tap it twice) and tab to its chart, or tab to the chart
+pane and press enter; esc goes back. The key bar's esc, enter and tab are those keys.
+Copies go to the browser's clipboard. Chrome on Windows and Linux keeps Ctrl+T and Ctrl+W for its
+tabs, so the page also takes Alt+T (copy the topic) and Alt+W (filter: back a level).
+
 ## Development
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux, macOS and Windows, checks the
 minimum Rust version, runs the end-to-end test against mosquitto (plain, TLS and mutual TLS, and capture to disk), and guards the
-release binary size.
+release binary size. `.github/workflows/web.yml` builds the web version with
+[trunk](https://trunkrs.dev) and publishes it to GitHub Pages with each release; locally,
+`rustup target add wasm32-unknown-unknown`, then `trunk serve web/index.html`.
 
 ```sh
 cargo test

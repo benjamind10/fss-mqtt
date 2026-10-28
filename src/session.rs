@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use web_time::{Duration, Instant, SystemTime};
 
 use crate::json::{self, Json};
 use crate::record::{self, Record};
@@ -465,7 +465,7 @@ pub fn open(path: PathBuf, store: Arc<Mutex<Store>>, conn: usize) -> std::thread
 mod tests {
     use super::*;
     use crate::store::{Props, Sub};
-    use std::time::UNIX_EPOCH;
+    use web_time::UNIX_EPOCH;
 
     pub fn tmp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("fss-mqtt-test-{}-{name}", std::process::id()));
